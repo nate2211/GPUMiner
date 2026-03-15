@@ -1,0 +1,1328 @@
+from __future__ import annotations
+
+import queue
+import secrets
+import threading
+import time
+from collections import deque
+from typing import Optional
+
+from PyQt5.QtCore import QObject, pyqtSignal
+
+from cpu_verify import CpuVerifier, target_hex_to_assigned_work
+from models import CandidateShare, MinerConfig, MiningJob, SubmitResult, VerifiedShare
+from opencl_miner import OpenCLGpuScanner
+from stratum_connection import MiningConnection
+from utils import nonce_to_hex_le, safe_bytes_from_hex
+
+
+class RollingWorkMeter:
+    def __init__(self, window_seconds: float) -> None:
+        self.window_seconds = float(window_seconds)
+        self._samples: deque[tuple[float, float]] = deque()
+        self._total_work = 0.0
+
+    def add_work(self, work: float, now: Optional[float] = None) -> None:
+        if work <= 0:
+            return
+        ts = time.time() if now is None else float(now)
+        self._samples.append((ts, float(work)))
+        self._total_work += float(work)
+        self._prune(ts)
+
+    def rate(self, now: Optional[float] = None) -> float:
+        ts = time.time() if now is None else float(now)
+        self._prune(ts)
+        if self.window_seconds <= 0:
+            return 0.0
+        return self._total_work / self.window_seconds
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.window_seconds
+        while self._samples and self._samples[0][0] < cutoff:
+            _, work = self._samples.popleft()
+            self._total_work -= work
+        if self._total_work < 0:
+            self._total_work = 0.0
+
+
+class MinerWorker(QObject):
+    log = pyqtSignal(str)
+    stats = pyqtSignal(dict)
+    status = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, config: MinerConfig, verifier: Optional[CpuVerifier] = None) -> None:
+        super().__init__()
+        self.config = config
+
+        needs_verifier_object = bool(config.require_dataset or config.enable_cpu_verify)
+        self.verifier = verifier
+        if self.verifier is None and needs_verifier_object:
+            self.verifier = CpuVerifier(
+                dll_path=(config.randomx_dll_path or None),
+                randomx_runtime_dll_path=(config.randomx_runtime_dll_path or None),
+                preload_randomx_runtime=bool(config.preload_randomx_runtime),
+                nonce_offset=config.nonce_offset,
+                on_log=self.log.emit,
+            )
+
+        self._stop = threading.Event()
+        self._job_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+
+        self._job: Optional[MiningJob] = None
+        self._job_generation: int = 0
+
+        self._scanner: Optional[OpenCLGpuScanner] = None
+        self._client: Optional[MiningConnection] = None
+
+        self._dataset_refresh_needed = False
+        self._job_refresh_needed = False
+        self._dataset_job_id: str = ""
+        self._dataset_seed_hash_hex: str = ""
+
+        self._candidate_queue: Optional[queue.Queue[tuple[int, CandidateShare] | None]] = None
+        self._submit_queue: Optional[queue.Queue[tuple[int, CandidateShare, VerifiedShare] | None]] = None
+        self._verify_threads: list[threading.Thread] = []
+        self._submit_thread: Optional[threading.Thread] = None
+
+        self._accepted = 0
+        self._rejected = 0
+        self._candidates = 0
+        self._verified = 0
+        self._submitted_unverified = 0
+        self._queued_dropped = 0
+        self._verify_rejected = 0
+        self._submit_stale = 0
+        self._submit_duplicate = 0
+        self._submit_invalid = 0
+        self._submit_backend_error = 0
+        self._job_changed_scan_drops = 0
+        self._job_changed_submit_drops = 0
+
+        self._teacher_hash_batches = 0
+        self._teacher_hash_labels = 0
+        self._teacher_hash_matches = 0
+        self._teacher_tail_batches = 0
+        self._teacher_tail_screened = 0
+        self._teacher_tail_accepted = 0
+
+        self._nonce_cursor = secrets.randbits(32)
+        self._hashes_done = 0
+        self._start_time = 0.0
+        self._last_stats_emit = 0.0
+        self._scan_launches_last = 0
+        self._last_effective_candidate_target = int(self.config.scan_candidate_target)
+        self._last_effective_work_items = int(self.config.active_scan_window())
+        self._last_job_age_ms = 0
+        self._last_verify_pressure_q8 = 0
+        self._last_submit_pressure_q8 = 0
+        self._last_stale_risk_q8 = 0
+
+        self._scan_rate_15m = RollingWorkMeter(15 * 60)
+        self._scan_rate_1h = RollingWorkMeter(60 * 60)
+        self._scan_rate_24h = RollingWorkMeter(24 * 60 * 60)
+
+        self._verified_work_15m = RollingWorkMeter(15 * 60)
+        self._accepted_work_15m = RollingWorkMeter(15 * 60)
+        self._accepted_work_1h = RollingWorkMeter(60 * 60)
+        self._accepted_work_24h = RollingWorkMeter(24 * 60 * 60)
+
+        self._accepted_work_total = 0.0
+
+    def _needs_randomx_prepare(self) -> bool:
+        return bool(
+            self.verifier is not None
+            and (self.config.require_dataset or self.config.enable_cpu_verify)
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _scan_mode(self) -> str:
+        return self.config.normalized_scan_mode()
+
+    def _verify_enabled(self) -> bool:
+        return bool(
+            self.config.enable_cpu_verify
+            and self.verifier is not None
+            and self.verifier.is_ready
+        )
+
+    def _verify_batch_enabled(self) -> bool:
+        return bool(
+            self._verify_enabled()
+            and self.config.enable_cpu_verify_batch
+            and int(self.config.cpu_verify_batch_size) > 1
+            and self.verifier is not None
+            and self.verifier.has_batch_verify
+        )
+
+    def _hash_batch_enabled(self) -> bool:
+        return bool(
+            self._verify_enabled()
+            and bool(getattr(self.config, "enable_cpu_hash_batch", True))
+            and self.verifier is not None
+            and self.verifier.has_batch_hash
+        )
+
+    def _tail_batch_enabled(self) -> bool:
+        return bool(
+            self._verify_enabled()
+            and bool(getattr(self.config, "enable_cpu_tail_batch", True))
+            and self.verifier is not None
+            and self.verifier.has_batch_tail
+        )
+
+    def _unverified_submit_enabled(self) -> bool:
+        if self.config.use_solo:
+            return False
+        return bool(self.config.submit_unverified_shares)
+
+    def _active_scan_window(self) -> int:
+        return self.config.active_scan_window()
+
+    def _desired_warm_batch_vms(self) -> int:
+        if not self._verify_enabled():
+            return 0
+
+        desired = max(
+            int(getattr(self.config, "cpu_verify_native_threads", 0)),
+            int(getattr(self.config, "cpu_hash_batch_threads", 0)),
+            int(getattr(self.config, "cpu_tail_batch_threads", 0)),
+        )
+
+        if self._verify_batch_enabled() or self._hash_batch_enabled() or self._tail_batch_enabled():
+            desired = max(desired, 1)
+
+        return max(0, desired)
+
+    def _queue_fill_pct(self, q: Optional[queue.Queue], limit: int) -> float:
+        if q is None or limit <= 0:
+            return 0.0
+        try:
+            return max(0.0, min(1.0, float(q.qsize()) / float(limit)))
+        except Exception:
+            return 0.0
+
+    def _classify_submit_result(self, result: SubmitResult) -> str:
+        if result.accepted:
+            return "pool_accepted"
+
+        if getattr(result, "reject_class", ""):
+            rc = str(result.reject_class).strip().lower()
+            if rc in {
+                "pool_stale",
+                "pool_duplicate",
+                "pool_invalid",
+                "pool_backend_error",
+                "pool_rejected",
+            }:
+                return rc
+
+        if getattr(result, "stale", False):
+            return "pool_stale"
+        if getattr(result, "duplicate", False):
+            return "pool_duplicate"
+        if getattr(result, "invalid", False):
+            return "pool_invalid"
+        if getattr(result, "backend_error", False):
+            return "pool_backend_error"
+
+        text = " ".join(
+            [
+                str(getattr(result, "status", "") or ""),
+                str(getattr(result, "error", "") or ""),
+                str(getattr(result, "reject_class", "") or ""),
+                str(getattr(result, "raw", "") or ""),
+            ]
+        ).lower()
+
+        if "stale" in text:
+            return "pool_stale"
+        if "duplicate" in text or "already submitted" in text or "duplicate_local" in text:
+            return "pool_duplicate"
+        if (
+            "invalid" in text
+            or "low difficulty" in text
+            or "bad nonce" in text
+            or "bad result" in text
+            or "malformed" in text
+            or "invalid_share" in text
+        ):
+            return "pool_invalid"
+        if (
+            "timeout" in text
+            or "connect" in text
+            or "gateway" in text
+            or "session" in text
+            or "not_open" in text
+            or "socket" in text
+            or "temporar" in text
+            or "not connected" in text
+        ):
+            return "pool_backend_error"
+        return "pool_rejected"
+
+    def _build_scan_context(self, job: MiningJob) -> dict[str, int]:
+        now = time.time()
+        job_age_ms = max(0, int((now - float(getattr(job, "received_at", now))) * 1000.0))
+
+        verify_pct = self._queue_fill_pct(self._candidate_queue, int(self.config.verify_queue_limit))
+        submit_pct = self._queue_fill_pct(self._submit_queue, int(self.config.submit_queue_limit))
+
+        age_soft = max(1, int(self.config.job_age_soft_ms))
+        age_hard = max(age_soft + 1, int(self.config.job_age_hard_ms))
+        if job_age_ms <= age_soft:
+            age_pct = 0.0
+        else:
+            age_pct = max(
+                0.0,
+                min(1.0, float(job_age_ms - age_soft) / float(max(1, age_hard - age_soft))),
+            )
+
+        verify_q8 = max(0, min(255, int(round(verify_pct * 255.0))))
+        submit_q8 = max(0, min(255, int(round(submit_pct * 255.0))))
+        stale_risk_q8 = max(0, min(255, int(round(max(verify_pct, submit_pct, age_pct) * 255.0))))
+
+        base_candidate_target = max(1, int(self.config.scan_candidate_target))
+        base_work_items = max(1, int(self._active_scan_window()))
+
+        effective_candidate_target = base_candidate_target
+        effective_work_items = base_work_items
+
+        if self.config.adaptive_queue_throttle:
+            soft = max(
+                float(self.config.clamped_verify_soft_pct()),
+                float(self.config.clamped_submit_soft_pct()),
+            )
+            live_pressure = max(verify_pct, submit_pct, age_pct)
+            if live_pressure > soft:
+                severity = (live_pressure - soft) / max(1e-6, 1.0 - soft)
+                factor = max(
+                    float(self.config.clamped_min_dynamic_work_pct()),
+                    1.0 - (0.75 * severity),
+                )
+
+                effective_candidate_target = max(
+                    int(self.config.min_candidate_target),
+                    min(
+                        base_candidate_target,
+                        int(round(base_candidate_target * factor)),
+                    ),
+                )
+                effective_work_items = max(
+                    1024,
+                    min(
+                        base_work_items,
+                        int(round(base_work_items * factor)),
+                    ),
+                )
+
+        self._last_effective_candidate_target = int(effective_candidate_target)
+        self._last_effective_work_items = int(effective_work_items)
+        self._last_job_age_ms = int(job_age_ms)
+        self._last_verify_pressure_q8 = int(verify_q8)
+        self._last_submit_pressure_q8 = int(submit_q8)
+        self._last_stale_risk_q8 = int(stale_risk_q8)
+
+        return {
+            "job_age_ms": int(job_age_ms),
+            "verify_pressure_q8": int(verify_q8),
+            "submit_pressure_q8": int(submit_q8),
+            "stale_risk_q8": int(stale_risk_q8),
+            "candidate_target": int(effective_candidate_target),
+            "work_items": int(effective_work_items),
+        }
+
+    def run(self) -> None:
+        scanner = OpenCLGpuScanner(self.config, self.log.emit)
+        client = MiningConnection(
+            self.config,
+            on_log=self.log.emit,
+            on_job=self._on_job,
+            on_status=self.status.emit,
+        )
+
+        self._scanner = scanner
+        self._client = client
+
+        try:
+            self._start_time = time.time()
+            scanner.initialize()
+            client.connect()
+            self._start_pipeline_threads()
+
+            if (
+                self.config.enable_cpu_verify
+                and self.config.enable_cpu_verify_batch
+                and self.verifier is not None
+                and not self.verifier.has_batch_verify
+            ):
+                self.log.emit(
+                    "[verify] native batch export not found in DLL; "
+                    "falling back to per-nonce verification"
+                )
+
+            if (
+                self.config.enable_cpu_verify
+                and bool(getattr(self.config, "enable_cpu_hash_batch", True))
+                and self.verifier is not None
+                and not self.verifier.has_batch_hash
+            ):
+                self.log.emit(
+                    "[verify] native hash batch export not found in DLL; "
+                    "falling back to verify batch / per-nonce exact labeling"
+                )
+
+            if (
+                self.config.enable_cpu_verify
+                and bool(getattr(self.config, "enable_cpu_tail_batch", True))
+                and self.verifier is not None
+                and not self.verifier.has_batch_tail
+            ):
+                self.log.emit(
+                    "[verify] native tail batch export not found in DLL; "
+                    "falling back to exact hash labeling"
+                )
+
+            if self.config.use_solo and not self._verify_enabled():
+                self.log.emit("[worker] solo mode detected; raw/unverified submit is disabled")
+
+            while not self._stop.is_set():
+                self._process_pending_verifier_refresh()
+
+                if self._needs_randomx_prepare():
+                    with self._job_lock:
+                        refresh_pending = self._dataset_refresh_needed or self._job_refresh_needed
+                    if refresh_pending:
+                        time.sleep(0.02)
+                        self._emit_stats(force=False)
+                        continue
+
+                job, job_generation = self._get_job_state()
+                if not job:
+                    time.sleep(0.02)
+                    self._emit_stats(force=False)
+                    continue
+
+                if self.config.require_dataset and (scanner.dataset_buf is None or scanner.dataset_words <= 0):
+                    time.sleep(0.02)
+                    self._emit_stats(force=False)
+                    continue
+
+                scan_ctx = self._build_scan_context(job)
+                start_nonce = self._next_nonce_window(scan_ctx["work_items"])
+
+                candidates = scanner.scan(
+                    job,
+                    start_nonce,
+                    job_age_ms=scan_ctx["job_age_ms"],
+                    verify_pressure_q8=scan_ctx["verify_pressure_q8"],
+                    submit_pressure_q8=scan_ctx["submit_pressure_q8"],
+                    stale_risk_q8=scan_ctx["stale_risk_q8"],
+                    scan_candidate_target_override=scan_ctx["candidate_target"],
+                    work_items_override=scan_ctx["work_items"],
+                )
+
+                live_job, live_generation = self._get_job_state()
+                if (
+                    live_generation != job_generation
+                    or live_job is None
+                    or live_job.job_id != job.job_id
+                    or live_job.session_id != job.session_id
+                ):
+                    if candidates:
+                        with self._stats_lock:
+                            self._job_changed_scan_drops += len(candidates)
+                        self.log.emit(
+                            f"[worker] job changed during scan, dropping stale candidate batch "
+                            f"for job={job.job_id} count={len(candidates)}"
+                        )
+                    self._emit_stats(force=False)
+                    continue
+
+                if candidates and bool(getattr(self.config, "sort_candidates", True)):
+                    candidates.sort(key=scanner.candidate_sort_key)
+
+                scanned_items = int(max(0, getattr(scanner, "last_scan_work_items", self._last_effective_work_items)))
+                self._scan_launches_last = int(max(1, getattr(scanner, "last_scan_chunk_count", 1)))
+
+                with self._stats_lock:
+                    self._candidates += len(candidates)
+                    self._hashes_done += scanned_items
+                    scan_work = float(scanned_items)
+                    self._scan_rate_15m.add_work(scan_work)
+                    self._scan_rate_1h.add_work(scan_work)
+                    self._scan_rate_24h.add_work(scan_work)
+
+                if candidates:
+                    self.log.emit(
+                        f"[opencl] candidates={len(candidates)} "
+                        f"job={job.job_id} start_nonce={start_nonce:08x} "
+                        f"mode={self._scan_mode()} backend={self.config.mining_backend_name()} "
+                        f"job_age_ms={scan_ctx['job_age_ms']} "
+                        f"verify_q8={scan_ctx['verify_pressure_q8']} "
+                        f"submit_q8={scan_ctx['submit_pressure_q8']} "
+                        f"stale_q8={scan_ctx['stale_risk_q8']} "
+                        f"target={scan_ctx['candidate_target']}"
+                    )
+
+                self._enqueue_candidates(job_generation, candidates)
+                self._emit_stats(force=False)
+
+                if self.config.scan_pause_ms > 0:
+                    time.sleep(self.config.scan_pause_ms / 1000.0)
+
+        except Exception as exc:
+            self.log.emit(f"[fatal] {exc}")
+            self.status.emit("error")
+        finally:
+            self._stop.set()
+            self._stop_pipeline_threads()
+
+            try:
+                if self.verifier is not None:
+                    self.verifier.close()
+            except Exception:
+                pass
+            try:
+                scanner.close()
+            except Exception:
+                pass
+            try:
+                client.close()
+            except Exception:
+                pass
+
+            self._emit_stats(force=True)
+
+            self._scanner = None
+            self._client = None
+            self.finished.emit()
+
+    def _start_pipeline_threads(self) -> None:
+        verify_enabled = self._verify_enabled()
+        verify_batch_enabled = self._verify_batch_enabled()
+        hash_batch_enabled = self._hash_batch_enabled()
+        tail_batch_enabled = self._tail_batch_enabled()
+        unverified_submit = self._unverified_submit_enabled()
+
+        if verify_enabled:
+            self._candidate_queue = queue.Queue(maxsize=max(1, int(self.config.verify_queue_limit)))
+        else:
+            self._candidate_queue = None
+
+        if verify_enabled or unverified_submit:
+            self._submit_queue = queue.Queue(maxsize=max(1, int(self.config.submit_queue_limit)))
+        else:
+            self._submit_queue = None
+
+        self._verify_threads = []
+        if verify_enabled and self._candidate_queue is not None:
+            verify_threads = max(1, int(getattr(self.config, "verify_threads", 1)))
+            if (verify_batch_enabled or hash_batch_enabled or tail_batch_enabled) and verify_threads != 1:
+                self.log.emit(
+                    f"[worker] verify_threads clamped from {verify_threads} to 1 "
+                    "because native batch labeling is enabled"
+                )
+                verify_threads = 1
+
+            for idx in range(verify_threads):
+                t = threading.Thread(target=self._verify_loop, name=f"VerifyThread-{idx}", daemon=True)
+                t.start()
+                self._verify_threads.append(t)
+
+        if self._submit_queue is not None:
+            self._submit_thread = threading.Thread(target=self._submit_loop, name="SubmitThread", daemon=True)
+            self._submit_thread.start()
+        else:
+            self._submit_thread = None
+
+        self.log.emit(
+            f"[worker] pipeline: "
+            f"verify={'on' if verify_enabled else 'off'} "
+            f"verify_batch={'on' if verify_batch_enabled else 'off'} "
+            f"hash_batch={'on' if hash_batch_enabled else 'off'} "
+            f"tail_batch={'on' if tail_batch_enabled else 'off'} "
+            f"hash_batch_min_size={int(getattr(self.config, 'cpu_hash_batch_min_size', 8))} "
+            f"hash_batch_threads={int(getattr(self.config, 'cpu_hash_batch_threads', 0))} "
+            f"tail_batch_min_size={int(getattr(self.config, 'cpu_tail_batch_min_size', 32))} "
+            f"tail_batch_threads={int(getattr(self.config, 'cpu_tail_batch_threads', 0))} "
+            f"batch_size={int(getattr(self.config, 'cpu_verify_batch_size', 1))} "
+            f"batch_wait_ms={int(getattr(self.config, 'cpu_verify_batch_wait_ms', 0))} "
+            f"native_threads={int(getattr(self.config, 'cpu_verify_native_threads', 0))} "
+            f"submit_unverified={'on' if unverified_submit else 'off'} "
+            f"verify_threads={len(self._verify_threads)} "
+            f"verify_queue_limit={int(self.config.verify_queue_limit)} "
+            f"submit_queue_limit={int(self.config.submit_queue_limit)} "
+            f"adaptive_queue_throttle={'on' if self.config.adaptive_queue_throttle else 'off'}"
+        )
+
+    def _stop_pipeline_threads(self) -> None:
+        if self._candidate_queue is not None:
+            for _ in self._verify_threads:
+                try:
+                    self._candidate_queue.put_nowait(None)
+                except Exception:
+                    pass
+
+        if self._submit_queue is not None:
+            try:
+                self._submit_queue.put_nowait(None)
+            except Exception:
+                pass
+
+        for t in self._verify_threads:
+            try:
+                t.join(timeout=2.0)
+            except Exception:
+                pass
+        self._verify_threads = []
+
+        if self._submit_thread is not None:
+            try:
+                self._submit_thread.join(timeout=2.0)
+            except Exception:
+                pass
+            self._submit_thread = None
+
+    def _candidate_to_unverified_submit(self, cand: CandidateShare) -> VerifiedShare:
+        assigned_work = target_hex_to_assigned_work(cand.target_hex)
+        verified = VerifiedShare(
+            nonce_hex=nonce_to_hex_le(cand.nonce),
+            result_hex=(cand.gpu_hash_hex or ""),
+            job_id=cand.job_id,
+            session_id=cand.session_id,
+            assigned_work=assigned_work,
+            actual_work=0.0,
+            credited_work=assigned_work,
+            quality=0.0,
+            actual_tail_u64=0,
+            predicted_tail_u64=int(getattr(cand, "predicted_tail_u64", 0)),
+            rank_score_u64=int(getattr(cand, "rank_score_u64", 0)),
+            tune_bucket=int(getattr(cand, "tune_bucket", -1)),
+            tune_tail_bin=int(getattr(cand, "tune_tail_bin", -1)),
+            rank_quality=int(getattr(cand, "rank_quality", 128)),
+            threshold_quality=int(getattr(cand, "threshold_quality", 128)),
+            gpu_hash_hex=(cand.gpu_hash_hex or ""),
+            predictor_hash_match=bool(getattr(cand, "predictor_hash_match", False)),
+        )
+        self._attach_solution_blob(verified, cand.nonce, cand.job_id)
+        return verified
+
+    def _attach_solution_blob(self, verified: VerifiedShare, nonce: int, job_id: str) -> None:
+        if not self.config.use_solo:
+            return
+
+        job, _ = self._get_job_state()
+        if job is None or job.job_id != job_id:
+            return
+
+        blob_hex = (job.submit_blob_hex or "").strip()
+        raw = safe_bytes_from_hex(blob_hex)
+        if not raw:
+            return
+
+        off = int(self.config.nonce_offset)
+        if len(raw) < off + 4:
+            return
+
+        nonce_u32 = int(nonce) & 0xFFFFFFFF
+        raw[off:off + 4] = nonce_u32.to_bytes(4, "little", signed=False)
+        verified.solution_blob_hex = bytes(raw).hex()
+
+    def _enqueue_candidates(self, job_generation: int, candidates: list[CandidateShare]) -> None:
+        if not candidates:
+            return
+
+        process_limit = int(getattr(self.config, "cpu_verify_limit", 0))
+        if process_limit > 0 and len(candidates) > process_limit:
+            self.log.emit(
+                f"[worker] process_limit clipped candidates for job={candidates[0].job_id}: "
+                f"processing={process_limit} total={len(candidates)}"
+            )
+            candidates = candidates[:process_limit]
+
+        if self._verify_enabled():
+            if self._candidate_queue is None:
+                return
+
+            enqueued = 0
+            dropped = 0
+            scanner = self._scanner
+            for cand in candidates:
+                try:
+                    self._candidate_queue.put_nowait((job_generation, cand))
+                    enqueued += 1
+                except queue.Full:
+                    dropped += 1
+                    if scanner is not None:
+                        scanner.record_feedback(cand, "queue_drop", 0.0, 0.0)
+
+            if dropped:
+                with self._stats_lock:
+                    self._queued_dropped += dropped
+                self.log.emit(
+                    f"[worker] candidate queue full, dropped={dropped} "
+                    f"enqueued={enqueued} job={candidates[0].job_id}"
+                )
+            return
+
+        if self._unverified_submit_enabled():
+            if self._submit_queue is None:
+                return
+
+            enqueued = 0
+            dropped = 0
+            scanner = self._scanner
+            for cand in candidates:
+                verified = self._candidate_to_unverified_submit(cand)
+                try:
+                    self._submit_queue.put_nowait((job_generation, cand, verified))
+                    enqueued += 1
+                except queue.Full:
+                    dropped += 1
+                    if scanner is not None:
+                        scanner.record_feedback(cand, "queue_drop", verified.credited_work, verified.quality)
+
+            if dropped:
+                with self._stats_lock:
+                    self._queued_dropped += dropped
+                self.log.emit(
+                    f"[worker] submit queue full, dropped={dropped} "
+                    f"enqueued={enqueued} job={candidates[0].job_id}"
+                )
+            return
+
+    def _collect_verify_batch(
+        self,
+        first_item: tuple[int, CandidateShare],
+    ) -> tuple[list[tuple[int, CandidateShare]], bool]:
+        batch = [first_item]
+        stop_after_batch = False
+
+        if not (
+            self._verify_batch_enabled()
+            or self._hash_batch_enabled()
+            or self._tail_batch_enabled()
+        ) or self._candidate_queue is None:
+            return batch, stop_after_batch
+
+        target_size = max(
+            1,
+            int(getattr(self.config, "cpu_verify_batch_size", 64)),
+            int(getattr(self.config, "cpu_hash_batch_min_size", 8)),
+            int(getattr(self.config, "cpu_tail_batch_min_size", 32)),
+        )
+        wait_ms = max(0, int(getattr(self.config, "cpu_verify_batch_wait_ms", 2)))
+        deadline = time.time() + (wait_ms / 1000.0)
+
+        while len(batch) < target_size and not self._stop.is_set():
+            try:
+                if len(batch) == 1 and wait_ms > 0:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    next_item = self._candidate_queue.get(timeout=remaining)
+                else:
+                    next_item = self._candidate_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if next_item is None:
+                try:
+                    self._candidate_queue.task_done()
+                except Exception:
+                    pass
+                stop_after_batch = True
+                break
+
+            batch.append(next_item)
+
+        return batch, stop_after_batch
+
+    def _queue_verified_submit(
+        self,
+        job_generation: int,
+        cand: CandidateShare,
+        verified: VerifiedShare,
+    ) -> None:
+        if self._submit_queue is None:
+            return
+
+        queued = False
+        while not self._stop.is_set():
+            current_job, current_generation = self._get_job_state()
+            if (
+                current_generation != job_generation
+                or current_job is None
+                or current_job.job_id != cand.job_id
+                or current_job.session_id != cand.session_id
+            ):
+                with self._stats_lock:
+                    self._job_changed_submit_drops += 1
+                break
+            try:
+                self._submit_queue.put(
+                    (job_generation, cand, verified),
+                    timeout=0.1,
+                )
+                queued = True
+                break
+            except queue.Full:
+                continue
+
+        if not queued:
+            scanner = self._scanner
+            if scanner is not None:
+                scanner.record_feedback(cand, "queue_drop", verified.credited_work, verified.quality)
+            self.log.emit(
+                f"[worker] submit queue full/stale, dropping verified share "
+                f"job={cand.job_id} nonce={verified.nonce_hex}"
+            )
+
+    def _handle_verified_share(
+        self,
+        job_generation: int,
+        cand: CandidateShare,
+        verified: VerifiedShare,
+    ) -> None:
+        scanner = self._scanner
+        if scanner is None:
+            return
+
+        self._attach_solution_blob(verified, cand.nonce, cand.job_id)
+
+        scanner.record_feedback(cand, "cpu_verified", verified.credited_work, verified.quality)
+
+        with self._stats_lock:
+            self._verified += 1
+            self._verified_work_15m.add_work(verified.credited_work)
+
+        self.log.emit(
+            f"[verify] share found nonce={verified.nonce_hex} "
+            f"job={verified.job_id} session={verified.session_id} "
+            f"pred_tail={verified.predicted_tail_u64} "
+            f"act_tail={verified.actual_tail_u64} "
+            f"bucket={verified.tune_bucket} bin={verified.tune_tail_bin} "
+            f"actual_work={verified.actual_work:.6f} "
+            f"assigned_work={verified.assigned_work:.6f} "
+            f"credited_work={verified.credited_work:.6f} "
+            f"quality={verified.quality:.6f}x "
+            f"predictor_match={1 if verified.predictor_hash_match else 0}"
+        )
+
+        self._queue_verified_submit(job_generation, cand, verified)
+
+    def _verify_loop(self) -> None:
+        while not self._stop.is_set():
+            if self._candidate_queue is None:
+                time.sleep(0.05)
+                continue
+
+            try:
+                first_item = self._candidate_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if first_item is None:
+                try:
+                    self._candidate_queue.task_done()
+                except Exception:
+                    pass
+                break
+
+            batch_items: list[tuple[int, CandidateShare]] = []
+            stop_after_batch = False
+
+            try:
+                batch_items, stop_after_batch = self._collect_verify_batch(first_item)
+
+                current_job, current_generation = self._get_job_state()
+                if current_job is None:
+                    continue
+
+                scanner = self._scanner
+                verifier = self.verifier
+                if scanner is None or verifier is None or not self._verify_enabled():
+                    continue
+
+                live_items: list[tuple[int, CandidateShare]] = []
+                for job_generation, cand in batch_items:
+                    if (
+                        current_generation == job_generation
+                        and current_job.job_id == cand.job_id
+                        and current_job.session_id == cand.session_id
+                    ):
+                        live_items.append((job_generation, cand))
+
+                if not live_items:
+                    continue
+
+                if len(live_items) > 1 and self._tail_batch_enabled() and len(live_items) >= max(
+                    2, int(getattr(self.config, "cpu_tail_batch_min_size", 32))
+                ):
+                    tail_threads = max(0, int(getattr(self.config, "cpu_tail_batch_threads", 0)))
+                    shares = [cand for _, cand in live_items]
+                    screened = verifier.screen_shares_batch_by_tail(
+                        shares,
+                        max_threads=tail_threads,
+                    )
+
+                    accepted_pairs: list[tuple[int, CandidateShare]] = []
+                    for (job_generation, cand), item in zip(live_items, screened):
+                        if not item.accepted_by_tail:
+                            with self._stats_lock:
+                                self._verify_rejected += 1
+                            scanner.record_feedback(cand, "cpu_rejected", 0.0, 0.0)
+                            continue
+                        accepted_pairs.append((job_generation, cand))
+
+                    accepted_count = 0
+                    match_count = 0
+
+                    if accepted_pairs:
+                        full_threads = max(0, int(getattr(self.config, "cpu_hash_batch_threads", 0)))
+                        labeled = verifier.label_shares_batch_with_hashes(
+                            [cand for _, cand in accepted_pairs],
+                            max_threads=full_threads,
+                        )
+
+                        for (job_generation, cand), item in zip(accepted_pairs, labeled):
+                            if item.predictor_hash_match:
+                                match_count += 1
+
+                            if item.verified is None:
+                                with self._stats_lock:
+                                    self._verify_rejected += 1
+                                scanner.record_feedback(cand, "cpu_rejected", 0.0, 0.0)
+                                continue
+
+                            accepted_count += 1
+                            self._handle_verified_share(job_generation, cand, item.verified)
+
+                    with self._stats_lock:
+                        self._teacher_tail_batches += 1
+                        self._teacher_tail_screened += len(live_items)
+                        self._teacher_tail_accepted += accepted_count
+                        self._teacher_hash_labels += accepted_count
+                        self._teacher_hash_matches += match_count
+
+                    self.log.emit(
+                        f"[verify-tail-batch] size={len(live_items)} "
+                        f"screen_accept={len(accepted_pairs)} "
+                        f"final_accept={accepted_count} "
+                        f"predictor_matches={match_count} "
+                        f"tail_threads={tail_threads}"
+                    )
+
+                elif len(live_items) > 1:
+                    prefer_hash_batch = (
+                        self._hash_batch_enabled()
+                        and len(live_items) >= max(2, int(getattr(self.config, "cpu_hash_batch_min_size", 8)))
+                    )
+
+                    native_threads = max(
+                        0,
+                        int(
+                            getattr(self.config, "cpu_hash_batch_threads", 0)
+                            if prefer_hash_batch
+                            else getattr(self.config, "cpu_verify_native_threads", 0)
+                        ),
+                    )
+
+                    shares = [cand for _, cand in live_items]
+                    labeled = verifier.label_shares_batch_with_hashes(
+                        shares,
+                        max_threads=native_threads,
+                    )
+
+                    if len(labeled) != len(live_items):
+                        raise RuntimeError(
+                            f"label_shares_batch_with_hashes returned {len(labeled)} "
+                            f"results for {len(live_items)} shares"
+                        )
+
+                    accepted_count = 0
+                    match_count = 0
+
+                    for (job_generation, cand), item in zip(live_items, labeled):
+                        if item.predictor_hash_match:
+                            match_count += 1
+
+                        if item.verified is None:
+                            with self._stats_lock:
+                                self._verify_rejected += 1
+                            scanner.record_feedback(cand, "cpu_rejected", 0.0, 0.0)
+                            continue
+
+                        accepted_count += 1
+                        self._handle_verified_share(job_generation, cand, item.verified)
+
+                    if prefer_hash_batch:
+                        with self._stats_lock:
+                            self._teacher_hash_batches += 1
+                            self._teacher_hash_labels += len(live_items)
+                            self._teacher_hash_matches += match_count
+
+                        self.log.emit(
+                            f"[verify-hash-batch] size={len(live_items)} accepted={accepted_count} "
+                            f"predictor_matches={match_count} native_threads={native_threads}"
+                        )
+                    else:
+                        self.log.emit(
+                            f"[verify-batch] size={len(live_items)} accepted={accepted_count} "
+                            f"predictor_matches={match_count} native_threads={native_threads}"
+                        )
+                else:
+                    job_generation, cand = live_items[0]
+                    verified, _credited_work = verifier.verify_with_work(cand)
+                    if not verified:
+                        with self._stats_lock:
+                            self._verify_rejected += 1
+                        scanner.record_feedback(cand, "cpu_rejected", 0.0, 0.0)
+                        continue
+                    self._handle_verified_share(job_generation, cand, verified)
+
+            finally:
+                for _ in batch_items:
+                    try:
+                        self._candidate_queue.task_done()
+                    except Exception:
+                        pass
+
+            if stop_after_batch:
+                break
+
+    def _submit_loop(self) -> None:
+        while not self._stop.is_set():
+            if self._submit_queue is None:
+                time.sleep(0.05)
+                continue
+
+            try:
+                item = self._submit_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if item is None:
+                try:
+                    self._submit_queue.task_done()
+                except Exception:
+                    pass
+                break
+
+            job_generation, cand, verified = item
+
+            try:
+                current_job, current_generation = self._get_job_state()
+                if (
+                    current_generation != job_generation
+                    or current_job is None
+                    or current_job.job_id != cand.job_id
+                    or current_job.session_id != cand.session_id
+                ):
+                    with self._stats_lock:
+                        self._job_changed_submit_drops += 1
+                    continue
+
+                scanner = self._scanner
+                client = self._client
+                if scanner is None or client is None:
+                    continue
+
+                submit_result = client.submit(verified)
+                outcome = self._classify_submit_result(submit_result)
+
+                with self._stats_lock:
+                    if submit_result.accepted:
+                        self._accepted += 1
+                        self._accepted_work_total += verified.credited_work
+                        self._accepted_work_15m.add_work(verified.credited_work)
+                        self._accepted_work_1h.add_work(verified.credited_work)
+                        self._accepted_work_24h.add_work(verified.credited_work)
+                    else:
+                        self._rejected += 1
+                        if outcome == "pool_stale":
+                            self._submit_stale += 1
+                        elif outcome == "pool_duplicate":
+                            self._submit_duplicate += 1
+                        elif outcome == "pool_invalid":
+                            self._submit_invalid += 1
+                        elif outcome == "pool_backend_error":
+                            self._submit_backend_error += 1
+
+                if self._verify_enabled():
+                    accepted_log_prefix = "[submit] accepted"
+                    rejected_log_prefix = "[submit] rejected"
+                else:
+                    with self._stats_lock:
+                        self._submitted_unverified += 1
+                    accepted_log_prefix = "[submit-raw] accepted"
+                    rejected_log_prefix = "[submit-raw] rejected"
+
+                scanner.record_feedback(cand, outcome, verified.credited_work, verified.quality)
+
+                if submit_result.accepted:
+                    self.log.emit(
+                        f"{accepted_log_prefix} nonce={verified.nonce_hex} "
+                        f"job={verified.job_id} status={submit_result.status} "
+                        f"class={outcome} credited_work={verified.credited_work:.6f}"
+                    )
+                else:
+                    self.log.emit(
+                        f"{rejected_log_prefix} nonce={verified.nonce_hex} "
+                        f"job={verified.job_id} status={submit_result.status} "
+                        f"class={outcome} error={submit_result.error}"
+                    )
+
+                self._emit_stats(force=False)
+
+            finally:
+                try:
+                    self._submit_queue.task_done()
+                except Exception:
+                    pass
+
+    def _emit_stats(self, force: bool) -> None:
+        now = time.time()
+        interval = max(0.05, float(int(getattr(self.config, "stats_update_ms", 500))) / 1000.0)
+
+        with self._stats_lock:
+            if not force and (now - self._last_stats_emit) < interval:
+                return
+            self._last_stats_emit = now
+
+            accepted = self._accepted
+            rejected = self._rejected
+            candidates = self._candidates
+            verified = self._verified
+            submitted_unverified = self._submitted_unverified
+            queued_dropped = self._queued_dropped
+            accepted_work_total = self._accepted_work_total
+            verify_rejected = self._verify_rejected
+            submit_stale = self._submit_stale
+            submit_duplicate = self._submit_duplicate
+            submit_invalid = self._submit_invalid
+            submit_backend_error = self._submit_backend_error
+            job_changed_scan_drops = self._job_changed_scan_drops
+            job_changed_submit_drops = self._job_changed_submit_drops
+
+            teacher_hash_batches = self._teacher_hash_batches
+            teacher_hash_labels = self._teacher_hash_labels
+            teacher_hash_matches = self._teacher_hash_matches
+            teacher_tail_batches = self._teacher_tail_batches
+            teacher_tail_screened = self._teacher_tail_screened
+            teacher_tail_accepted = self._teacher_tail_accepted
+
+            elapsed = max(now - self._start_time, 1e-6)
+            scan_rate_lifetime = int(self._hashes_done / elapsed)
+            gpu_scan_rate_15m = int(self._scan_rate_15m.rate(now))
+            gpu_scan_rate_1h = int(self._scan_rate_1h.rate(now))
+            gpu_scan_rate_24h = int(self._scan_rate_24h.rate(now))
+            verified_rate_15m = int(self._verified_work_15m.rate(now))
+            p2pool_rate_15m = int(self._accepted_work_15m.rate(now))
+            p2pool_rate_1h = int(self._accepted_work_1h.rate(now))
+            p2pool_rate_24h = int(self._accepted_work_24h.rate(now))
+
+        job, _ = self._get_job_state()
+        verify_yield = (float(verified) / float(candidates)) if candidates > 0 else 0.0
+        accept_yield = (float(accepted) / float(verified)) if verified > 0 else 0.0
+        teacher_hash_match_rate = (
+            float(teacher_hash_matches) / float(teacher_hash_labels)
+            if teacher_hash_labels > 0 else 0.0
+        )
+        teacher_tail_accept_rate = (
+            float(teacher_tail_accepted) / float(teacher_tail_screened)
+            if teacher_tail_screened > 0 else 0.0
+        )
+
+        stats = {
+            "accepted": accepted,
+            "rejected": rejected,
+            "candidates": candidates,
+            "verified": verified,
+            "verify_rejected": verify_rejected,
+            "submitted_unverified": submitted_unverified,
+            "queued_dropped": queued_dropped,
+            "submit_stale": submit_stale,
+            "submit_duplicate": submit_duplicate,
+            "submit_invalid": submit_invalid,
+            "submit_backend_error": submit_backend_error,
+            "job_changed_scan_drops": job_changed_scan_drops,
+            "job_changed_submit_drops": job_changed_submit_drops,
+
+            "scan_rate_lifetime": scan_rate_lifetime,
+            "gpu_scan_rate_15m": gpu_scan_rate_15m,
+            "gpu_scan_rate_1h": gpu_scan_rate_1h,
+            "gpu_scan_rate_24h": gpu_scan_rate_24h,
+
+            "verified_rate_15m": verified_rate_15m,
+            "p2pool_rate_15m": p2pool_rate_15m,
+            "p2pool_rate_1h": p2pool_rate_1h,
+            "p2pool_rate_24h": p2pool_rate_24h,
+            "hashrate_est": p2pool_rate_15m,
+
+            "accepted_work_total": accepted_work_total,
+            "verify_yield": verify_yield,
+            "accept_yield": accept_yield,
+
+            "teacher_hash_batches": teacher_hash_batches,
+            "teacher_hash_labels": teacher_hash_labels,
+            "teacher_hash_matches": teacher_hash_matches,
+            "teacher_hash_match_rate": teacher_hash_match_rate,
+            "teacher_tail_batches": teacher_tail_batches,
+            "teacher_tail_screened": teacher_tail_screened,
+            "teacher_tail_accepted": teacher_tail_accepted,
+            "teacher_tail_accept_rate": teacher_tail_accept_rate,
+
+            "job_id": (job.job_id if job else "-"),
+            "height": (job.height if job else 0),
+            "backend": self.config.mining_backend_name(),
+            "scan_mode": self._scan_mode(),
+            "verification_enabled": self._verify_enabled(),
+            "verification_batch_enabled": self._verify_batch_enabled(),
+            "hash_batch_enabled": self._hash_batch_enabled(),
+            "tail_batch_enabled": self._tail_batch_enabled(),
+            "cpu_verify_batch_size": int(getattr(self.config, "cpu_verify_batch_size", 1)),
+            "cpu_verify_batch_wait_ms": int(getattr(self.config, "cpu_verify_batch_wait_ms", 0)),
+            "cpu_verify_native_threads": int(getattr(self.config, "cpu_verify_native_threads", 0)),
+            "cpu_hash_batch_min_size": int(getattr(self.config, "cpu_hash_batch_min_size", 8)),
+            "cpu_hash_batch_threads": int(getattr(self.config, "cpu_hash_batch_threads", 0)),
+            "cpu_tail_batch_min_size": int(getattr(self.config, "cpu_tail_batch_min_size", 32)),
+            "cpu_tail_batch_threads": int(getattr(self.config, "cpu_tail_batch_threads", 0)),
+            "job_tuning_enabled": bool(getattr(self.config, "enable_job_tuning", True)),
+            "submit_unverified_shares": bool(self._unverified_submit_enabled()),
+            "platform_index": int(self.config.platform_index),
+            "device_index": int(self.config.device_index),
+            "candidate_queue_depth": (self._candidate_queue.qsize() if self._candidate_queue is not None else 0),
+            "submit_queue_depth": (self._submit_queue.qsize() if self._submit_queue is not None else 0),
+            "scan_launches_last": int(self._scan_launches_last),
+            "python_verify_threads_active": len(self._verify_threads),
+
+            "effective_candidate_target_last": int(self._last_effective_candidate_target),
+            "effective_work_items_last": int(self._last_effective_work_items),
+            "job_age_ms_last": int(self._last_job_age_ms),
+            "verify_pressure_q8_last": int(self._last_verify_pressure_q8),
+            "submit_pressure_q8_last": int(self._last_submit_pressure_q8),
+            "stale_risk_q8_last": int(self._last_stale_risk_q8),
+
+            "split_tuning": True,
+            "credit_tuning": True,
+            "tail_bins": int(self.config.normalized_tail_bins()),
+        }
+        self.stats.emit(stats)
+
+    def _process_pending_verifier_refresh(self) -> None:
+        scanner = self._scanner
+        if scanner is None:
+            return
+
+        with self._job_lock:
+            if not (self._dataset_refresh_needed or self._job_refresh_needed):
+                return
+            job = self._job
+            seed_refresh = self._dataset_refresh_needed
+            job_refresh = self._job_refresh_needed
+
+        if job is None:
+            return
+
+        if not self._needs_randomx_prepare():
+            with self._job_lock:
+                self._dataset_refresh_needed = False
+                self._job_refresh_needed = False
+                self._dataset_job_id = job.job_id
+                self._dataset_seed_hash_hex = (job.seed_hash_hex or "").lower()
+            return
+
+        verifier = self.verifier
+        if verifier is None or not verifier.is_ready:
+            self.log.emit("[verify] RandomX verifier is not ready")
+            time.sleep(0.5)
+            return
+
+        try:
+            if seed_refresh:
+                self.log.emit(
+                    f"[verify] preparing RandomX seed for job_id={job.job_id} seed={job.seed_hash_hex}"
+                )
+                verifier.prepare_seed_for_job(job)
+
+                warm_target = self._desired_warm_batch_vms()
+                if warm_target > 0:
+                    verifier.warm_batch_vms(warm_target)
+                    self.log.emit(f"[verify] warmed batch vms target={warm_target}")
+
+                if self.config.require_dataset:
+                    if not verifier.has_dataset_exports:
+                        raise RuntimeError(
+                            "RandomX DLL does not export "
+                            "bnrx_dataset_words64 / bnrx_export_dataset64"
+                        )
+
+                    self.log.emit(f"[verify] exporting RandomX dataset for seed={job.seed_hash_hex}")
+                    dataset_u64 = verifier.export_dataset_u64()
+                    scanner.bind_dataset(dataset_u64, verifier.current_dataset_fingerprint)
+
+            if job_refresh:
+                self.log.emit(f"[verify] binding verifier job job_id={job.job_id}")
+                verifier.set_job(job)
+
+            with self._job_lock:
+                self._dataset_refresh_needed = False
+                self._job_refresh_needed = False
+                self._dataset_job_id = job.job_id
+                self._dataset_seed_hash_hex = (job.seed_hash_hex or "").lower()
+
+        except Exception as exc:
+            self.log.emit(f"[verify] seed/job refresh failed for job={job.job_id}: {exc}")
+            time.sleep(0.5)
+
+    def _on_job(self, job: MiningJob) -> None:
+        new_seed = (job.seed_hash_hex or "").lower()
+
+        with self._job_lock:
+            old_seed = self._dataset_seed_hash_hex
+            self._job = job
+            self._job_generation += 1
+            self._nonce_cursor = secrets.randbits(32)
+
+            needs_prepare = self._needs_randomx_prepare()
+            self._dataset_refresh_needed = bool(new_seed != old_seed and needs_prepare)
+            self._job_refresh_needed = bool(needs_prepare)
+
+            self._dataset_job_id = job.job_id
+
+        self._drain_queue(self._candidate_queue)
+        self._drain_queue(self._submit_queue)
+
+    def _get_job_state(self) -> tuple[Optional[MiningJob], int]:
+        with self._job_lock:
+            return self._job, self._job_generation
+
+    def _next_nonce_window(self, span: Optional[int] = None) -> int:
+        step = max(1, int(span or self._active_scan_window()))
+        with self._job_lock:
+            start = self._nonce_cursor
+            self._nonce_cursor = (self._nonce_cursor + step) & 0xFFFFFFFF
+            return start
+
+    @staticmethod
+    def _drain_queue(q: Optional[queue.Queue]) -> None:
+        if q is None:
+            return
+        while True:
+            try:
+                item = q.get_nowait()
+            except queue.Empty:
+                break
+            else:
+                try:
+                    q.task_done()
+                except Exception:
+                    pass
+                if item is None:
+                    continue
