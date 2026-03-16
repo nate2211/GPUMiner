@@ -34,16 +34,6 @@ def _nonce_range_array(start_nonce: int, count: int) -> np.ndarray:
     base = np.uint64(int(start_nonce) & 0xFFFFFFFF)
     seq = (np.arange(count, dtype=np.uint64) + base) & np.uint64(0xFFFFFFFF)
     return np.ascontiguousarray(seq.astype(np.uint32))
-
-def _nonce_range_array(start_nonce: int, count: int) -> np.ndarray:
-    count = max(0, int(count))
-    if count <= 0:
-        return np.empty((0,), dtype=np.uint32)
-    base = np.uint64(int(start_nonce) & 0xFFFFFFFF)
-    seq = (np.arange(count, dtype=np.uint64) + base) & np.uint64(0xFFFFFFFF)
-    return np.ascontiguousarray(seq.astype(np.uint32))
-
-
 def parse_target_hex_to_u64(target_hex: str) -> int:
     s = _normalize_hex(target_hex)
     raw = safe_bytes_from_hex(s)
