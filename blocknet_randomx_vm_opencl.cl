@@ -38,7 +38,7 @@
     much more VM/scratchpad/program oriented while preserving the host ABI.
 */
 #ifndef BN_RXP_SCRATCH_WORDS
-#define BN_RXP_SCRATCH_WORDS 256u      /* 256 * 8 = 2048 bytes */
+#define BN_RXP_SCRATCH_WORDS 256u
 #endif
 
 #ifndef BN_RXP_PROGRAM_SIZE
@@ -252,16 +252,26 @@ inline ulong bn_adjust_target64(ulong target64, uint threshold_quality) {
 
     if (threshold_quality < BN_TUNE_NEUTRAL) {
         uint delta = BN_TUNE_NEUTRAL - threshold_quality;
-        ulong tighten = ((target64 >> 1) * (ulong)delta) / (ulong)BN_TUNE_NEUTRAL;
+        ulong tighten = ((target64 >> 2) * (ulong)delta) / (ulong)BN_TUNE_NEUTRAL;
         if (tighten >= target64) {
             return 1UL;
         }
         return target64 - tighten;
     }
 
+    if (threshold_quality > BN_TUNE_NEUTRAL) {
+        uint delta = threshold_quality - BN_TUNE_NEUTRAL;
+        ulong loosen = ((target64 >> 3) * (ulong)delta) / (ulong)BN_TUNE_NEUTRAL;
+        if (target64 > (~0UL - loosen)) {
+            return ~0UL;
+        }
+        return target64 + loosen;
+    }
+
     return target64;
 }
 
+/* much softer than the strict version */
 inline ulong bn_apply_operational_tightening(
     ulong target64,
     uint job_age_ms,
@@ -274,10 +284,10 @@ inline ulong bn_apply_operational_tightening(
     }
 
     uint pressure = max(verify_pressure_q8, max(submit_pressure_q8, stale_risk_q8));
-    ulong tighten_pressure = ((target64 >> 1) * (ulong)pressure) / 255UL;
 
+    ulong tighten_pressure = ((target64 >> 4) * (ulong)pressure) / 255UL;
     uint age_ms = min(job_age_ms, 4000u);
-    ulong tighten_age = ((target64 >> 2) * (ulong)age_ms) / 4000UL;
+    ulong tighten_age = ((target64 >> 4) * (ulong)age_ms) / 4000UL;
 
     ulong tighten = tighten_pressure + tighten_age;
     if (tighten >= target64) {
@@ -286,48 +296,47 @@ inline ulong bn_apply_operational_tightening(
     return max(1UL, target64 - tighten);
 }
 
-inline ulong bn_apply_confidence_target_tightening(
+/* small early/fresh-job relaxation to keep candidates flowing */
+inline ulong bn_apply_early_job_relaxation(
+    ulong target64,
+    uint job_age_ms,
+    uint verify_pressure_q8,
+    uint submit_pressure_q8,
+    uint stale_risk_q8,
+    uint confidence_quality
+) {
+    uint pressure = max(verify_pressure_q8, max(submit_pressure_q8, stale_risk_q8));
+    if (job_age_ms > 900u || pressure > 64u) {
+        return target64;
+    }
+
+    ulong bonus = target64 >> 2; /* +25% */
+    if (confidence_quality >= 96u) {
+        bonus += (target64 >> 4); /* up to +31.25% */
+    }
+
+    if (target64 > (~0UL - bonus)) {
+        return ~0UL;
+    }
+    return target64 + bonus;
+}
+
+inline ulong bn_near_target64(
     ulong target64,
     uint confidence_quality
 ) {
-    if (target64 <= 1UL) {
-        return target64;
+    ulong bonus = target64 >> 2; /* +25% */
+
+    if (confidence_quality >= 96u) {
+        bonus += (target64 >> 3); /* +12.5% more */
+    } else if (confidence_quality < 32u) {
+        bonus >>= 1;
     }
 
-    if (confidence_quality < 16u) {
-        return max(1UL, target64 >> 2);
+    if (target64 > (~0UL - bonus)) {
+        return ~0UL;
     }
-    if (confidence_quality < 32u) {
-        return max(1UL, target64 >> 1);
-    }
-    if (confidence_quality < 64u) {
-        ulong tighten = target64 >> 2;
-        if (tighten >= target64) {
-            return 1UL;
-        }
-        return max(1UL, target64 - tighten);
-    }
-
-    return target64;
-}
-
-inline ulong bn_apply_ensemble_target_tightening(
-    ulong target64,
-    uint disagreement_q8
-) {
-    if (target64 <= 1UL) {
-        return target64;
-    }
-
-    if (disagreement_q8 == 0u) {
-        return target64;
-    }
-
-    ulong tighten = ((target64 >> 2) * (ulong)disagreement_q8) / 255UL;
-    if (tighten >= target64) {
-        return 1UL;
-    }
-    return max(1UL, target64 - tighten);
+    return target64 + max(1UL, bonus);
 }
 
 inline ulong bn_rank_score(ulong tail64, uint rank_quality) {
@@ -336,7 +345,7 @@ inline ulong bn_rank_score(ulong tail64, uint rank_quality) {
     }
 
     uint delta = BN_TUNE_NEUTRAL - rank_quality;
-    ulong penalty = ((ulong)delta) << 48;
+    ulong penalty = ((ulong)delta) << 46;
     ulong limit = ~0UL - penalty;
     return (tail64 >= limit) ? ~0UL : (tail64 + penalty);
 }
@@ -355,7 +364,7 @@ inline ulong bn_apply_credit_bonus(ulong score, uint credit_quality, uint confid
     }
 
     uint delta = credit_quality - BN_TUNE_NEUTRAL;
-    ulong bonus = (((ulong)delta) * (ulong)(confidence_quality + 1u)) << 24;
+    ulong bonus = (((ulong)delta) * (ulong)(confidence_quality + 1u)) << 22;
 
     if (bonus >= score) {
         return 0UL;
@@ -371,66 +380,16 @@ inline ulong bn_apply_operational_penalty(
     uint stale_risk_q8
 ) {
     uint pressure = max(verify_pressure_q8, max(submit_pressure_q8, stale_risk_q8));
-    ulong penalty = (((ulong)pressure) << 32);
 
+    ulong penalty = (((ulong)pressure) << 30);
     uint age_ms = min(job_age_ms, 4000u);
-    penalty += (((ulong)age_ms) << 20);
+    penalty += (((ulong)age_ms) << 18);
 
     ulong limit = ~0UL - penalty;
     if (score >= limit) {
         return ~0UL;
     }
     return score + penalty;
-}
-
-inline ulong bn_near_target64(ulong target64) {
-    if (target64 == ~0UL) {
-        return target64;
-    }
-    ulong slack = max(1UL, target64 >> 3);
-    if (target64 > (~0UL - slack)) {
-        return ~0UL;
-    }
-    return target64 + slack;
-}
-
-inline uint bn_effective_local_topk(
-    uint job_age_ms,
-    uint verify_pressure_q8,
-    uint submit_pressure_q8,
-    uint stale_risk_q8
-) {
-    uint topk = BN_LOCAL_TOPK;
-    uint pressure = max(verify_pressure_q8, max(submit_pressure_q8, stale_risk_q8));
-
-    if (pressure >= 192u || job_age_ms >= 2400u) {
-        topk = max(1u, topk / 2u);
-    } else if (pressure >= 96u || job_age_ms >= 1200u) {
-        topk = max(1u, topk - 2u);
-    }
-
-    return max(1u, min((uint)BN_LOCAL_TOPK, topk));
-}
-
-inline uint bn_effective_local_near_limit(
-    uint effective_topk,
-    uint job_age_ms,
-    uint verify_pressure_q8,
-    uint submit_pressure_q8,
-    uint stale_risk_q8
-) {
-    uint pressure = max(verify_pressure_q8, max(submit_pressure_q8, stale_risk_q8));
-
-    if (effective_topk <= 1u) {
-        return 0u;
-    }
-    if (pressure >= 160u || job_age_ms >= 1600u) {
-        return 0u;
-    }
-    if (pressure >= 96u || job_age_ms >= 900u) {
-        return 1u;
-    }
-    return max(1u, effective_topk / 4u);
 }
 
 inline void bn_compute_tail_ensemble(
@@ -460,15 +419,20 @@ inline void bn_compute_tail_ensemble(
     ulong md = bn_median3_u64(t0, t1, t2);
 
     ulong spread = mx - mn;
-    ulong gap = md - mn;
-
-    uint spread_q8 = min(255u, (uint)(spread >> 52));
-    uint gap_q8 = min(255u, (uint)(gap >> 52));
+    uint spread_q8 = min(255u, (uint)(spread >> 53));
 
     *tail_best = mn;
     *tail_consensus = md;
     *tail_worst = mx;
-    *disagreement_q8 = max(spread_q8, gap_q8);
+    *disagreement_q8 = spread_q8;
+}
+
+inline ulong bn_soft_pass_tail(
+    ulong tail_best,
+    ulong tail_consensus
+) {
+    /* halfway between best and consensus: candidate-heavy but not reckless */
+    return tail_best + ((tail_consensus - tail_best) >> 1);
 }
 
 inline ulong bn_uncertainty_penalty(
@@ -486,48 +450,82 @@ inline ulong bn_uncertainty_penalty(
         (uint)abs(pc2 - 32) +
         (uint)abs(pc3 - 32);
 
-    int px01 = (int)bn_popcount64(hv[0] ^ hv[1]);
-    int px12 = (int)bn_popcount64(hv[1] ^ hv[2]);
-    int px23 = (int)bn_popcount64(hv[2] ^ hv[3]);
-
-    uint cross =
-        (uint)abs(px01 - 32) +
-        (uint)abs(px12 - 32) +
-        (uint)abs(px23 - 32);
-
-    ulong penalty = 0UL;
-    penalty += ((ulong)imbalance) << 20;
-    penalty += ((ulong)cross) << 18;
-    penalty += ((ulong)disagreement_q8) << 32;
+    ulong penalty = ((ulong)imbalance << 18) + ((ulong)disagreement_q8 << 28);
     return penalty;
 }
 
 inline ulong bn_compose_rank_score(
     __private const ulong hv[4],
-    ulong tail_consensus,
+    ulong soft_tail,
     uint disagreement_q8,
     uint rank_quality,
     uint credit_quality,
-    uint confidence_quality
+    uint confidence_quality,
+    uint stage_class
 ) {
-    ulong score = bn_rank_score(tail_consensus, rank_quality);
+    ulong score = bn_rank_score(soft_tail, rank_quality);
 
     ulong mix0 = hv[0] ^ bn_rotl64(hv[1], 9u) ^ bn_rotr64(hv[2], 13u);
     ulong mix1 = hv[1] ^ bn_rotl64(hv[2], 7u) ^ bn_rotr64(hv[0], 11u);
 
-    ulong secondary = (mix0 >> 40) & 0xFFFFFFUL;
+    ulong secondary = (mix0 >> 44) & 0xFFFFFUL;
     ulong spread = (ulong)(bn_popcount64(mix1) & 0xFFu);
-    ulong tie_penalty = (secondary << 8) | spread;
 
-    score = bn_add_penalty_sat(score, tie_penalty);
+    score = bn_add_penalty_sat(score, (secondary << 8) | spread);
     score = bn_add_penalty_sat(score, bn_uncertainty_penalty(hv, disagreement_q8));
 
-    if (confidence_quality < 64u) {
-        score = bn_add_penalty_sat(score, ((ulong)(64u - confidence_quality)) << 30);
+    if (confidence_quality < 32u) {
+        score = bn_add_penalty_sat(score, ((ulong)(32u - confidence_quality)) << 26);
+    }
+
+    if (stage_class == BN_STAGE_NEAR) {
+        score = bn_add_penalty_sat(score, BN_U64_C(1) << 52);
     }
 
     score = bn_apply_credit_bonus(score, credit_quality, confidence_quality);
     return score;
+}
+
+inline uint bn_effective_local_topk(
+    uint job_age_ms,
+    uint verify_pressure_q8,
+    uint submit_pressure_q8,
+    uint stale_risk_q8
+) {
+    uint topk = BN_LOCAL_TOPK;
+    uint pressure = max(verify_pressure_q8, max(submit_pressure_q8, stale_risk_q8));
+
+    if (pressure >= 224u || job_age_ms >= 3200u) {
+        topk = max(1u, topk / 2u);
+    } else if (pressure >= 160u || job_age_ms >= 2400u) {
+        topk = max(2u, topk - 2u);
+    }
+
+    return max(1u, min((uint)BN_LOCAL_TOPK, topk));
+}
+
+inline uint bn_effective_local_near_limit(
+    uint effective_topk,
+    uint job_age_ms,
+    uint verify_pressure_q8,
+    uint submit_pressure_q8,
+    uint stale_risk_q8
+) {
+    uint pressure = max(verify_pressure_q8, max(submit_pressure_q8, stale_risk_q8));
+
+    if (effective_topk <= 1u) {
+        return 0u;
+    }
+    if (pressure >= 240u || job_age_ms >= 3500u) {
+        return 0u;
+    }
+    if (pressure >= 128u || job_age_ms >= 2200u) {
+        return 1u;
+    }
+    if (pressure >= 64u || job_age_ms >= 1200u) {
+        return min(2u, effective_topk - 1u);
+    }
+    return max(1u, effective_topk / 2u);
 }
 
 inline ulong bn_local_pick_penalty(
@@ -546,22 +544,18 @@ inline ulong bn_local_pick_penalty(
         if (chosen_bucket[j] == cand_bucket && (uint)chosen_tailbin[j] == cand_tailbin) {
             ++dup_cell;
         } else {
-            if (chosen_bucket[j] == cand_bucket) {
-                ++dup_bucket;
-            }
-            if ((uint)chosen_tailbin[j] == cand_tailbin) {
-                ++dup_bin;
-            }
+            if (chosen_bucket[j] == cand_bucket) ++dup_bucket;
+            if ((uint)chosen_tailbin[j] == cand_tailbin) ++dup_bin;
         }
     }
 
     ulong penalty = 0UL;
-    penalty += ((ulong)dup_cell) << 46;
-    penalty += ((ulong)dup_bucket) << 40;
-    penalty += ((ulong)dup_bin) << 36;
+    penalty += ((ulong)dup_cell) << 42;
+    penalty += ((ulong)dup_bucket) << 36;
+    penalty += ((ulong)dup_bin) << 32;
 
     if (cand_class == BN_STAGE_NEAR) {
-        penalty += BN_U64_C(1) << 52;
+        penalty += BN_U64_C(1) << 48;
     }
 
     return penalty;
@@ -641,11 +635,7 @@ inline uint bn_sp_index(uint level_sel, ulong addr) {
     return (uint)(addr & (ulong)(mask_words - 1u));
 }
 
-/*
-    IMPORTANT FIX:
-    Predictor state no longer depends on gid / work-item position.
-    It now depends only on blob + seed + dataset + nonce.
-*/
+/* gid-independent predictor state */
 inline void bn_init_predict_vm(
     __private const uchar* work_blob,
     uint blob_len,
@@ -1135,7 +1125,7 @@ inline void bn_flush_local_topk(
     uint selected_count = 0u;
     uint near_picked = 0u;
 
-    /* Phase 1: unique pass cells first */
+    /* pass first */
     while (selected_count < effective_topk) {
         ulong best_score = ~0UL;
         uint best_i = BN_LOCAL_STAGE_SIZE;
@@ -1188,7 +1178,7 @@ inline void bn_flush_local_topk(
         ++selected_count;
     }
 
-    /* Phase 2: small unique near-miss reserve */
+    /* controlled near reserve */
     while (selected_count < effective_topk && near_picked < near_limit) {
         ulong best_score = ~0UL;
         uint best_i = BN_LOCAL_STAGE_SIZE;
@@ -1242,7 +1232,7 @@ inline void bn_flush_local_topk(
         ++near_picked;
     }
 
-    /* Phase 3: fill remaining with diversity-aware adjusted ranking */
+    /* fill with diversity-aware adjusted rank */
     while (selected_count < effective_topk) {
         ulong best_adj_score = ~0UL;
         uint best_i = BN_LOCAL_STAGE_SIZE;
@@ -1251,10 +1241,7 @@ inline void bn_flush_local_topk(
             if (used[i] != (uchar)0u) continue;
             if ((uint)l_class[i] == BN_STAGE_REJECT) continue;
             if (l_score[i] == ~0UL) continue;
-
-            if ((uint)l_class[i] == BN_STAGE_NEAR && near_picked >= near_limit) {
-                continue;
-            }
+            if ((uint)l_class[i] == BN_STAGE_NEAR && near_picked >= near_limit) continue;
 
             ulong adj = bn_add_penalty_sat(
                 l_score[i],
@@ -1345,9 +1332,11 @@ inline void bn_rank_and_stage(
         &disagreement_q8
     );
 
+    ulong soft_tail = bn_soft_pass_tail(tail_best, tail_consensus);
+
     uint active_tail_bins = max(1u, max(seed_tune_tail_bins, job_tune_tail_bins));
     uint bucket = bn_tune_bucket(hv[0], hv[1], nonce_u32);
-    uint tail_bin = bn_tail_bin_from_tail(tail_consensus, active_tail_bins);
+    uint tail_bin = bn_tail_bin_from_tail(soft_tail, active_tail_bins);
 
     uint seed_rank_q = bn_read_tune_quality(
         seed_tune, seed_tune_buckets, seed_tune_tail_bins, BN_PLANE_RANK,
@@ -1396,42 +1385,34 @@ inline void bn_rank_and_stage(
         submit_pressure_q8,
         stale_risk_q8
     );
-    adjusted_target = bn_apply_confidence_target_tightening(
+    adjusted_target = bn_apply_early_job_relaxation(
         adjusted_target,
+        job_age_ms,
+        verify_pressure_q8,
+        submit_pressure_q8,
+        stale_risk_q8,
         confidence_q
     );
-    adjusted_target = bn_apply_ensemble_target_tightening(
-        adjusted_target,
-        disagreement_q8
-    );
+
+    ulong near_target = bn_near_target64(adjusted_target, confidence_q);
 
     uint stage_class = BN_STAGE_REJECT;
 
-    if (tail_consensus < adjusted_target) {
+    if (soft_tail < adjusted_target || tail_best < adjusted_target) {
         stage_class = BN_STAGE_PASS;
-    } else {
-        ulong near_target = bn_near_target64(adjusted_target);
-        if (
-            confidence_q >= 64u &&
-            disagreement_q8 <= 96u &&
-            tail_best < near_target
-        ) {
-            stage_class = BN_STAGE_NEAR;
-        }
+    } else if (tail_best < near_target && confidence_q >= 16u) {
+        stage_class = BN_STAGE_NEAR;
     }
 
     ulong score = bn_compose_rank_score(
         hv,
-        tail_consensus,
+        soft_tail,
         disagreement_q8,
         rank_q,
         credit_q,
-        confidence_q
+        confidence_q,
+        stage_class
     );
-
-    if (stage_class == BN_STAGE_NEAR) {
-        score = bn_add_penalty_sat(score, BN_U64_C(1) << 56);
-    }
 
     score = bn_apply_operational_penalty(
         score,
@@ -1495,8 +1476,6 @@ __kernel void blocknet_randomx_vm_scan_ext(
     const uint submit_pressure_q8,
     const uint stale_risk_q8
 ) {
-    const size_t gid = get_global_id(0);
-    (void)gid; /* ABI kept, predictor no longer depends on gid */
     const uint lid = get_local_id(0);
     const uint local_size = get_local_size(0);
     const uint nonce_u32 = start_nonce + (uint)get_global_id(0);
@@ -1615,8 +1594,6 @@ __kernel void blocknet_randomx_vm_hash_batch_ext(
     const uint submit_pressure_q8,
     const uint stale_risk_q8
 ) {
-    const size_t gid = get_global_id(0);
-    (void)gid; /* ABI kept, predictor no longer depends on gid */
     const uint lid = get_local_id(0);
     const uint local_size = get_local_size(0);
     const uint nonce_u32 = start_nonce + (uint)get_global_id(0);
