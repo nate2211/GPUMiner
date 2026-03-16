@@ -73,6 +73,10 @@
 #define BN_PLANE_CONFIDENCE 3u
 #define BN_PLANE_COUNT 4u
 
+#define BN_STAGE_REJECT 0u
+#define BN_STAGE_PASS   1u
+#define BN_STAGE_NEAR   2u
+
 inline ulong bn_rotl64(ulong x, uint r) {
     return (x << (r & 63u)) | (x >> ((64u - r) & 63u));
 }
@@ -101,6 +105,36 @@ inline ulong bn_avalanche64(ulong x) {
 
 inline ulong bn_mulh64(ulong a, ulong b) {
     return mul_hi(a, b);
+}
+
+inline uint bn_popcount64(ulong x) {
+    return popcount((uint)x) + popcount((uint)(x >> 32));
+}
+
+inline ulong bn_min_u64(ulong a, ulong b) {
+    return (a < b) ? a : b;
+}
+
+inline ulong bn_max_u64(ulong a, ulong b) {
+    return (a > b) ? a : b;
+}
+
+inline ulong bn_min3_u64(ulong a, ulong b, ulong c) {
+    return bn_min_u64(a, bn_min_u64(b, c));
+}
+
+inline ulong bn_max3_u64(ulong a, ulong b, ulong c) {
+    return bn_max_u64(a, bn_max_u64(b, c));
+}
+
+inline ulong bn_median3_u64(ulong a, ulong b, ulong c) {
+    if (a < b) {
+        if (b < c) return b;
+        return (a < c) ? c : a;
+    } else {
+        if (a < c) return a;
+        return (b < c) ? c : b;
+    }
 }
 
 inline ulong bn_rng_step(__private ulong* s) {
@@ -252,6 +286,50 @@ inline ulong bn_apply_operational_tightening(
     return max(1UL, target64 - tighten);
 }
 
+inline ulong bn_apply_confidence_target_tightening(
+    ulong target64,
+    uint confidence_quality
+) {
+    if (target64 <= 1UL) {
+        return target64;
+    }
+
+    if (confidence_quality < 16u) {
+        return max(1UL, target64 >> 2);
+    }
+    if (confidence_quality < 32u) {
+        return max(1UL, target64 >> 1);
+    }
+    if (confidence_quality < 64u) {
+        ulong tighten = target64 >> 2;
+        if (tighten >= target64) {
+            return 1UL;
+        }
+        return max(1UL, target64 - tighten);
+    }
+
+    return target64;
+}
+
+inline ulong bn_apply_ensemble_target_tightening(
+    ulong target64,
+    uint disagreement_q8
+) {
+    if (target64 <= 1UL) {
+        return target64;
+    }
+
+    if (disagreement_q8 == 0u) {
+        return target64;
+    }
+
+    ulong tighten = ((target64 >> 2) * (ulong)disagreement_q8) / 255UL;
+    if (tighten >= target64) {
+        return 1UL;
+    }
+    return max(1UL, target64 - tighten);
+}
+
 inline ulong bn_rank_score(ulong tail64, uint rank_quality) {
     if (rank_quality >= BN_TUNE_NEUTRAL) {
         return tail64;
@@ -261,6 +339,14 @@ inline ulong bn_rank_score(ulong tail64, uint rank_quality) {
     ulong penalty = ((ulong)delta) << 48;
     ulong limit = ~0UL - penalty;
     return (tail64 >= limit) ? ~0UL : (tail64 + penalty);
+}
+
+inline ulong bn_add_penalty_sat(ulong score, ulong penalty) {
+    ulong limit = ~0UL - penalty;
+    if (score >= limit) {
+        return ~0UL;
+    }
+    return score + penalty;
 }
 
 inline ulong bn_apply_credit_bonus(ulong score, uint credit_quality, uint confidence_quality) {
@@ -295,6 +381,190 @@ inline ulong bn_apply_operational_penalty(
         return ~0UL;
     }
     return score + penalty;
+}
+
+inline ulong bn_near_target64(ulong target64) {
+    if (target64 == ~0UL) {
+        return target64;
+    }
+    ulong slack = max(1UL, target64 >> 3);
+    if (target64 > (~0UL - slack)) {
+        return ~0UL;
+    }
+    return target64 + slack;
+}
+
+inline uint bn_effective_local_topk(
+    uint job_age_ms,
+    uint verify_pressure_q8,
+    uint submit_pressure_q8,
+    uint stale_risk_q8
+) {
+    uint topk = BN_LOCAL_TOPK;
+    uint pressure = max(verify_pressure_q8, max(submit_pressure_q8, stale_risk_q8));
+
+    if (pressure >= 192u || job_age_ms >= 2400u) {
+        topk = max(1u, topk / 2u);
+    } else if (pressure >= 96u || job_age_ms >= 1200u) {
+        topk = max(1u, topk - 2u);
+    }
+
+    return max(1u, min((uint)BN_LOCAL_TOPK, topk));
+}
+
+inline uint bn_effective_local_near_limit(
+    uint effective_topk,
+    uint job_age_ms,
+    uint verify_pressure_q8,
+    uint submit_pressure_q8,
+    uint stale_risk_q8
+) {
+    uint pressure = max(verify_pressure_q8, max(submit_pressure_q8, stale_risk_q8));
+
+    if (effective_topk <= 1u) {
+        return 0u;
+    }
+    if (pressure >= 160u || job_age_ms >= 1600u) {
+        return 0u;
+    }
+    if (pressure >= 96u || job_age_ms >= 900u) {
+        return 1u;
+    }
+    return max(1u, effective_topk / 4u);
+}
+
+inline void bn_compute_tail_ensemble(
+    __private const ulong hv[4],
+    __private ulong* tail_best,
+    __private ulong* tail_consensus,
+    __private ulong* tail_worst,
+    __private uint* disagreement_q8
+) {
+    ulong t0 = hv[3];
+    ulong t1 = bn_mix64(
+        hv[0] ^
+        bn_rotl64(hv[2], 17u) ^
+        bn_rotr64(hv[3], 7u) ^
+        BN_U64_C(0x9E3779B97F4A7C15)
+    );
+    ulong t2 = bn_mix64(
+        hv[1] ^
+        bn_rotr64(hv[2], 11u) ^
+        bn_rotl64(hv[0], 3u) ^
+        bn_rotl64(hv[3], 29u) ^
+        BN_U64_C(0xD1B54A32D192ED03)
+    );
+
+    ulong mn = bn_min3_u64(t0, t1, t2);
+    ulong mx = bn_max3_u64(t0, t1, t2);
+    ulong md = bn_median3_u64(t0, t1, t2);
+
+    ulong spread = mx - mn;
+    ulong gap = md - mn;
+
+    uint spread_q8 = min(255u, (uint)(spread >> 52));
+    uint gap_q8 = min(255u, (uint)(gap >> 52));
+
+    *tail_best = mn;
+    *tail_consensus = md;
+    *tail_worst = mx;
+    *disagreement_q8 = max(spread_q8, gap_q8);
+}
+
+inline ulong bn_uncertainty_penalty(
+    __private const ulong hv[4],
+    uint disagreement_q8
+) {
+    int pc0 = (int)bn_popcount64(hv[0]);
+    int pc1 = (int)bn_popcount64(hv[1]);
+    int pc2 = (int)bn_popcount64(hv[2]);
+    int pc3 = (int)bn_popcount64(hv[3]);
+
+    uint imbalance =
+        (uint)abs(pc0 - 32) +
+        (uint)abs(pc1 - 32) +
+        (uint)abs(pc2 - 32) +
+        (uint)abs(pc3 - 32);
+
+    int px01 = (int)bn_popcount64(hv[0] ^ hv[1]);
+    int px12 = (int)bn_popcount64(hv[1] ^ hv[2]);
+    int px23 = (int)bn_popcount64(hv[2] ^ hv[3]);
+
+    uint cross =
+        (uint)abs(px01 - 32) +
+        (uint)abs(px12 - 32) +
+        (uint)abs(px23 - 32);
+
+    ulong penalty = 0UL;
+    penalty += ((ulong)imbalance) << 20;
+    penalty += ((ulong)cross) << 18;
+    penalty += ((ulong)disagreement_q8) << 32;
+    return penalty;
+}
+
+inline ulong bn_compose_rank_score(
+    __private const ulong hv[4],
+    ulong tail_consensus,
+    uint disagreement_q8,
+    uint rank_quality,
+    uint credit_quality,
+    uint confidence_quality
+) {
+    ulong score = bn_rank_score(tail_consensus, rank_quality);
+
+    ulong mix0 = hv[0] ^ bn_rotl64(hv[1], 9u) ^ bn_rotr64(hv[2], 13u);
+    ulong mix1 = hv[1] ^ bn_rotl64(hv[2], 7u) ^ bn_rotr64(hv[0], 11u);
+
+    ulong secondary = (mix0 >> 40) & 0xFFFFFFUL;
+    ulong spread = (ulong)(bn_popcount64(mix1) & 0xFFu);
+    ulong tie_penalty = (secondary << 8) | spread;
+
+    score = bn_add_penalty_sat(score, tie_penalty);
+    score = bn_add_penalty_sat(score, bn_uncertainty_penalty(hv, disagreement_q8));
+
+    if (confidence_quality < 64u) {
+        score = bn_add_penalty_sat(score, ((ulong)(64u - confidence_quality)) << 30);
+    }
+
+    score = bn_apply_credit_bonus(score, credit_quality, confidence_quality);
+    return score;
+}
+
+inline ulong bn_local_pick_penalty(
+    uint cand_class,
+    uint cand_bucket,
+    uint cand_tailbin,
+    __private const uint* chosen_bucket,
+    __private const uchar* chosen_tailbin,
+    uint selected_count
+) {
+    uint dup_cell = 0u;
+    uint dup_bucket = 0u;
+    uint dup_bin = 0u;
+
+    for (uint j = 0u; j < selected_count; ++j) {
+        if (chosen_bucket[j] == cand_bucket && (uint)chosen_tailbin[j] == cand_tailbin) {
+            ++dup_cell;
+        } else {
+            if (chosen_bucket[j] == cand_bucket) {
+                ++dup_bucket;
+            }
+            if ((uint)chosen_tailbin[j] == cand_tailbin) {
+                ++dup_bin;
+            }
+        }
+    }
+
+    ulong penalty = 0UL;
+    penalty += ((ulong)dup_cell) << 46;
+    penalty += ((ulong)dup_bucket) << 40;
+    penalty += ((ulong)dup_bin) << 36;
+
+    if (cand_class == BN_STAGE_NEAR) {
+        penalty += BN_U64_C(1) << 52;
+    }
+
+    return penalty;
 }
 
 inline void bn_prepare_work_blob(
@@ -371,6 +641,11 @@ inline uint bn_sp_index(uint level_sel, ulong addr) {
     return (uint)(addr & (ulong)(mask_words - 1u));
 }
 
+/*
+    IMPORTANT FIX:
+    Predictor state no longer depends on gid / work-item position.
+    It now depends only on blob + seed + dataset + nonce.
+*/
 inline void bn_init_predict_vm(
     __private const uchar* work_blob,
     uint blob_len,
@@ -379,17 +654,18 @@ inline void bn_init_predict_vm(
     __global const ulong* dataset64,
     uint dataset_words,
     uint nonce_u32,
-    ulong gid64,
     __private ulong regs[8],
     __private ulong* ma,
     __private ulong* mx,
     __private ulong* seed_mix,
     __private ulong* rng_state
 ) {
-    ulong s0 = BN_U64_C(0x243F6A8885A308D3) ^ gid64 ^ (ulong)nonce_u32;
-    ulong s1 = BN_U64_C(0x13198A2E03707344) ^ ((ulong)blob_len << 32) ^ bn_rotl64(gid64, 7u);
-    ulong s2 = BN_U64_C(0xA4093822299F31D0) ^ ((ulong)seed_len << 24) ^ bn_rotl64((ulong)nonce_u32, 13u);
-    ulong s3 = BN_U64_C(0x082EFA98EC4E6C89) ^ gid64 ^ bn_rotr64((ulong)nonce_u32, 9u);
+    ulong nonce64 = (ulong)nonce_u32;
+
+    ulong s0 = BN_U64_C(0x243F6A8885A308D3) ^ nonce64;
+    ulong s1 = BN_U64_C(0x13198A2E03707344) ^ ((ulong)blob_len << 32) ^ bn_rotl64(nonce64, 7u);
+    ulong s2 = BN_U64_C(0xA4093822299F31D0) ^ ((ulong)seed_len << 24) ^ bn_rotl64(nonce64, 13u);
+    ulong s3 = BN_U64_C(0x082EFA98EC4E6C89) ^ bn_rotr64(nonce64, 9u);
 
     for (uint i = 0u; i < blob_len; ++i) {
         ulong v = (ulong)work_blob[i] | ((ulong)(i + 1u) << 8);
@@ -409,8 +685,8 @@ inline void bn_init_predict_vm(
 
     ulong ds0 = bn_dataset_read_mix(dataset64, dataset_words, s0 ^ s2);
     ulong ds1 = bn_dataset_read_mix(dataset64, dataset_words, s1 ^ s3);
-    ulong ds2 = bn_dataset_read_mix(dataset64, dataset_words, s2 ^ s0 ^ gid64);
-    ulong ds3 = bn_dataset_read_mix(dataset64, dataset_words, s3 ^ s1 ^ (ulong)nonce_u32);
+    ulong ds2 = bn_dataset_read_mix(dataset64, dataset_words, s2 ^ s0 ^ nonce64);
+    ulong ds3 = bn_dataset_read_mix(dataset64, dataset_words, s3 ^ s1 ^ nonce64);
 
     regs[0] = bn_avalanche64(s0 ^ ds0);
     regs[1] = bn_avalanche64(s1 ^ ds1);
@@ -424,7 +700,7 @@ inline void bn_init_predict_vm(
     *ma = regs[0] ^ regs[4] ^ ds2;
     *mx = regs[3] ^ regs[7] ^ ds1;
     *seed_mix = bn_avalanche64(s0 ^ s1 ^ s2 ^ s3 ^ ds0 ^ ds1 ^ ds2 ^ ds3);
-    *rng_state = bn_avalanche64(*seed_mix ^ regs[1] ^ regs[6] ^ gid64 ^ (ulong)nonce_u32);
+    *rng_state = bn_avalanche64(*seed_mix ^ regs[1] ^ regs[6] ^ nonce64);
 }
 
 inline void bn_fill_predict_scratchpad(
@@ -603,7 +879,6 @@ inline void bn_digest_predict_state(
     __global const ulong* dataset64,
     uint dataset_words,
     uint nonce_u32,
-    ulong gid64,
     __private ulong outv[4]
 ) {
     ulong s0 = regs[0] ^ bn_rotl64(regs[4], 11u) ^ *ma ^ *seed_mix;
@@ -628,7 +903,7 @@ inline void bn_digest_predict_state(
     }
 
     for (uint i = 0u; i < BN_TAIL_PREDICT_ROUNDS + 8u; ++i) {
-        ulong ds0 = bn_dataset_read_mix(dataset64, dataset_words, s0 ^ s2 ^ (ulong)i ^ gid64);
+        ulong ds0 = bn_dataset_read_mix(dataset64, dataset_words, s0 ^ s2 ^ (ulong)i ^ (ulong)nonce_u32);
         ulong ds1 = bn_dataset_read_mix(dataset64, dataset_words, s1 ^ s3 ^ (ulong)nonce_u32 ^ ((ulong)i << 12));
         ulong x = bn_mix64(ds0 ^ bn_rotl64(ds1, (i + 5u) & 63u) ^ *seed_mix);
 
@@ -653,7 +928,6 @@ inline void bn_gpu_dataset_prefilter_hash(
     uint seed_len,
     __global const ulong* dataset64,
     uint dataset_words,
-    ulong gid64,
     __private ulong outv[4]
 ) {
     __private uchar work_blob[BN_MAX_BLOB_BYTES];
@@ -680,7 +954,6 @@ inline void bn_gpu_dataset_prefilter_hash(
         dataset64,
         dataset_words,
         nonce_u32,
-        gid64,
         regs,
         &ma,
         &mx,
@@ -714,7 +987,6 @@ inline void bn_gpu_dataset_prefilter_hash(
             p
         );
 
-        /* Between-program re-seed / fold similar in spirit to RandomX multi-program flow. */
         ulong fold = bn_mix64(
             regs[p & 7u] ^
             regs[(p + 3u) & 7u] ^
@@ -742,7 +1014,6 @@ inline void bn_gpu_dataset_prefilter_hash(
         dataset64,
         dataset_words,
         nonce_u32,
-        gid64,
         outv
     );
 }
@@ -752,7 +1023,7 @@ inline void bn_stage_candidate_local(
     uint nonce_u32,
     __private const ulong hv[4],
     ulong rank_score,
-    uint passed,
+    uint stage_class,
     uint tune_bucket,
     uint tune_tail_bin,
     uint rank_quality,
@@ -766,10 +1037,11 @@ inline void bn_stage_candidate_local(
     __local uint* l_bucket,
     __local uchar* l_rankq,
     __local uchar* l_threshq,
-    __local uchar* l_tailbin
+    __local uchar* l_tailbin,
+    __local uchar* l_class
 ) {
     if (lid < BN_LOCAL_STAGE_SIZE) {
-        if (passed != 0u) {
+        if (stage_class != BN_STAGE_REJECT) {
             l_score[lid] = rank_score;
             l_nonce[lid] = nonce_u32;
             l_h0[lid] = hv[0];
@@ -780,6 +1052,7 @@ inline void bn_stage_candidate_local(
             l_rankq[lid] = (uchar)(rank_quality & 0xFFu);
             l_threshq[lid] = (uchar)(threshold_quality & 0xFFu);
             l_tailbin[lid] = (uchar)(tune_tail_bin & 0xFFu);
+            l_class[lid] = (uchar)(stage_class & 0xFFu);
         } else {
             l_score[lid] = ~0UL;
             l_nonce[lid] = 0u;
@@ -791,6 +1064,7 @@ inline void bn_stage_candidate_local(
             l_rankq[lid] = (uchar)BN_TUNE_NEUTRAL;
             l_threshq[lid] = (uchar)BN_TUNE_NEUTRAL;
             l_tailbin[lid] = (uchar)0u;
+            l_class[lid] = (uchar)BN_STAGE_REJECT;
         }
     }
 }
@@ -799,6 +1073,10 @@ inline void bn_flush_local_topk(
     uint lid,
     uint local_size,
     uint max_results,
+    uint job_age_ms,
+    uint verify_pressure_q8,
+    uint submit_pressure_q8,
+    uint stale_risk_q8,
     __local ulong* l_score,
     __local uint* l_nonce,
     __local ulong* l_h0,
@@ -809,6 +1087,7 @@ inline void bn_flush_local_topk(
     __local uchar* l_rankq,
     __local uchar* l_threshq,
     __local uchar* l_tailbin,
+    __local uchar* l_class,
     __global uchar* out_hashes,
     __global uint* out_nonces,
     __global ulong* out_scores,
@@ -829,17 +1108,53 @@ inline void bn_flush_local_topk(
         active = BN_LOCAL_STAGE_SIZE;
     }
 
+    uint effective_topk = bn_effective_local_topk(
+        job_age_ms,
+        verify_pressure_q8,
+        submit_pressure_q8,
+        stale_risk_q8
+    );
+    effective_topk = min(effective_topk, max_results);
+
+    uint near_limit = bn_effective_local_near_limit(
+        effective_topk,
+        job_age_ms,
+        verify_pressure_q8,
+        submit_pressure_q8,
+        stale_risk_q8
+    );
+
     uchar used[BN_LOCAL_STAGE_SIZE];
     for (uint i = 0u; i < active; ++i) {
         used[i] = (uchar)0u;
     }
 
-    for (uint k = 0u; k < BN_LOCAL_TOPK; ++k) {
+    uint chosen_bucket[BN_LOCAL_TOPK];
+    uchar chosen_tailbin[BN_LOCAL_TOPK];
+
+    uint selected_count = 0u;
+    uint near_picked = 0u;
+
+    /* Phase 1: unique pass cells first */
+    while (selected_count < effective_topk) {
         ulong best_score = ~0UL;
         uint best_i = BN_LOCAL_STAGE_SIZE;
 
         for (uint i = 0u; i < active; ++i) {
-            if (used[i] == (uchar)0u && l_score[i] < best_score) {
+            if (used[i] != (uchar)0u) continue;
+            if ((uint)l_class[i] != BN_STAGE_PASS) continue;
+            if (l_score[i] == ~0UL) continue;
+
+            uint dup_cell = 0u;
+            for (uint j = 0u; j < selected_count; ++j) {
+                if (chosen_bucket[j] == l_bucket[i] && (uint)chosen_tailbin[j] == (uint)l_tailbin[i]) {
+                    dup_cell = 1u;
+                    break;
+                }
+            }
+            if (dup_cell != 0u) continue;
+
+            if (l_score[i] < best_score) {
                 best_score = l_score[i];
                 best_i = i;
             }
@@ -850,6 +1165,8 @@ inline void bn_flush_local_topk(
         }
 
         used[best_i] = (uchar)1u;
+        chosen_bucket[selected_count] = l_bucket[best_i];
+        chosen_tailbin[selected_count] = l_tailbin[best_i];
 
         uint slot = bn_reserve_slot(out_count);
         if (slot < max_results) {
@@ -859,7 +1176,6 @@ inline void bn_flush_local_topk(
             out_rankq[slot] = l_rankq[best_i];
             out_threshq[slot] = l_threshq[best_i];
             out_tailbin[slot] = l_tailbin[best_i];
-
             bn_write_hash32(
                 out_hashes + (slot * BN_HASH_BYTES),
                 l_h0[best_i],
@@ -868,6 +1184,126 @@ inline void bn_flush_local_topk(
                 l_h3[best_i]
             );
         }
+
+        ++selected_count;
+    }
+
+    /* Phase 2: small unique near-miss reserve */
+    while (selected_count < effective_topk && near_picked < near_limit) {
+        ulong best_score = ~0UL;
+        uint best_i = BN_LOCAL_STAGE_SIZE;
+
+        for (uint i = 0u; i < active; ++i) {
+            if (used[i] != (uchar)0u) continue;
+            if ((uint)l_class[i] != BN_STAGE_NEAR) continue;
+            if (l_score[i] == ~0UL) continue;
+
+            uint dup_cell = 0u;
+            for (uint j = 0u; j < selected_count; ++j) {
+                if (chosen_bucket[j] == l_bucket[i] && (uint)chosen_tailbin[j] == (uint)l_tailbin[i]) {
+                    dup_cell = 1u;
+                    break;
+                }
+            }
+            if (dup_cell != 0u) continue;
+
+            if (l_score[i] < best_score) {
+                best_score = l_score[i];
+                best_i = i;
+            }
+        }
+
+        if (best_i >= active || best_score == ~0UL) {
+            break;
+        }
+
+        used[best_i] = (uchar)1u;
+        chosen_bucket[selected_count] = l_bucket[best_i];
+        chosen_tailbin[selected_count] = l_tailbin[best_i];
+
+        uint slot = bn_reserve_slot(out_count);
+        if (slot < max_results) {
+            out_nonces[slot] = l_nonce[best_i];
+            out_scores[slot] = l_score[best_i];
+            out_buckets[slot] = l_bucket[best_i];
+            out_rankq[slot] = l_rankq[best_i];
+            out_threshq[slot] = l_threshq[best_i];
+            out_tailbin[slot] = l_tailbin[best_i];
+            bn_write_hash32(
+                out_hashes + (slot * BN_HASH_BYTES),
+                l_h0[best_i],
+                l_h1[best_i],
+                l_h2[best_i],
+                l_h3[best_i]
+            );
+        }
+
+        ++selected_count;
+        ++near_picked;
+    }
+
+    /* Phase 3: fill remaining with diversity-aware adjusted ranking */
+    while (selected_count < effective_topk) {
+        ulong best_adj_score = ~0UL;
+        uint best_i = BN_LOCAL_STAGE_SIZE;
+
+        for (uint i = 0u; i < active; ++i) {
+            if (used[i] != (uchar)0u) continue;
+            if ((uint)l_class[i] == BN_STAGE_REJECT) continue;
+            if (l_score[i] == ~0UL) continue;
+
+            if ((uint)l_class[i] == BN_STAGE_NEAR && near_picked >= near_limit) {
+                continue;
+            }
+
+            ulong adj = bn_add_penalty_sat(
+                l_score[i],
+                bn_local_pick_penalty(
+                    (uint)l_class[i],
+                    l_bucket[i],
+                    (uint)l_tailbin[i],
+                    chosen_bucket,
+                    chosen_tailbin,
+                    selected_count
+                )
+            );
+
+            if (adj < best_adj_score) {
+                best_adj_score = adj;
+                best_i = i;
+            }
+        }
+
+        if (best_i >= active || best_adj_score == ~0UL) {
+            break;
+        }
+
+        used[best_i] = (uchar)1u;
+        chosen_bucket[selected_count] = l_bucket[best_i];
+        chosen_tailbin[selected_count] = l_tailbin[best_i];
+
+        if ((uint)l_class[best_i] == BN_STAGE_NEAR) {
+            ++near_picked;
+        }
+
+        uint slot = bn_reserve_slot(out_count);
+        if (slot < max_results) {
+            out_nonces[slot] = l_nonce[best_i];
+            out_scores[slot] = l_score[best_i];
+            out_buckets[slot] = l_bucket[best_i];
+            out_rankq[slot] = l_rankq[best_i];
+            out_threshq[slot] = l_threshq[best_i];
+            out_tailbin[slot] = l_tailbin[best_i];
+            bn_write_hash32(
+                out_hashes + (slot * BN_HASH_BYTES),
+                l_h0[best_i],
+                l_h1[best_i],
+                l_h2[best_i],
+                l_h3[best_i]
+            );
+        }
+
+        ++selected_count;
     }
 }
 
@@ -895,11 +1331,23 @@ inline void bn_rank_and_stage(
     __local uint* l_bucket,
     __local uchar* l_rankq,
     __local uchar* l_threshq,
-    __local uchar* l_tailbin
+    __local uchar* l_tailbin,
+    __local uchar* l_class
 ) {
-    uint active_tail_bins = max(1u, seed_tune_tail_bins);
+    ulong tail_best, tail_consensus, tail_worst;
+    uint disagreement_q8;
+
+    bn_compute_tail_ensemble(
+        hv,
+        &tail_best,
+        &tail_consensus,
+        &tail_worst,
+        &disagreement_q8
+    );
+
+    uint active_tail_bins = max(1u, max(seed_tune_tail_bins, job_tune_tail_bins));
     uint bucket = bn_tune_bucket(hv[0], hv[1], nonce_u32);
-    uint tail_bin = bn_tail_bin_from_tail(hv[3], active_tail_bins);
+    uint tail_bin = bn_tail_bin_from_tail(tail_consensus, active_tail_bins);
 
     uint seed_rank_q = bn_read_tune_quality(
         seed_tune, seed_tune_buckets, seed_tune_tail_bins, BN_PLANE_RANK,
@@ -948,11 +1396,43 @@ inline void bn_rank_and_stage(
         submit_pressure_q8,
         stale_risk_q8
     );
+    adjusted_target = bn_apply_confidence_target_tightening(
+        adjusted_target,
+        confidence_q
+    );
+    adjusted_target = bn_apply_ensemble_target_tightening(
+        adjusted_target,
+        disagreement_q8
+    );
 
-    uint passed = (hv[3] < adjusted_target) ? 1u : 0u;
+    uint stage_class = BN_STAGE_REJECT;
 
-    ulong score = bn_rank_score(hv[3], rank_q);
-    score = bn_apply_credit_bonus(score, credit_q, confidence_q);
+    if (tail_consensus < adjusted_target) {
+        stage_class = BN_STAGE_PASS;
+    } else {
+        ulong near_target = bn_near_target64(adjusted_target);
+        if (
+            confidence_q >= 64u &&
+            disagreement_q8 <= 96u &&
+            tail_best < near_target
+        ) {
+            stage_class = BN_STAGE_NEAR;
+        }
+    }
+
+    ulong score = bn_compose_rank_score(
+        hv,
+        tail_consensus,
+        disagreement_q8,
+        rank_q,
+        credit_q,
+        confidence_q
+    );
+
+    if (stage_class == BN_STAGE_NEAR) {
+        score = bn_add_penalty_sat(score, BN_U64_C(1) << 56);
+    }
+
     score = bn_apply_operational_penalty(
         score,
         job_age_ms,
@@ -966,7 +1446,7 @@ inline void bn_rank_and_stage(
         nonce_u32,
         hv,
         score,
-        passed,
+        stage_class,
         bucket,
         tail_bin,
         rank_q,
@@ -980,7 +1460,8 @@ inline void bn_rank_and_stage(
         l_bucket,
         l_rankq,
         l_threshq,
-        l_tailbin
+        l_tailbin,
+        l_class
     );
 }
 
@@ -1015,9 +1496,10 @@ __kernel void blocknet_randomx_vm_scan_ext(
     const uint stale_risk_q8
 ) {
     const size_t gid = get_global_id(0);
+    (void)gid; /* ABI kept, predictor no longer depends on gid */
     const uint lid = get_local_id(0);
     const uint local_size = get_local_size(0);
-    const uint nonce_u32 = start_nonce + (uint)gid;
+    const uint nonce_u32 = start_nonce + (uint)get_global_id(0);
 
     __private ulong hv[4];
 
@@ -1031,6 +1513,7 @@ __kernel void blocknet_randomx_vm_scan_ext(
     __local uchar l_rankq[BN_LOCAL_STAGE_SIZE];
     __local uchar l_threshq[BN_LOCAL_STAGE_SIZE];
     __local uchar l_tailbin[BN_LOCAL_STAGE_SIZE];
+    __local uchar l_class[BN_LOCAL_STAGE_SIZE];
 
     bn_gpu_dataset_prefilter_hash(
         blob,
@@ -1041,7 +1524,6 @@ __kernel void blocknet_randomx_vm_scan_ext(
         seed_len,
         dataset64,
         dataset_words,
-        (ulong)gid,
         hv
     );
 
@@ -1069,13 +1551,18 @@ __kernel void blocknet_randomx_vm_scan_ext(
         l_bucket,
         l_rankq,
         l_threshq,
-        l_tailbin
+        l_tailbin,
+        l_class
     );
 
     bn_flush_local_topk(
         lid,
         local_size,
         max_results,
+        job_age_ms,
+        verify_pressure_q8,
+        submit_pressure_q8,
+        stale_risk_q8,
         l_score,
         l_nonce,
         l_h0,
@@ -1086,6 +1573,7 @@ __kernel void blocknet_randomx_vm_scan_ext(
         l_rankq,
         l_threshq,
         l_tailbin,
+        l_class,
         out_hashes,
         out_nonces,
         out_scores,
@@ -1128,9 +1616,10 @@ __kernel void blocknet_randomx_vm_hash_batch_ext(
     const uint stale_risk_q8
 ) {
     const size_t gid = get_global_id(0);
+    (void)gid; /* ABI kept, predictor no longer depends on gid */
     const uint lid = get_local_id(0);
     const uint local_size = get_local_size(0);
-    const uint nonce_u32 = start_nonce + (uint)gid;
+    const uint nonce_u32 = start_nonce + (uint)get_global_id(0);
 
     __private ulong hv[4];
 
@@ -1144,6 +1633,7 @@ __kernel void blocknet_randomx_vm_hash_batch_ext(
     __local uchar l_rankq[BN_LOCAL_STAGE_SIZE];
     __local uchar l_threshq[BN_LOCAL_STAGE_SIZE];
     __local uchar l_tailbin[BN_LOCAL_STAGE_SIZE];
+    __local uchar l_class[BN_LOCAL_STAGE_SIZE];
 
     bn_gpu_dataset_prefilter_hash(
         blob,
@@ -1154,7 +1644,6 @@ __kernel void blocknet_randomx_vm_hash_batch_ext(
         seed_len,
         dataset64,
         dataset_words,
-        (ulong)gid,
         hv
     );
 
@@ -1182,13 +1671,18 @@ __kernel void blocknet_randomx_vm_hash_batch_ext(
         l_bucket,
         l_rankq,
         l_threshq,
-        l_tailbin
+        l_tailbin,
+        l_class
     );
 
     bn_flush_local_topk(
         lid,
         local_size,
         max_results,
+        job_age_ms,
+        verify_pressure_q8,
+        submit_pressure_q8,
+        stale_risk_q8,
         l_score,
         l_nonce,
         l_h0,
@@ -1199,6 +1693,7 @@ __kernel void blocknet_randomx_vm_hash_batch_ext(
         l_rankq,
         l_threshq,
         l_tailbin,
+        l_class,
         out_hashes,
         out_nonces,
         out_scores,
