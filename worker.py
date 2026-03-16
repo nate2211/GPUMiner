@@ -10,7 +10,7 @@ from typing import Optional
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from cpu_verify import CpuVerifier, target_hex_to_assigned_work
-from models import CandidateShare, MinerConfig, MiningJob, SubmitResult, VerifiedShare
+from models import CandidateShare, MinerConfig, MiningJob, NonceWindow, SubmitResult, VerifiedShare
 from opencl_miner import OpenCLGpuScanner
 from stratum_connection import MiningConnection
 from utils import nonce_to_hex_le, safe_bytes_from_hex
@@ -119,6 +119,9 @@ class MinerWorker(QObject):
         self._last_verify_pressure_q8 = 0
         self._last_submit_pressure_q8 = 0
         self._last_stale_risk_q8 = 0
+        self._last_scan_window_source = "local"
+        self._last_scan_window_count = int(self.config.active_scan_window())
+        self._monerorpc_local_fallback_logged = False
 
         self._scan_rate_15m = RollingWorkMeter(15 * 60)
         self._scan_rate_1h = RollingWorkMeter(60 * 60)
@@ -176,7 +179,7 @@ class MinerWorker(QObject):
         )
 
     def _unverified_submit_enabled(self) -> bool:
-        if self.config.use_solo:
+        if self.config.use_solo or self.config.use_monero_rpc:
             return False
         return bool(self.config.submit_unverified_shares)
 
@@ -211,7 +214,7 @@ class MinerWorker(QObject):
             return "pool_accepted"
 
         if getattr(result, "reject_class", ""):
-            rc = str(result.reject_class).strip().lower()
+            rc = str(getattr(result, "reject_class", "")).strip().lower()
             if rc in {
                 "pool_stale",
                 "pool_duplicate",
@@ -307,17 +310,11 @@ class MinerWorker(QObject):
 
                 effective_candidate_target = max(
                     int(self.config.min_candidate_target),
-                    min(
-                        base_candidate_target,
-                        int(round(base_candidate_target * factor)),
-                    ),
+                    min(base_candidate_target, int(round(base_candidate_target * factor))),
                 )
                 effective_work_items = max(
                     1024,
-                    min(
-                        base_work_items,
-                        int(round(base_work_items * factor)),
-                    ),
+                    min(base_work_items, int(round(base_work_items * factor))),
                 )
 
         self._last_effective_candidate_target = int(effective_candidate_target)
@@ -335,6 +332,38 @@ class MinerWorker(QObject):
             "candidate_target": int(effective_candidate_target),
             "work_items": int(effective_work_items),
         }
+
+    def _acquire_scan_window(self, requested_span: int) -> Optional[NonceWindow]:
+        span = max(1, int(requested_span or self._active_scan_window()))
+        client = self._client
+
+        if self.config.use_monero_rpc and client is not None:
+            try:
+                window = client.request_scan_window(span)
+            except Exception as exc:
+                self.log.emit(f"[monerorpc] nonce lease request failed: {exc}")
+                if bool(getattr(self.config, "monero_rpc_require_leases", False)):
+                    return None
+                window = None
+
+            if window is not None and int(getattr(window, "count", 0)) > 0:
+                self._last_scan_window_source = str(getattr(window, "source", "monerorpc") or "monerorpc")
+                self._last_scan_window_count = max(1, int(window.count))
+                self._monerorpc_local_fallback_logged = False
+                return window
+
+            if bool(getattr(self.config, "monero_rpc_require_leases", False)):
+                self.status.emit("waiting_for_lease")
+                return None
+
+            if not self._monerorpc_local_fallback_logged:
+                self.log.emit("[monerorpc] lease unavailable, falling back to local nonce cursor")
+                self._monerorpc_local_fallback_logged = True
+
+        start = self._next_nonce_window(span)
+        self._last_scan_window_source = "local"
+        self._last_scan_window_count = span
+        return NonceWindow(start_nonce=start, count=span, source="local")
 
     def run(self) -> None:
         scanner = OpenCLGpuScanner(self.config, self.log.emit)
@@ -390,6 +419,9 @@ class MinerWorker(QObject):
             if self.config.use_solo and not self._verify_enabled():
                 self.log.emit("[worker] solo mode detected; raw/unverified submit is disabled")
 
+            if self.config.use_monero_rpc and not self._verify_enabled():
+                self.log.emit("[worker] monerorpc mode detected; raw/unverified submit is disabled")
+
             while not self._stop.is_set():
                 self._process_pending_verifier_refresh()
 
@@ -413,7 +445,16 @@ class MinerWorker(QObject):
                     continue
 
                 scan_ctx = self._build_scan_context(job)
-                start_nonce = self._next_nonce_window(scan_ctx["work_items"])
+                window = self._acquire_scan_window(scan_ctx["work_items"])
+                if window is None or int(window.count) <= 0:
+                    time.sleep(0.05)
+                    self._emit_stats(force=False)
+                    continue
+
+                start_nonce = int(window.start_nonce) & 0xFFFFFFFF
+                work_items = max(1, int(window.count))
+                self._last_scan_window_source = str(window.source or "local")
+                self._last_scan_window_count = int(work_items)
 
                 candidates = scanner.scan(
                     job,
@@ -423,7 +464,7 @@ class MinerWorker(QObject):
                     submit_pressure_q8=scan_ctx["submit_pressure_q8"],
                     stale_risk_q8=scan_ctx["stale_risk_q8"],
                     scan_candidate_target_override=scan_ctx["candidate_target"],
-                    work_items_override=scan_ctx["work_items"],
+                    work_items_override=work_items,
                 )
 
                 live_job, live_generation = self._get_job_state()
@@ -446,7 +487,7 @@ class MinerWorker(QObject):
                 if candidates and bool(getattr(self.config, "sort_candidates", True)):
                     candidates.sort(key=scanner.candidate_sort_key)
 
-                scanned_items = int(max(0, getattr(scanner, "last_scan_work_items", self._last_effective_work_items)))
+                scanned_items = int(max(0, getattr(scanner, "last_scan_work_items", work_items)))
                 self._scan_launches_last = int(max(1, getattr(scanner, "last_scan_chunk_count", 1)))
 
                 with self._stats_lock:
@@ -462,6 +503,8 @@ class MinerWorker(QObject):
                         f"[opencl] candidates={len(candidates)} "
                         f"job={job.job_id} start_nonce={start_nonce:08x} "
                         f"mode={self._scan_mode()} backend={self.config.mining_backend_name()} "
+                        f"window_source={self._last_scan_window_source} "
+                        f"window_count={work_items} "
                         f"job_age_ms={scan_ctx['job_age_ms']} "
                         f"verify_q8={scan_ctx['verify_pressure_q8']} "
                         f"submit_q8={scan_ctx['submit_pressure_q8']} "
@@ -497,7 +540,6 @@ class MinerWorker(QObject):
                 pass
 
             self._emit_stats(force=True)
-
             self._scanner = None
             self._client = None
             self.finished.emit()
@@ -613,7 +655,7 @@ class MinerWorker(QObject):
         return verified
 
     def _attach_solution_blob(self, verified: VerifiedShare, nonce: int, job_id: str) -> None:
-        if not self.config.use_solo:
+        if not (self.config.use_solo or self.config.use_monero_rpc):
             return
 
         job, _ = self._get_job_state()
@@ -694,7 +736,6 @@ class MinerWorker(QObject):
                     f"[worker] submit queue full, dropped={dropped} "
                     f"enqueued={enqueued} job={candidates[0].job_id}"
                 )
-            return
 
     def _collect_verify_batch(
         self,
@@ -765,10 +806,7 @@ class MinerWorker(QObject):
                     self._job_changed_submit_drops += 1
                 break
             try:
-                self._submit_queue.put(
-                    (job_generation, cand, verified),
-                    timeout=0.1,
-                )
+                self._submit_queue.put((job_generation, cand, verified), timeout=0.1)
                 queued = True
                 break
             except queue.Full:
@@ -794,7 +832,6 @@ class MinerWorker(QObject):
             return
 
         self._attach_solution_blob(verified, cand.nonce, cand.job_id)
-
         scanner.record_feedback(cand, "cpu_verified", verified.credited_work, verified.quality)
 
         with self._stats_lock:
@@ -1208,6 +1245,8 @@ class MinerWorker(QObject):
             "verify_pressure_q8_last": int(self._last_verify_pressure_q8),
             "submit_pressure_q8_last": int(self._last_submit_pressure_q8),
             "stale_risk_q8_last": int(self._last_stale_risk_q8),
+            "scan_window_source_last": self._last_scan_window_source,
+            "scan_window_count_last": int(self._last_scan_window_count),
 
             "split_tuning": True,
             "credit_tuning": True,
@@ -1295,6 +1334,7 @@ class MinerWorker(QObject):
             self._job_refresh_needed = bool(needs_prepare)
 
             self._dataset_job_id = job.job_id
+            self._monerorpc_local_fallback_logged = False
 
         self._drain_queue(self._candidate_queue)
         self._drain_queue(self._submit_queue)

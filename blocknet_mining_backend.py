@@ -818,3 +818,123 @@ class BlockNetCpuScanner:
             max_results=max_results,
             threads=threads,
         )
+
+JsonDict = Dict[str, Any]
+
+
+@dataclass
+class MoneroRpcLease:
+    lease_id: str = ""
+    start_nonce: int = 0
+    count: int = 0
+    job_seq: int = 0
+
+
+class BlockNetMoneroRpcBackend:
+    """
+    Broker-backed mining flow:
+
+      GET  /v1/monero_rpc/job/current
+      POST /v1/monero_rpc/feed/poll
+      POST /v1/monero_rpc/lease/alloc
+      POST /v1/monero_rpc/submit/share
+
+    Feeder-side only:
+      POST /v1/monero_rpc/job/push
+    """
+
+    def __init__(
+        self,
+        cfg: BlockNetApiCfg,
+        *,
+        miner_id: str,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.cfg = cfg
+        self.logger = logger or (lambda s: None)
+        self.miner_id = str(miner_id or "").strip() or "worker-1"
+
+        self.feed_seq: int = 0
+        self.job_seq: int = 0
+        self.current_job: JsonDict = {}
+        self.current_lease: Optional[MoneroRpcLease] = None
+
+    async def get_current_job(self) -> JsonDict:
+        j = await asyncio.to_thread(_get_json_sync, self.cfg, "/monero_rpc/job/current")
+        if not j.get("ok"):
+            raise RuntimeError(f"monero_rpc job/current failed: {j}")
+
+        job = j.get("job") or {}
+        self.current_job = job
+        self.job_seq = int(j.get("job_seq", self.job_seq or 0))
+        self.feed_seq = int(j.get("feed_seq", self.feed_seq or 0))
+        return job
+
+    async def poll_feed(self, *, timeout_ms: int = 15000) -> JsonDict:
+        j = await _post_json(
+            self.cfg,
+            "/monero_rpc/feed/poll",
+            {
+                "after_seq": int(self.feed_seq),
+                "timeout_ms": int(timeout_ms),
+            },
+        )
+        if not j.get("ok"):
+            raise RuntimeError(f"monero_rpc feed/poll failed: {j}")
+
+        if j.get("changed"):
+            self.feed_seq = int(j.get("feed_seq", self.feed_seq))
+            self.job_seq = int(j.get("job_seq", self.job_seq))
+            self.current_job = j.get("job") or {}
+            self.current_lease = None
+
+        return j
+
+    async def alloc_lease(self, *, count: int) -> MoneroRpcLease:
+        j = await _post_json(
+            self.cfg,
+            "/monero_rpc/lease/alloc",
+            {
+                "miner_id": self.miner_id,
+                "count": int(count),
+            },
+        )
+        if not j.get("ok"):
+            raise RuntimeError(f"monero_rpc lease/alloc failed: {j}")
+
+        self.current_job = j.get("job") or self.current_job
+        lease = j.get("lease") or {}
+
+        out = MoneroRpcLease(
+            lease_id=str(lease.get("lease_id", "")),
+            start_nonce=int(lease.get("start_nonce", 0)) & 0xFFFFFFFF,
+            count=int(lease.get("count", 0)),
+            job_seq=int(lease.get("job_seq", j.get("job_seq", self.job_seq))),
+        )
+        self.current_lease = out
+        self.job_seq = out.job_seq or self.job_seq
+        return out
+
+    async def submit_share(
+        self,
+        *,
+        job_id: str,
+        nonce_hex: str,
+        result_hex: str,
+        lease_id: str = "",
+    ) -> JsonDict:
+        payload: JsonDict = {
+            "miner_id": self.miner_id,
+            "job_id": str(job_id or "").strip(),
+            "nonce": _normalize_hex(nonce_hex),
+            "result": _normalize_hex(result_hex),
+        }
+        if self.job_seq > 0:
+            payload["job_seq"] = int(self.job_seq)
+        if lease_id:
+            payload["lease_id"] = str(lease_id)
+
+        j = await _post_json(self.cfg, "/monero_rpc/submit/share", payload)
+        if not j.get("ok"):
+            raise RuntimeError(f"monero_rpc submit/share failed: {j}")
+        return j

@@ -198,8 +198,8 @@ class StatCard(QFrame):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("GPUMiner - OpenCL + Stratum / BlockNet / Solo")
-        self.resize(1680, 1120)
+        self.setWindowTitle("GPUMiner - OpenCL + Stratum / BlockNet / Solo / MoneroRPC")
+        self.resize(1760, 1160)
 
         self.worker_thread: QThread | None = None
         self.worker: MinerWorker | None = None
@@ -231,7 +231,7 @@ class MainWindow(QMainWindow):
         self.left_scroll = QScrollArea()
         self.left_scroll.setWidgetResizable(True)
         self.left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.left_scroll.setMinimumWidth(790)
+        self.left_scroll.setMinimumWidth(820)
 
         self.left_container = QWidget()
         self.left_scroll.setWidget(self.left_container)
@@ -242,10 +242,11 @@ class MainWindow(QMainWindow):
 
         self.main_split.addWidget(self.left_scroll)
         self.main_split.addWidget(self._make_right_tabs())
-        self.main_split.setSizes([860, 940])
+        self.main_split.setSizes([900, 960])
 
         self.left_layout.addWidget(self._make_connection_group())
         self.left_layout.addWidget(self._make_blocknet_group())
+        self.left_layout.addWidget(self._make_monerorpc_group())
         self.left_layout.addWidget(self._make_solo_group())
         self.left_layout.addWidget(self._make_opencl_group())
         self.left_layout.addWidget(self._make_pipeline_group())
@@ -263,6 +264,23 @@ class MainWindow(QMainWindow):
         self.set_status("idle")
         self.statusBar().showMessage(f"Config path: {CFG_PATH}")
 
+    @staticmethod
+    def _combo_value_or_none(combo: QComboBox) -> str | None:
+        text = combo.currentText().strip().lower()
+        return text or None
+
+    @staticmethod
+    def _set_combo_from_optional(combo: QComboBox, value: Any) -> None:
+        text = str(value or "").strip().lower()
+        idx = combo.findText(text, Qt.MatchFixedString)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        else:
+            combo.setCurrentIndex(0)
+
+    def _monero_feeder_mode(self) -> str:
+        return self.monero_rpc_feeder_mode_combo.currentText().strip().lower()
+
     def _make_header(self) -> QHBoxLayout:
         layout = QHBoxLayout()
 
@@ -272,7 +290,7 @@ class MainWindow(QMainWindow):
 
         subtitle = QLabel(
             "OpenCL scan + optional CPU verify + adaptive queue pressure control + "
-            "rank / threshold / credit / confidence tuning"
+            "rank / threshold / credit / confidence tuning + brokered MoneroRPC feeder modes"
         )
         subtitle.setObjectName("SubTitle")
 
@@ -300,18 +318,16 @@ class MainWindow(QMainWindow):
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(10)
 
-        self.card_hashrate = StatCard("Accepted 15m", "0 H/s", "P2Pool-style accepted work")
-        self.card_scan = StatCard("GPU Scan 15m", "0 H/s", "Raw scan throughput")
-        self.card_verified_rate = StatCard("Verified 15m", "0 H/s", "Verified credited work")
+        self.card_hashrate = StatCard("Accepted 15m", "0 H/s", "accepted credited work")
+        self.card_scan = StatCard("GPU Scan 15m", "0 H/s", "raw scan throughput")
+        self.card_verified_rate = StatCard("Verified 15m", "0 H/s", "verified credited work")
         self.card_accepted = StatCard("Accepted", "0", "")
         self.card_rejected = StatCard("Rejected", "0", "")
-
         self.card_candidates = StatCard("Candidates", "0", "")
         self.card_verified = StatCard("Verified", "0", "")
         self.card_verify_yield = StatCard("Verify Yield", "0.000", "verified / candidates")
         self.card_accept_yield = StatCard("Accept Yield", "0.000", "accepted / verified")
         self.card_job = StatCard("Job", "-", "")
-
         self.card_height = StatCard("Height", "-", "")
         self.card_queues = StatCard("Queues", "0 / 0", "verify / submit")
         self.card_backend = StatCard("Backend / Mode", "-", "")
@@ -347,7 +363,7 @@ class MainWindow(QMainWindow):
         form.setSpacing(10)
 
         self.backend_combo = QComboBox()
-        self.backend_combo.addItems(["stratum", "blocknet", "solo"])
+        self.backend_combo.addItems(["stratum", "blocknet", "solo", "monerorpc"])
         self.backend_combo.currentTextChanged.connect(self._sync_backend_controls)
 
         self.host_edit = QLineEdit("127.0.0.1")
@@ -357,6 +373,7 @@ class MainWindow(QMainWindow):
 
         self.login_edit = QLineEdit("x")
         self.pass_edit = QLineEdit("x")
+        self.agent_edit = QLineEdit("GPUMiner-PyQt5/0.2")
         self.tls_check = QCheckBox("Use TLS for direct stratum")
 
         form.addRow("Backend", self.backend_combo)
@@ -364,6 +381,7 @@ class MainWindow(QMainWindow):
         form.addRow("Port", self.port_spin)
         form.addRow("Login / Wallet", self.login_edit)
         form.addRow("Password", self.pass_edit)
+        form.addRow("Agent", self.agent_edit)
         form.addRow("", self.tls_check)
         return box
 
@@ -374,6 +392,9 @@ class MainWindow(QMainWindow):
         self.blocknet_relay_edit = QLineEdit("")
         self.blocknet_token_edit = QLineEdit("")
         self.blocknet_prefix_edit = QLineEdit("/v1")
+
+        self.blocknet_force_scheme_combo = QComboBox()
+        self.blocknet_force_scheme_combo.addItems(["", "http", "https"])
 
         self.blocknet_verify_tls_check = QCheckBox("Verify HTTPS certificate")
         self.blocknet_timeout_spin = QSpinBox()
@@ -396,15 +417,87 @@ class MainWindow(QMainWindow):
 
         grid.addWidget(QLabel("API prefix"), 2, 0)
         grid.addWidget(self.blocknet_prefix_edit, 2, 1)
-        grid.addWidget(self.blocknet_verify_tls_check, 2, 2, 1, 2)
+        grid.addWidget(QLabel("Force scheme"), 2, 2)
+        grid.addWidget(self.blocknet_force_scheme_combo, 2, 3)
 
-        grid.addWidget(QLabel("HTTP timeout (s)"), 3, 0)
-        grid.addWidget(self.blocknet_timeout_spin, 3, 1)
-        grid.addWidget(QLabel("Poll interval (ms)"), 3, 2)
-        grid.addWidget(self.blocknet_poll_ms_spin, 3, 3)
+        grid.addWidget(self.blocknet_verify_tls_check, 3, 0, 1, 2)
+        grid.addWidget(QLabel("HTTP timeout (s)"), 3, 2)
+        grid.addWidget(self.blocknet_timeout_spin, 3, 3)
 
-        grid.addWidget(QLabel("Poll max msgs"), 4, 0)
-        grid.addWidget(self.blocknet_max_msgs_spin, 4, 1)
+        grid.addWidget(QLabel("Poll interval (ms)"), 4, 0)
+        grid.addWidget(self.blocknet_poll_ms_spin, 4, 1)
+        grid.addWidget(QLabel("Poll max msgs"), 4, 2)
+        grid.addWidget(self.blocknet_max_msgs_spin, 4, 3)
+
+        return box
+
+    def _make_monerorpc_group(self) -> QGroupBox:
+        box = QGroupBox("MoneroRPC Broker")
+        grid = QGridLayout(box)
+
+        self.monero_rpc_url_edit = QLineEdit("")
+        self.monero_rpc_token_edit = QLineEdit("")
+        self.monero_rpc_prefix_edit = QLineEdit("/v1")
+        self.monero_rpc_force_scheme_combo = QComboBox()
+        self.monero_rpc_force_scheme_combo.addItems(["", "http", "https"])
+
+        self.monero_rpc_verify_tls_check = QCheckBox("Verify HTTPS certificate")
+        self.monero_rpc_timeout_spin = QSpinBox()
+        self.monero_rpc_timeout_spin.setRange(1, 600)
+        self.monero_rpc_timeout_spin.setValue(30)
+
+        self.monero_rpc_poll_ms_spin = QSpinBox()
+        self.monero_rpc_poll_ms_spin.setRange(20, 10000)
+        self.monero_rpc_poll_ms_spin.setValue(250)
+
+        self.monero_rpc_client_id_edit = QLineEdit("")
+        self.monero_rpc_lease_size_spin = QSpinBox()
+        self.monero_rpc_lease_size_spin.setRange(1, 1_000_000_000)
+        self.monero_rpc_lease_size_spin.setValue(8_388_608)
+
+        self.monero_rpc_require_leases_check = QCheckBox("Require backend nonce leases (no local fallback)")
+
+        self.monero_rpc_feeder_mode_combo = QComboBox()
+        self.monero_rpc_feeder_mode_combo.addItems(["none", "solo", "blocknet"])
+        self.monero_rpc_feeder_mode_combo.currentTextChanged.connect(self._sync_backend_controls)
+
+        self.monero_rpc_feeder_poll_ms_spin = QSpinBox()
+        self.monero_rpc_feeder_poll_ms_spin.setRange(100, 60_000)
+        self.monero_rpc_feeder_poll_ms_spin.setValue(1000)
+
+        grid.addWidget(QLabel("Broker URL or host[:port]"), 0, 0)
+        grid.addWidget(self.monero_rpc_url_edit, 0, 1, 1, 3)
+
+        grid.addWidget(QLabel("Token"), 1, 0)
+        grid.addWidget(self.monero_rpc_token_edit, 1, 1, 1, 3)
+
+        grid.addWidget(QLabel("API prefix"), 2, 0)
+        grid.addWidget(self.monero_rpc_prefix_edit, 2, 1)
+        grid.addWidget(QLabel("Force scheme"), 2, 2)
+        grid.addWidget(self.monero_rpc_force_scheme_combo, 2, 3)
+
+        grid.addWidget(self.monero_rpc_verify_tls_check, 3, 0, 1, 2)
+        grid.addWidget(QLabel("HTTP timeout (s)"), 3, 2)
+        grid.addWidget(self.monero_rpc_timeout_spin, 3, 3)
+
+        grid.addWidget(QLabel("Poll interval (ms)"), 4, 0)
+        grid.addWidget(self.monero_rpc_poll_ms_spin, 4, 1)
+        grid.addWidget(QLabel("Client ID"), 4, 2)
+        grid.addWidget(self.monero_rpc_client_id_edit, 4, 3)
+
+        grid.addWidget(QLabel("Lease size"), 5, 0)
+        grid.addWidget(self.monero_rpc_lease_size_spin, 5, 1)
+        grid.addWidget(self.monero_rpc_require_leases_check, 5, 2, 1, 2)
+
+        grid.addWidget(QLabel("Embedded feeder"), 6, 0)
+        grid.addWidget(self.monero_rpc_feeder_mode_combo, 6, 1)
+        grid.addWidget(QLabel("Feeder poll (ms)"), 6, 2)
+        grid.addWidget(self.monero_rpc_feeder_poll_ms_spin, 6, 3)
+
+        note = QLabel("Feeder=solo uses Solo/monerod settings below. Feeder=blocknet uses BlockNet relay settings above.")
+        note.setObjectName("SubTitle")
+        note.setWordWrap(True)
+        grid.addWidget(note, 7, 0, 1, 4)
 
         return box
 
@@ -970,6 +1063,7 @@ class MainWindow(QMainWindow):
             self.host_edit,
             self.login_edit,
             self.pass_edit,
+            self.agent_edit,
             self.kernel_edit,
             self.loader_edit,
             self.verifier_dll_edit,
@@ -978,6 +1072,10 @@ class MainWindow(QMainWindow):
             self.blocknet_relay_edit,
             self.blocknet_token_edit,
             self.blocknet_prefix_edit,
+            self.monero_rpc_url_edit,
+            self.monero_rpc_token_edit,
+            self.monero_rpc_prefix_edit,
+            self.monero_rpc_client_id_edit,
             self.solo_wallet_edit,
             self.solo_rpc_edit,
             self.solo_zmq_edit,
@@ -987,6 +1085,8 @@ class MainWindow(QMainWindow):
         for check in [
             self.tls_check,
             self.blocknet_verify_tls_check,
+            self.monero_rpc_verify_tls_check,
+            self.monero_rpc_require_leases_check,
             self.enable_cpu_verify_check,
             self.submit_unverified_check,
             self.enable_cpu_verify_batch_check,
@@ -1001,7 +1101,16 @@ class MainWindow(QMainWindow):
         ]:
             check.toggled.connect(self.schedule_save)
 
-        self.backend_combo.currentTextChanged.connect(self.schedule_save)
+        for combo in [
+            self.backend_combo,
+            self.scan_mode_combo,
+            self.blocknet_force_scheme_combo,
+            self.monero_rpc_force_scheme_combo,
+            self.monero_rpc_feeder_mode_combo,
+        ]:
+            combo.currentTextChanged.connect(self.schedule_save)
+
+        self.tabs.currentChanged.connect(self.schedule_save)
 
         for spin in [
             self.port_spin,
@@ -1014,6 +1123,10 @@ class MainWindow(QMainWindow):
             self.blocknet_timeout_spin,
             self.blocknet_poll_ms_spin,
             self.blocknet_max_msgs_spin,
+            self.monero_rpc_timeout_spin,
+            self.monero_rpc_poll_ms_spin,
+            self.monero_rpc_lease_size_spin,
+            self.monero_rpc_feeder_poll_ms_spin,
             self.scan_chunk_spin,
             self.hash_batch_size_spin,
             self.scan_target_spin,
@@ -1058,10 +1171,12 @@ class MainWindow(QMainWindow):
 
     def _sync_backend_controls(self) -> None:
         backend = self.backend_combo.currentText().strip().lower()
+        feeder_mode = self._monero_feeder_mode()
 
         using_stratum = backend == "stratum"
         using_blocknet = backend == "blocknet"
         using_solo = backend == "solo"
+        using_monerorpc = backend == "monerorpc"
 
         self.host_edit.setEnabled(using_stratum)
         self.port_spin.setEnabled(using_stratum)
@@ -1069,16 +1184,36 @@ class MainWindow(QMainWindow):
         self.pass_edit.setEnabled(using_stratum)
         self.tls_check.setEnabled(using_stratum)
 
+        enable_blocknet_group = using_blocknet or (using_monerorpc and feeder_mode == "blocknet")
+        enable_solo_group = using_solo or (using_monerorpc and feeder_mode == "solo")
+
         for w in [
             self.blocknet_relay_edit,
             self.blocknet_token_edit,
             self.blocknet_prefix_edit,
+            self.blocknet_force_scheme_combo,
             self.blocknet_verify_tls_check,
             self.blocknet_timeout_spin,
             self.blocknet_poll_ms_spin,
             self.blocknet_max_msgs_spin,
         ]:
-            w.setEnabled(using_blocknet)
+            w.setEnabled(enable_blocknet_group)
+
+        for w in [
+            self.monero_rpc_url_edit,
+            self.monero_rpc_token_edit,
+            self.monero_rpc_prefix_edit,
+            self.monero_rpc_force_scheme_combo,
+            self.monero_rpc_verify_tls_check,
+            self.monero_rpc_timeout_spin,
+            self.monero_rpc_poll_ms_spin,
+            self.monero_rpc_client_id_edit,
+            self.monero_rpc_lease_size_spin,
+            self.monero_rpc_require_leases_check,
+            self.monero_rpc_feeder_mode_combo,
+            self.monero_rpc_feeder_poll_ms_spin,
+        ]:
+            w.setEnabled(using_monerorpc)
 
         for w in [
             self.solo_wallet_edit,
@@ -1088,9 +1223,9 @@ class MainWindow(QMainWindow):
             self.solo_poll_spin,
             self.solo_reserve_spin,
         ]:
-            w.setEnabled(using_solo)
+            w.setEnabled(enable_solo_group)
 
-        if using_solo and not self.enable_cpu_verify_check.isChecked():
+        if using_solo or using_monerorpc:
             self.submit_unverified_check.setChecked(False)
 
         self._sync_verification_controls()
@@ -1103,7 +1238,6 @@ class MainWindow(QMainWindow):
         self.gws_spin.setEnabled(is_chunk)
         self.scan_chunk_spin.setEnabled(is_chunk)
         self.max_scan_ms_spin.setEnabled(is_chunk)
-
         self.hash_batch_size_spin.setEnabled(is_hash_batch)
 
     def _sync_verification_controls(self) -> None:
@@ -1111,10 +1245,11 @@ class MainWindow(QMainWindow):
         verify_batch_on = verify_on and self.enable_cpu_verify_batch_check.isChecked()
         hash_teacher_on = verify_on and self.enable_cpu_hash_batch_check.isChecked()
         tail_batch_on = verify_on and self.enable_cpu_tail_batch_check.isChecked()
-        solo = self.backend_combo.currentText().strip().lower() == "solo"
+        backend = self.backend_combo.currentText().strip().lower()
+        raw_forbidden = backend in {"solo", "monerorpc"}
 
-        self.submit_unverified_check.setEnabled((not verify_on) and (not solo))
-        if solo:
+        self.submit_unverified_check.setEnabled((not verify_on) and (not raw_forbidden))
+        if raw_forbidden:
             self.submit_unverified_check.setChecked(False)
 
         if (verify_batch_on or hash_teacher_on or tail_batch_on) and self.verify_threads_spin.value() != 1:
@@ -1122,7 +1257,9 @@ class MainWindow(QMainWindow):
             self.verify_threads_spin.setValue(1)
             self.verify_threads_spin.blockSignals(False)
 
-        self.verify_threads_spin.setEnabled(verify_on and (not verify_batch_on) and (not hash_teacher_on) and (not tail_batch_on))
+        self.verify_threads_spin.setEnabled(
+            verify_on and (not verify_batch_on) and (not hash_teacher_on) and (not tail_batch_on)
+        )
         self.verify_queue_limit_spin.setEnabled(verify_on)
 
         self.enable_cpu_verify_batch_check.setEnabled(verify_on)
@@ -1139,10 +1276,7 @@ class MainWindow(QMainWindow):
         self.cpu_tail_batch_threads_spin.setEnabled(tail_batch_on)
 
     def _sync_tuning_controls(self) -> None:
-        tuning_on = self.enable_bucket_tuning_check.isChecked()
-        job_tuning_on = self.enable_job_tuning_check.isChecked()
-        enabled = tuning_on or job_tuning_on
-
+        enabled = self.enable_bucket_tuning_check.isChecked() or self.enable_job_tuning_check.isChecked()
         for w in [
             self.ema_alpha_spin,
             self.tune_verified_spin,
@@ -1224,12 +1358,14 @@ class MainWindow(QMainWindow):
         lws = self.lws_spin.value() or None
 
         backend = self.backend_combo.currentText().strip().lower()
+        feeder_mode = self._monero_feeder_mode()
         host = self.host_edit.text().strip()
         kernel_path = self.kernel_edit.text().strip()
         opencl_loader = self.loader_edit.text().strip()
         verifier_dll_path = self.verifier_dll_edit.text().strip()
         randomx_runtime_dll_path = self.randomx_runtime_dll_edit.text().strip()
         scan_mode = self.scan_mode_combo.currentText().strip().lower()
+        agent = self.agent_edit.text().strip() or "GPUMiner-PyQt5/0.2"
 
         if not kernel_path:
             raise ValueError("Kernel path is required.")
@@ -1241,29 +1377,42 @@ class MainWindow(QMainWindow):
             raise ValueError("GPU scan mode must be 'chunk' or 'hash_batch'.")
 
         if backend == "blocknet":
-            relay = self.blocknet_relay_edit.text().strip()
-            if not relay:
+            if not self.blocknet_relay_edit.text().strip():
                 raise ValueError("BlockNet relay is required when BlockNet backend is selected.")
         elif backend == "solo":
-            wallet = self.solo_wallet_edit.text().strip()
-            if not wallet:
+            if not self.solo_wallet_edit.text().strip():
                 raise ValueError("Solo wallet address is required.")
-            rpc_url = self.solo_rpc_edit.text().strip()
-            if not rpc_url:
+            if not self.solo_rpc_edit.text().strip():
                 raise ValueError("Solo daemon RPC URL is required.")
+        elif backend == "monerorpc":
+            if not self.monero_rpc_url_edit.text().strip():
+                raise ValueError("MoneroRPC URL is required when MoneroRPC backend is selected.")
+            if feeder_mode == "solo":
+                if not self.solo_wallet_edit.text().strip():
+                    raise ValueError("Solo wallet address is required for MoneroRPC feeder=solo.")
+                if not self.solo_rpc_edit.text().strip():
+                    raise ValueError("Solo daemon RPC URL is required for MoneroRPC feeder=solo.")
+            if feeder_mode == "blocknet":
+                if not self.blocknet_relay_edit.text().strip():
+                    raise ValueError("BlockNet relay is required for MoneroRPC feeder=blocknet.")
         else:
             if not host:
                 raise ValueError("Host is required.")
-            login = self.login_edit.text().strip()
-            if not login:
+            if not self.login_edit.text().strip():
                 raise ValueError("Login / wallet is required for direct stratum.")
+
+        submit_unverified = self.submit_unverified_check.isChecked()
+        if backend in {"solo", "monerorpc"}:
+            submit_unverified = False
 
         return MinerConfig(
             mining_backend=backend,
+
             host=host,
             port=int(self.port_spin.value()),
             login=self.login_edit.text().strip(),
             password=self.pass_edit.text().strip(),
+            agent=agent,
             use_tls=self.tls_check.isChecked(),
 
             blocknet_api_relay=self.blocknet_relay_edit.text().strip(),
@@ -1271,8 +1420,22 @@ class MainWindow(QMainWindow):
             blocknet_api_prefix=self.blocknet_prefix_edit.text().strip() or "/v1",
             blocknet_verify_tls=self.blocknet_verify_tls_check.isChecked(),
             blocknet_timeout_s=float(self.blocknet_timeout_spin.value()),
+            blocknet_force_scheme=self._combo_value_or_none(self.blocknet_force_scheme_combo),
             blocknet_poll_interval_ms=int(self.blocknet_poll_ms_spin.value()),
             blocknet_poll_max_msgs=int(self.blocknet_max_msgs_spin.value()),
+
+            monero_rpc_url=self.monero_rpc_url_edit.text().strip(),
+            monero_rpc_token=self.monero_rpc_token_edit.text().strip(),
+            monero_rpc_prefix=self.monero_rpc_prefix_edit.text().strip() or "/v1",
+            monero_rpc_verify_tls=self.monero_rpc_verify_tls_check.isChecked(),
+            monero_rpc_timeout_s=float(self.monero_rpc_timeout_spin.value()),
+            monero_rpc_force_scheme=self._combo_value_or_none(self.monero_rpc_force_scheme_combo),
+            monero_rpc_poll_interval_ms=int(self.monero_rpc_poll_ms_spin.value()),
+            monero_rpc_client_id=self.monero_rpc_client_id_edit.text().strip(),
+            monero_rpc_lease_size=int(self.monero_rpc_lease_size_spin.value()),
+            monero_rpc_require_leases=self.monero_rpc_require_leases_check.isChecked(),
+            monero_rpc_feeder_mode=feeder_mode,
+            monero_rpc_feeder_poll_interval_ms=int(self.monero_rpc_feeder_poll_ms_spin.value()),
 
             solo_wallet_address=self.solo_wallet_edit.text().strip(),
             solo_daemon_rpc_url=self.solo_rpc_edit.text().strip(),
@@ -1296,7 +1459,7 @@ class MainWindow(QMainWindow):
             require_dataset=True,
 
             enable_cpu_verify=self.enable_cpu_verify_check.isChecked(),
-            submit_unverified_shares=self.submit_unverified_check.isChecked(),
+            submit_unverified_shares=submit_unverified,
 
             enable_cpu_verify_batch=self.enable_cpu_verify_batch_check.isChecked(),
             cpu_verify_batch_size=int(self.cpu_verify_batch_size_spin.value()),
@@ -1396,9 +1559,7 @@ class MainWindow(QMainWindow):
         launches = int(stats.get("scan_launches_last", 0))
 
         verify_enabled = bool(stats.get("verification_enabled", self.enable_cpu_verify_check.isChecked()))
-        verify_batch_enabled = bool(
-            stats.get("verification_batch_enabled", self.enable_cpu_verify_batch_check.isChecked())
-        )
+        verify_batch_enabled = bool(stats.get("verification_batch_enabled", self.enable_cpu_verify_batch_check.isChecked()))
         hash_batch_enabled = bool(stats.get("hash_batch_enabled", self.enable_cpu_hash_batch_check.isChecked()))
         tail_batch_enabled = bool(stats.get("tail_batch_enabled", self.enable_cpu_tail_batch_check.isChecked()))
         hash_batch_min_size = int(stats.get("cpu_hash_batch_min_size", self.cpu_hash_batch_min_size_spin.value()))
@@ -1415,6 +1576,8 @@ class MainWindow(QMainWindow):
         submit_q8 = int(stats.get("submit_pressure_q8_last", 0))
         stale_q8 = int(stats.get("stale_risk_q8_last", 0))
         tail_bins = int(stats.get("tail_bins", self.tune_tail_bins_spin.value()))
+        scan_window_source = str(stats.get("scan_window_source_last", "local"))
+        scan_window_count = int(stats.get("scan_window_count_last", 0))
 
         self.card_hashrate.set_value(f"{accepted_rate:,} H/s", "accepted work")
         self.card_scan.set_value(f"{scan_rate:,} H/s", "raw scan")
@@ -1424,14 +1587,20 @@ class MainWindow(QMainWindow):
             str(rejected),
             f"stale={stale_rejects} dup={dup_rejects} invalid={invalid_rejects} backend={backend_rejects}",
         )
-        self.card_candidates.set_value(str(candidates), f"verify_rejected={verify_rejected} tail_accepts={teacher_tail_accepted}")
+        self.card_candidates.set_value(
+            str(candidates),
+            f"verify_rejected={verify_rejected} tail_accepts={teacher_tail_accepted}",
+        )
         self.card_verified.set_value(str(verified), f"launches={launches}")
         self.card_verify_yield.set_value(f"{verify_yield:.3f}", "verified / candidates")
         self.card_accept_yield.set_value(f"{accept_yield:.3f}", "accepted / verified")
         self.card_job.set_value(job_id, f"tail_bins={tail_bins}")
         self.card_height.set_value(height, "")
         self.card_queues.set_value(f"{cq} / {sq}", "verify / submit")
-        self.card_backend.set_value(f"{backend} / {scan_mode}", f"verify={'on' if verify_enabled else 'off'}")
+        self.card_backend.set_value(
+            f"{backend} / {scan_mode}",
+            f"verify={'on' if verify_enabled else 'off'} window={scan_window_source}/{scan_window_count}",
+        )
         self.card_effective_target.set_value(str(eff_target), f"stale_q8={stale_q8}")
         self.card_effective_work.set_value(str(eff_work), f"age_ms={job_age_ms}")
 
@@ -1439,7 +1608,8 @@ class MainWindow(QMainWindow):
         self.summary_sub_lbl.setText(
             f"Accepted: {accepted}    Rejected: {rejected}    Candidates: {candidates}    "
             f"Verified: {verified}    VerifyReject: {verify_rejected}    TailAccept: {teacher_tail_accepted}    "
-            f"RawSubmits: {submitted_unverified}    Job: {job_id}    Height: {height}    Queues: {cq}/{sq}    Mode: {scan_mode}    "
+            f"RawSubmits: {submitted_unverified}    Job: {job_id}    Height: {height}    Queues: {cq}/{sq}    "
+            f"Mode: {scan_mode}    Backend: {backend}    Window: {scan_window_source}/{scan_window_count}    "
             f"Verify: {'on' if verify_enabled else 'off'}    "
             f"VerifyBatch: {'on' if verify_batch_enabled else 'off'}({verify_batch_size})    "
             f"HashTeacher: {'on' if hash_batch_enabled else 'off'}({hash_batch_min_size})    "
@@ -1464,7 +1634,7 @@ class MainWindow(QMainWindow):
         self.pressure_lbl.setText(
             f"EffTarget: {eff_target}    EffWork: {eff_work}    "
             f"AgeMs: {job_age_ms}    Q8[v/s/st]={verify_q8}/{submit_q8}/{stale_q8}    "
-            f"TailBins: {tail_bins}"
+            f"TailBins: {tail_bins}    Window: {scan_window_source}/{scan_window_count}"
         )
 
         try:
@@ -1477,16 +1647,26 @@ class MainWindow(QMainWindow):
         upper = s.upper()
         self.status_pill.setText(upper)
 
-        if upper in {"RUNNING", "CONNECTED"}:
+        if upper in {"RUNNING", "CONNECTED", "MINING"}:
             self.status_pill.setStyleSheet("background:#153a29; color:#eaffea;")
-        elif upper in {"STARTING", "RECONNECTING", "STOPPING", "CONNECTING"}:
+        elif upper in {"STARTING", "RECONNECTING", "STOPPING", "CONNECTING", "WAITING_FOR_LEASE", "WAITING_FOR_FEEDER"}:
             self.status_pill.setStyleSheet("background:#3b3418; color:#fff7da;")
         else:
             self.status_pill.setStyleSheet("background:#4b2020; color:#ffecec;")
 
         self.start_btn.setEnabled(upper in {"IDLE", "STOPPED", "ERROR"})
         self.stop_btn.setEnabled(
-            upper in {"RUNNING", "STARTING", "RECONNECTING", "STOPPING", "CONNECTED", "CONNECTING"}
+            upper in {
+                "RUNNING",
+                "STARTING",
+                "RECONNECTING",
+                "STOPPING",
+                "CONNECTED",
+                "CONNECTING",
+                "MINING",
+                "WAITING_FOR_LEASE",
+                "WAITING_FOR_FEEDER",
+            }
         )
 
     def _update_uptime(self) -> None:
@@ -1506,15 +1686,30 @@ class MainWindow(QMainWindow):
             "port": int(self.port_spin.value()),
             "login": self.login_edit.text().strip(),
             "password": self.pass_edit.text(),
+            "agent": self.agent_edit.text().strip(),
             "use_tls": bool(self.tls_check.isChecked()),
 
             "blocknet_api_relay": self.blocknet_relay_edit.text().strip(),
             "blocknet_api_token": self.blocknet_token_edit.text().strip(),
             "blocknet_api_prefix": self.blocknet_prefix_edit.text().strip(),
+            "blocknet_force_scheme": self.blocknet_force_scheme_combo.currentText().strip(),
             "blocknet_verify_tls": bool(self.blocknet_verify_tls_check.isChecked()),
             "blocknet_timeout_s": int(self.blocknet_timeout_spin.value()),
             "blocknet_poll_interval_ms": int(self.blocknet_poll_ms_spin.value()),
             "blocknet_poll_max_msgs": int(self.blocknet_max_msgs_spin.value()),
+
+            "monero_rpc_url": self.monero_rpc_url_edit.text().strip(),
+            "monero_rpc_token": self.monero_rpc_token_edit.text().strip(),
+            "monero_rpc_prefix": self.monero_rpc_prefix_edit.text().strip(),
+            "monero_rpc_force_scheme": self.monero_rpc_force_scheme_combo.currentText().strip(),
+            "monero_rpc_verify_tls": bool(self.monero_rpc_verify_tls_check.isChecked()),
+            "monero_rpc_timeout_s": int(self.monero_rpc_timeout_spin.value()),
+            "monero_rpc_poll_interval_ms": int(self.monero_rpc_poll_ms_spin.value()),
+            "monero_rpc_client_id": self.monero_rpc_client_id_edit.text().strip(),
+            "monero_rpc_lease_size": int(self.monero_rpc_lease_size_spin.value()),
+            "monero_rpc_require_leases": bool(self.monero_rpc_require_leases_check.isChecked()),
+            "monero_rpc_feeder_mode": self.monero_rpc_feeder_mode_combo.currentText().strip(),
+            "monero_rpc_feeder_poll_interval_ms": int(self.monero_rpc_feeder_poll_ms_spin.value()),
 
             "solo_wallet_address": self.solo_wallet_edit.text().strip(),
             "solo_daemon_rpc_url": self.solo_rpc_edit.text().strip(),
@@ -1598,7 +1793,9 @@ class MainWindow(QMainWindow):
 
     def _apply_config_dict(self, data: dict[str, Any]) -> None:
         backend = str(data.get("mining_backend", "")).strip().lower()
-        if backend not in {"stratum", "blocknet", "solo"}:
+        if backend in {"monero_rpc", "monero-rpc"}:
+            backend = "monerorpc"
+        if backend not in {"stratum", "blocknet", "solo", "monerorpc"}:
             if bool(data.get("use_blocknet", False)):
                 backend = "blocknet"
             else:
@@ -1609,11 +1806,13 @@ class MainWindow(QMainWindow):
         self.port_spin.setValue(int(data.get("port", self.port_spin.value())))
         self.login_edit.setText(str(data.get("login", self.login_edit.text())))
         self.pass_edit.setText(str(data.get("password", self.pass_edit.text())))
+        self.agent_edit.setText(str(data.get("agent", self.agent_edit.text())))
         self.tls_check.setChecked(bool(data.get("use_tls", self.tls_check.isChecked())))
 
         self.blocknet_relay_edit.setText(str(data.get("blocknet_api_relay", self.blocknet_relay_edit.text())))
         self.blocknet_token_edit.setText(str(data.get("blocknet_api_token", self.blocknet_token_edit.text())))
         self.blocknet_prefix_edit.setText(str(data.get("blocknet_api_prefix", self.blocknet_prefix_edit.text())))
+        self._set_combo_from_optional(self.blocknet_force_scheme_combo, data.get("blocknet_force_scheme", ""))
         self.blocknet_verify_tls_check.setChecked(
             bool(data.get("blocknet_verify_tls", self.blocknet_verify_tls_check.isChecked()))
         )
@@ -1623,6 +1822,36 @@ class MainWindow(QMainWindow):
         )
         self.blocknet_max_msgs_spin.setValue(
             int(data.get("blocknet_poll_max_msgs", self.blocknet_max_msgs_spin.value()))
+        )
+
+        self.monero_rpc_url_edit.setText(str(data.get("monero_rpc_url", self.monero_rpc_url_edit.text())))
+        self.monero_rpc_token_edit.setText(str(data.get("monero_rpc_token", self.monero_rpc_token_edit.text())))
+        self.monero_rpc_prefix_edit.setText(str(data.get("monero_rpc_prefix", self.monero_rpc_prefix_edit.text())))
+        self._set_combo_from_optional(self.monero_rpc_force_scheme_combo, data.get("monero_rpc_force_scheme", ""))
+        self.monero_rpc_verify_tls_check.setChecked(
+            bool(data.get("monero_rpc_verify_tls", self.monero_rpc_verify_tls_check.isChecked()))
+        )
+        self.monero_rpc_timeout_spin.setValue(
+            int(data.get("monero_rpc_timeout_s", self.monero_rpc_timeout_spin.value()))
+        )
+        self.monero_rpc_poll_ms_spin.setValue(
+            int(data.get("monero_rpc_poll_interval_ms", self.monero_rpc_poll_ms_spin.value()))
+        )
+        self.monero_rpc_client_id_edit.setText(
+            str(data.get("monero_rpc_client_id", self.monero_rpc_client_id_edit.text()))
+        )
+        self.monero_rpc_lease_size_spin.setValue(
+            int(data.get("monero_rpc_lease_size", self.monero_rpc_lease_size_spin.value()))
+        )
+        self.monero_rpc_require_leases_check.setChecked(
+            bool(data.get("monero_rpc_require_leases", self.monero_rpc_require_leases_check.isChecked()))
+        )
+        self._set_combo_from_optional(
+            self.monero_rpc_feeder_mode_combo,
+            data.get("monero_rpc_feeder_mode", "none"),
+        )
+        self.monero_rpc_feeder_poll_ms_spin.setValue(
+            int(data.get("monero_rpc_feeder_poll_interval_ms", self.monero_rpc_feeder_poll_ms_spin.value()))
         )
 
         self.solo_wallet_edit.setText(str(data.get("solo_wallet_address", self.solo_wallet_edit.text())))
@@ -1672,7 +1901,9 @@ class MainWindow(QMainWindow):
         self.adaptive_queue_throttle_check.setChecked(
             bool(data.get("adaptive_queue_throttle", self.adaptive_queue_throttle_check.isChecked()))
         )
-        self.sort_candidates_check.setChecked(bool(data.get("sort_candidates", self.sort_candidates_check.isChecked())))
+        self.sort_candidates_check.setChecked(
+            bool(data.get("sort_candidates", self.sort_candidates_check.isChecked()))
+        )
 
         self.platform_spin.setValue(int(data.get("platform_index", self.platform_spin.value())))
         self.device_spin.setValue(int(data.get("device_index", self.device_spin.value())))
@@ -1838,11 +2069,33 @@ class MainWindow(QMainWindow):
             f"randomx_runtime={cfg.randomx_runtime_dll_path or '-'} "
             f"preload_randomx_runtime={'on' if cfg.preload_randomx_runtime else 'off'}"
         )
+
+        if cfg.use_blocknet:
+            self.append_log(
+                f"[gui] blocknet relay={cfg.blocknet_api_relay or '-'} "
+                f"prefix={cfg.blocknet_api_prefix or '/v1'} "
+                f"verify_tls={'on' if cfg.blocknet_verify_tls else 'off'} "
+                f"poll_ms={cfg.blocknet_poll_interval_ms}"
+            )
+
         if cfg.use_solo:
             self.append_log(
                 f"[gui] solo rpc={cfg.solo_daemon_rpc_url} "
                 f"zmq={'on' if cfg.solo_use_zmq else 'off'} "
                 f"wallet={cfg.solo_wallet_address[:16]}..."
+            )
+
+        if cfg.use_monero_rpc:
+            self.append_log(
+                f"[gui] monerorpc url={cfg.monero_rpc_url or '-'} "
+                f"prefix={cfg.monero_rpc_prefix or '/v1'} "
+                f"verify_tls={'on' if cfg.monero_rpc_verify_tls else 'off'} "
+                f"poll_ms={cfg.monero_rpc_poll_interval_ms} "
+                f"lease_size={cfg.monero_rpc_lease_size} "
+                f"require_leases={'on' if cfg.monero_rpc_require_leases else 'off'} "
+                f"client_id={cfg.monero_rpc_client_id or '-'} "
+                f"feeder={cfg.normalized_monero_rpc_feeder_mode()} "
+                f"feeder_poll_ms={cfg.monero_rpc_feeder_poll_interval_ms}"
             )
 
         self.worker_thread = QThread(self)

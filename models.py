@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 @dataclass
 class MinerConfig:
-    # backend: "stratum" | "blocknet" | "solo"
+    # backend: "stratum" | "blocknet" | "solo" | "monerorpc"
     mining_backend: str = "stratum"
 
     # direct stratum
@@ -27,6 +27,23 @@ class MinerConfig:
     blocknet_force_scheme: Optional[str] = None
     blocknet_poll_interval_ms: int = 50
     blocknet_poll_max_msgs: int = 32
+
+    # MoneroRPC broker
+    monero_rpc_url: str = ""
+    monero_rpc_token: str = ""
+    monero_rpc_prefix: str = "/v1"
+    monero_rpc_verify_tls: bool = False
+    monero_rpc_timeout_s: float = 30.0
+    monero_rpc_force_scheme: Optional[str] = None
+    monero_rpc_poll_interval_ms: int = 250
+    monero_rpc_client_id: str = ""
+    monero_rpc_lease_size: int = 8_388_608
+    monero_rpc_require_leases: bool = False
+
+    # Embedded feeder for MoneroRPC broker
+    # "none" | "solo" | "blocknet"
+    monero_rpc_feeder_mode: str = "blocknet"
+    monero_rpc_feeder_poll_interval_ms: int = 1000
 
     # Solo mining via monerod
     solo_wallet_address: str = ""
@@ -148,7 +165,11 @@ class MinerConfig:
 
     def mining_backend_name(self) -> str:
         name = (self.mining_backend or "stratum").strip().lower()
-        return name if name in {"stratum", "blocknet", "solo"} else "stratum"
+        return name if name in {"stratum", "blocknet", "solo", "monerorpc"} else "stratum"
+
+    def normalized_monero_rpc_feeder_mode(self) -> str:
+        mode = (self.monero_rpc_feeder_mode or "none").strip().lower()
+        return mode if mode in {"none", "solo", "blocknet"} else "none"
 
     def normalized_tail_bins(self) -> int:
         n = max(1, int(self.tune_tail_bins))
@@ -174,6 +195,14 @@ class MinerConfig:
     def use_solo(self) -> bool:
         return self.mining_backend_name() == "solo"
 
+    @property
+    def use_monero_rpc(self) -> bool:
+        return self.mining_backend_name() == "monerorpc"
+
+    @property
+    def use_monerorpc(self) -> bool:
+        return self.mining_backend_name() == "monerorpc"
+
 
 @dataclass
 class MiningJob:
@@ -186,7 +215,7 @@ class MiningJob:
     algo: str = "rx/0"
     received_at: float = field(default_factory=time.time)
 
-    # optional fields for solo mining
+    # optional fields for solo / monerorpc
     submit_blob_hex: str = ""
     reserved_offset: int = 0
     prefilter_target64: Optional[int] = None
@@ -259,3 +288,13 @@ class SubmitResult:
     duplicate: bool = False
     invalid: bool = False
     backend_error: bool = False
+
+
+@dataclass
+class NonceWindow:
+    start_nonce: int
+    count: int
+    lease_id: str = ""
+    expires_at: float = 0.0
+    source: str = "local"
+    job_seq: int = 0

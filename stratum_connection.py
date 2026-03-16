@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 from blocknet_client import BlockNetClient
-from models import MinerConfig, MiningJob, SubmitResult, VerifiedShare
+from models import MinerConfig, MiningJob, NonceWindow, SubmitResult, VerifiedShare
+from monero_rpc_client import MoneroRpcClient
 from solo_zmq import SoloMiningConnection
 from stratum_client import StratumClient
 
@@ -39,6 +40,13 @@ class MiningConnection:
                 on_job=self.on_job,
                 on_status=self.on_status,
             )
+        elif backend == "monerorpc":
+            self._inner = MoneroRpcClient(
+                self.config,
+                on_log=self.on_log,
+                on_job=self.on_job,
+                on_status=self.on_status,
+            )
         else:
             self._inner = StratumClient(
                 self.config,
@@ -66,6 +74,15 @@ class MiningConnection:
                 backend_error=True,
             )
         return self._inner.submit(verified)
+
+    def request_scan_window(self, span: int) -> Optional[NonceWindow]:
+        inner = self._inner
+        if inner is None:
+            return None
+        fn = getattr(inner, "request_scan_window", None)
+        if callable(fn):
+            return fn(int(span))
+        return None
 
     @property
     def current_job(self) -> Optional[MiningJob]:
