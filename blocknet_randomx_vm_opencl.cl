@@ -29,16 +29,11 @@
 #endif
 
 #ifndef BN_LOCAL_TOPK
-#define BN_LOCAL_TOPK 8u
+#define BN_LOCAL_TOPK 32u
 #endif
 
-/*
-    RandomX-shaped predictor controls.
-    These DO NOT make this exact RandomX. They only make the surrogate
-    much more VM/scratchpad/program oriented while preserving the host ABI.
-*/
 #ifndef BN_RXP_SCRATCH_WORDS
-#define BN_RXP_SCRATCH_WORDS 256u
+#define BN_RXP_SCRATCH_WORDS 128u
 #endif
 
 #ifndef BN_RXP_PROGRAM_SIZE
@@ -46,11 +41,11 @@
 #endif
 
 #ifndef BN_RXP_PROGRAM_ITERS
-#define BN_RXP_PROGRAM_ITERS 96u
+#define BN_RXP_PROGRAM_ITERS 64u
 #endif
 
 #ifndef BN_RXP_PROGRAM_COUNT
-#define BN_RXP_PROGRAM_COUNT 4u
+#define BN_RXP_PROGRAM_COUNT 1u
 #endif
 
 #ifndef BN_RXP_L1_WORDS
@@ -64,6 +59,7 @@
 #ifndef BN_RXP_JUMP_MASK_BITS
 #define BN_RXP_JUMP_MASK_BITS 8u
 #endif
+
 #ifndef BN_RXP_LINE_WORDS
 #define BN_RXP_LINE_WORDS 8u
 #endif
@@ -73,20 +69,21 @@
 #endif
 
 #ifndef BN_RXP_L1_LINES
-#define BN_RXP_L1_LINES 8u
+#define BN_RXP_L1_LINES 4u
 #endif
 
 #ifndef BN_RXP_L2_LINES
-#define BN_RXP_L2_LINES 16u
+#define BN_RXP_L2_LINES 8u
 #endif
 
 #ifndef BN_RXP_L3_LINES
-#define BN_RXP_L3_LINES 32u
+#define BN_RXP_L3_LINES 8u
 #endif
 
 #ifndef BN_RXP_FP_LANES
 #define BN_RXP_FP_LANES 4u
 #endif
+
 #define BN_U64_C(x) ((ulong)(x##UL))
 
 #define BN_PLANE_RANK 0u
@@ -293,7 +290,6 @@ inline ulong bn_adjust_target64(ulong target64, uint threshold_quality) {
     return target64;
 }
 
-/* much softer than the strict version */
 inline ulong bn_apply_operational_tightening(
     ulong target64,
     uint job_age_ms,
@@ -318,7 +314,6 @@ inline ulong bn_apply_operational_tightening(
     return max(1UL, target64 - tighten);
 }
 
-/* small early/fresh-job relaxation to keep candidates flowing */
 inline ulong bn_apply_early_job_relaxation(
     ulong target64,
     uint job_age_ms,
@@ -332,9 +327,9 @@ inline ulong bn_apply_early_job_relaxation(
         return target64;
     }
 
-    ulong bonus = target64 >> 2; /* +25% */
+    ulong bonus = target64 >> 2;
     if (confidence_quality >= 96u) {
-        bonus += (target64 >> 4); /* up to +31.25% */
+        bonus += (target64 >> 4);
     }
 
     if (target64 > (~0UL - bonus)) {
@@ -347,10 +342,10 @@ inline ulong bn_near_target64(
     ulong target64,
     uint confidence_quality
 ) {
-    ulong bonus = target64 >> 2; /* +25% */
+    ulong bonus = target64 >> 2;
 
     if (confidence_quality >= 96u) {
-        bonus += (target64 >> 3); /* +12.5% more */
+        bonus += (target64 >> 3);
     } else if (confidence_quality < 32u) {
         bonus >>= 1;
     }
@@ -453,7 +448,6 @@ inline ulong bn_soft_pass_tail(
     ulong tail_best,
     ulong tail_consensus
 ) {
-    /* halfway between best and consensus: candidate-heavy but not reckless */
     return tail_best + ((tail_consensus - tail_best) >> 1);
 }
 
@@ -632,6 +626,7 @@ inline ulong bn_global_load_u64_repeat(
     return v;
 }
 
+/* accuracy-first: contiguous 64-byte line read and structured fold */
 inline ulong bn_dataset_read_mix(
     __global const ulong* dataset64,
     uint dataset_words,
@@ -642,31 +637,27 @@ inline ulong bn_dataset_read_mix(
     }
 
     ulong line_base = addr & ~(ulong)(BN_RXP_LINE_WORDS - 1u);
-    uint ix0 = (uint)(line_base % (ulong)dataset_words);
-    uint ix1 = (ix0 + 1u) % dataset_words;
-    uint ix2 = (ix0 + 3u) % dataset_words;
-    uint ix3 = (ix0 + 7u) % dataset_words;
-    uint ix4 = (ix0 + 13u) % dataset_words;
-    uint ix5 = (ix0 + 29u) % dataset_words;
+    uint base = (uint)(line_base % (ulong)dataset_words);
 
-    ulong a = dataset64[ix0];
-    ulong b = dataset64[ix1];
-    ulong c = dataset64[ix2];
-    ulong d = dataset64[ix3];
-    ulong e = dataset64[ix4];
-    ulong f = dataset64[ix5];
+    ulong v0 = dataset64[(base + 0u) % dataset_words];
+    ulong v1 = dataset64[(base + 1u) % dataset_words];
+    ulong v2 = dataset64[(base + 2u) % dataset_words];
+    ulong v3 = dataset64[(base + 3u) % dataset_words];
+    ulong v4 = dataset64[(base + 4u) % dataset_words];
+    ulong v5 = dataset64[(base + 5u) % dataset_words];
+    ulong v6 = dataset64[(base + 6u) % dataset_words];
+    ulong v7 = dataset64[(base + 7u) % dataset_words];
 
-    ulong lane = bn_mix64(
-        a ^
-        bn_rotl64(b, 7u) ^
-        bn_rotr64(c, 11u) ^
-        d ^
-        bn_rotl64(e, 19u) ^
-        bn_rotr64(f, 23u) ^
-        addr
-    );
+    ulong x0 = v0 ^ bn_rotl64(v4, 11u) ^ addr;
+    ulong x1 = v1 ^ bn_rotr64(v5, 13u) ^ bn_rotl64(addr, 7u);
+    ulong x2 = v2 ^ bn_rotl64(v6, 17u) ^ bn_rotr64(addr, 9u);
+    ulong x3 = v3 ^ bn_rotr64(v7, 19u) ^ bn_rotl64(addr, 23u);
 
-    return bn_avalanche64(lane ^ bn_rotl64(addr, (uint)(addr & 31u)));
+    ulong m0 = bn_mix64(x0 ^ x2);
+    ulong m1 = bn_mix64(x1 ^ x3);
+    ulong lane = bn_mix64(m0 ^ bn_rotl64(m1, (uint)(addr & 31u)));
+
+    return bn_avalanche64(lane ^ v0 ^ bn_rotr64(v7, 21u));
 }
 
 inline uint bn_sp_index(uint level_sel, ulong addr) {
@@ -717,8 +708,16 @@ inline ulong bn_line_fold(__private const ulong* line) {
     return v;
 }
 
+/* power-of-two line counts -> locality-preserving index */
 inline uint bn_cache_slot(ulong tag, uint lines) {
-    return (uint)(tag % (ulong)lines);
+    return (uint)(tag & (ulong)(lines - 1u));
+}
+
+/* locality-preserving tag:
+   low 2 bits = region, upper bits = line id */
+inline ulong bn_virtual_tag(ulong word_addr, uint region_sel) {
+    ulong line_id = word_addr >> 3;
+    return (line_id << 2) | (ulong)(region_sel & 3u);
 }
 
 inline void bn_cache_read_line(
@@ -743,14 +742,6 @@ inline void bn_cache_write_line(
     }
 }
 
-inline ulong bn_virtual_tag(ulong word_addr, uint region_sel) {
-    ulong line_id = word_addr >> 3;
-    ulong salt = ((ulong)(region_sel + 1u) * BN_U64_C(0x9E3779B97F4A7C15));
-    ulong virt = bn_mix64(line_id ^ salt ^ bn_rotl64(word_addr, region_sel + 3u));
-    uint dataset_backed = (region_sel >= 2u) ? 1u : 0u;
-    return (virt << 1) | (ulong)dataset_backed;
-}
-
 inline void bn_virtual_line_load(
     ulong tag,
     ulong salt,
@@ -759,8 +750,11 @@ inline void bn_virtual_line_load(
     uint dataset_words,
     __private ulong* line_out
 ) {
-    ulong line_no = tag >> 1;
-    uint dataset_backed = (uint)(tag & 1UL);
+    (void)salt;
+
+    ulong line_no = tag >> 2;
+    uint region_sel = (uint)(tag & 3UL);
+    uint dataset_backed = (region_sel >= 2u) ? 1u : 0u;
 
     if (dataset_backed == 0u) {
         uint line_count = BN_RXP_SCRATCH_WORDS / BN_RXP_LINE_WORDS;
@@ -770,17 +764,15 @@ inline void bn_virtual_line_load(
             line_out[i] = scratch[(base + i) % BN_RXP_SCRATCH_WORDS];
         }
     } else {
+        ulong qword_base = (line_no * (ulong)BN_RXP_LINE_WORDS) + ((ulong)(region_sel & 1u) * (ulong)BN_RXP_LINE_WORDS);
+        uint base = (uint)(qword_base % (ulong)dataset_words);
         for (uint i = 0u; i < BN_RXP_LINE_WORDS; ++i) {
-            ulong a = (line_no * (ulong)BN_RXP_LINE_WORDS) + (ulong)i;
-            line_out[i] = bn_dataset_read_mix(
-                dataset64,
-                dataset_words,
-                a ^ salt ^ ((ulong)i * BN_U64_C(0xD1B54A32D192ED03))
-            );
+            line_out[i] = dataset64[(base + i) % dataset_words];
         }
     }
 }
 
+/* no mirrored random writeback; preserve locality */
 inline void bn_virtual_line_writeback(
     ulong tag,
     __private const ulong* line_in,
@@ -788,28 +780,26 @@ inline void bn_virtual_line_writeback(
     __private ulong* seed_mix,
     __private ulong regs[8]
 ) {
-    ulong line_no = tag >> 1;
-    uint dataset_backed = (uint)(tag & 1UL);
+    ulong line_no = tag >> 2;
+    uint region_sel = (uint)(tag & 3UL);
+    uint dataset_backed = (region_sel >= 2u) ? 1u : 0u;
+
+    uint line_count = BN_RXP_SCRATCH_WORDS / BN_RXP_LINE_WORDS;
+    uint base_line = (uint)(line_no % (ulong)line_count);
+    uint base = base_line * BN_RXP_LINE_WORDS;
 
     if (dataset_backed == 0u) {
-        uint line_count = BN_RXP_SCRATCH_WORDS / BN_RXP_LINE_WORDS;
-        uint base_line = (uint)(line_no % (ulong)line_count);
-        uint base = base_line * BN_RXP_LINE_WORDS;
         for (uint i = 0u; i < BN_RXP_LINE_WORDS; ++i) {
             scratch[(base + i) % BN_RXP_SCRATCH_WORDS] = line_in[i];
         }
     } else {
-        uint mirror_line_count = BN_RXP_SCRATCH_WORDS / BN_RXP_LINE_WORDS;
-        uint base_line = (uint)((line_no ^ (*seed_mix >> 17)) % (ulong)mirror_line_count);
-        uint base = base_line * BN_RXP_LINE_WORDS;
-
-        ulong fold = bn_line_fold(line_in) ^ tag;
+        ulong fold = bn_line_fold(line_in) ^ tag ^ ((ulong)region_sel << 56);
         *seed_mix = bn_mix64(*seed_mix ^ fold);
 
         for (uint i = 0u; i < BN_RXP_LINE_WORDS; ++i) {
             ulong v = bn_mix64(line_in[i] ^ bn_rotl64(fold, i + 1u));
             scratch[(base + i) % BN_RXP_SCRATCH_WORDS] ^= v;
-            regs[i & 7u] ^= bn_rotr64(v, (i * 7u + 3u) & 63u);
+            regs[i & 7u] ^= bn_rotr64(v, (i * 5u + 7u) & 63u);
         }
     }
 }
@@ -1131,7 +1121,120 @@ inline void bn_cache_flush_all(
     }
 }
 
-/* gid-independent predictor state */
+/* ---------- persistent runtime state ---------- */
+
+inline void bn_init_predict_runtime_state(
+    __private ulong regs[8],
+    __private float fstate[BN_RXP_FP_LANES],
+    __private int estate[BN_RXP_FP_LANES],
+    __private ulong* l1_data,
+    __private ulong* l1_tag,
+    __private uchar* l1_valid,
+    __private uchar* l1_dirty,
+    __private ulong* l2_data,
+    __private ulong* l2_tag,
+    __private uchar* l2_valid,
+    __private uchar* l2_dirty,
+    __private ulong* l3_data,
+    __private ulong* l3_tag,
+    __private uchar* l3_valid,
+    __private uchar* l3_dirty
+) {
+    for (uint i = 0u; i < BN_RXP_FP_LANES; ++i) {
+        float a = bn_u64_to_unit_float(regs[i]);
+        float b = bn_u64_to_unit_float(regs[i + 4u]);
+        fstate[i] = a + b;
+        estate[i] = ((int)((regs[i] >> 58) & 31UL)) - 16;
+    }
+
+    for (uint i = 0u; i < BN_RXP_L1_LINES * BN_RXP_LINE_WORDS; ++i) l1_data[i] = 0UL;
+    for (uint i = 0u; i < BN_RXP_L2_LINES * BN_RXP_LINE_WORDS; ++i) l2_data[i] = 0UL;
+    for (uint i = 0u; i < BN_RXP_L3_LINES * BN_RXP_LINE_WORDS; ++i) l3_data[i] = 0UL;
+
+    for (uint i = 0u; i < BN_RXP_L1_LINES; ++i) {
+        l1_tag[i] = 0UL;
+        l1_valid[i] = (uchar)0u;
+        l1_dirty[i] = (uchar)0u;
+    }
+    for (uint i = 0u; i < BN_RXP_L2_LINES; ++i) {
+        l2_tag[i] = 0UL;
+        l2_valid[i] = (uchar)0u;
+        l2_dirty[i] = (uchar)0u;
+    }
+    for (uint i = 0u; i < BN_RXP_L3_LINES; ++i) {
+        l3_tag[i] = 0UL;
+        l3_valid[i] = (uchar)0u;
+        l3_dirty[i] = (uchar)0u;
+    }
+}
+
+inline void bn_finalize_predict_runtime_state(
+    __private ulong regs[8],
+    __private ulong* ma,
+    __private ulong* mx,
+    __private ulong* seed_mix,
+    __private ulong scratch[BN_RXP_SCRATCH_WORDS],
+    __private float fstate[BN_RXP_FP_LANES],
+    __private int estate[BN_RXP_FP_LANES],
+    __private ulong* l1_data,
+    __private ulong* l1_tag,
+    __private uchar* l1_valid,
+    __private uchar* l1_dirty,
+    __private ulong* l2_data,
+    __private ulong* l2_tag,
+    __private uchar* l2_valid,
+    __private uchar* l2_dirty,
+    __private ulong* l3_data,
+    __private ulong* l3_tag,
+    __private uchar* l3_valid,
+    __private uchar* l3_dirty
+) {
+    bn_cache_flush_all(
+        scratch,
+        l1_data, l1_tag, l1_valid, l1_dirty,
+        l2_data, l2_tag, l2_valid, l2_dirty,
+        l3_data, l3_tag, l3_valid, l3_dirty,
+        seed_mix, regs
+    );
+
+    for (uint i = 0u; i < BN_RXP_FP_LANES; ++i) {
+        ulong fe = bn_pack_festate(fstate[i], estate[i]);
+        regs[i] ^= bn_mix64(fe ^ regs[i + 4u] ^ ((ulong)i << 40));
+        *seed_mix = bn_mix64(*seed_mix ^ fe ^ regs[i]);
+    }
+
+    for (uint i = 0u; i < BN_RXP_L1_LINES; ++i) {
+        if (l1_valid[i] != (uchar)0) {
+            __private ulong line[BN_RXP_LINE_WORDS];
+            bn_cache_read_line(l1_data, i, line);
+            ulong fold = bn_line_fold(line);
+            *seed_mix = bn_mix64(*seed_mix ^ l1_tag[i] ^ fold ^ ((ulong)l1_dirty[i] << 48));
+        }
+    }
+
+    for (uint i = 0u; i < BN_RXP_L2_LINES; ++i) {
+        if (l2_valid[i] != (uchar)0) {
+            __private ulong line[BN_RXP_LINE_WORDS];
+            bn_cache_read_line(l2_data, i, line);
+            ulong fold = bn_line_fold(line);
+            regs[i & 7u] ^= bn_mix64(l2_tag[i] ^ fold ^ ((ulong)l2_dirty[i] << 40));
+            *ma = bn_mix64(*ma + fold);
+        }
+    }
+
+    for (uint i = 0u; i < BN_RXP_L3_LINES; ++i) {
+        if (l3_valid[i] != (uchar)0) {
+            __private ulong line[BN_RXP_LINE_WORDS];
+            bn_cache_read_line(l3_data, i, line);
+            ulong fold = bn_line_fold(line);
+            *ma ^= bn_mix64(l3_tag[i] ^ fold ^ ((ulong)l3_dirty[i] << 32));
+            *mx = bn_mix64(*mx + bn_rotl64(fold, i + 1u));
+        }
+    }
+}
+
+/* ---------- predictor init ---------- */
+
 inline void bn_init_predict_vm(
     __private const uchar* work_blob,
     uint blob_len,
@@ -1226,6 +1329,25 @@ inline void bn_fill_predict_scratchpad(
     }
 }
 
+/* ---------- biased program generation ---------- */
+
+inline uint bn_select_biased_op(uint r) {
+    if (r < 40u) return 0u;    /* int/mem mix */
+    if (r < 72u) return 1u;    /* mulh-ish */
+    if (r < 98u) return 14u;   /* mulh-heavy */
+    if (r < 124u) return 2u;   /* store */
+    if (r < 144u) return 3u;   /* store/add */
+    if (r < 166u) return 8u;   /* dataset */
+    if (r < 184u) return 6u;   /* cbranch */
+    if (r < 202u) return 5u;   /* multi-lane mem */
+    if (r < 218u) return 11u;  /* dependent read */
+    if (r < 232u) return 12u;  /* dual write */
+    if (r < 244u) return 13u;  /* branchy state */
+    if (r < 250u) return 9u;   /* fp/int bridge */
+    if (r < 254u) return 10u;  /* swaps */
+    return 7u;                 /* write pair */
+}
+
 inline void bn_generate_program_words(
     __private ulong* rng_state,
     __private ulong regs[8],
@@ -1234,22 +1356,33 @@ inline void bn_generate_program_words(
     __private uint prog[BN_RXP_PROGRAM_SIZE]
 ) {
     ulong st = *rng_state ^ regs[program_index & 7u] ^ *seed_mix ^ ((ulong)program_index << 32);
+    uint prev_dst = (program_index * 3u) & 7u;
 
     for (uint i = 0u; i < BN_RXP_PROGRAM_SIZE; ++i) {
         ulong w0 = bn_rng_step(&st);
         ulong w1 = bn_rng_step(&st);
         ulong w2 = bn_rng_step(&st);
 
-        uint op = (uint)(w0 & 15u);
+        uint op = bn_select_biased_op((uint)(w0 & 255u));
         uint dst = (uint)((w0 >> 4) & 7u);
-        uint src = (uint)((w0 >> 7) & 7u);
-        uint aux = (uint)((w0 >> 10) & 7u);
+        uint src = (((uint)(w1 & 1u)) != 0u) ? prev_dst : (uint)((w0 >> 7) & 7u);
+        uint aux = (((uint)(w1 >> 1) & 1u) != 0u) ? ((prev_dst + 3u) & 7u) : (uint)((w0 >> 10) & 7u);
         uint sh = (uint)((w0 >> 13) & 63u);
+
+        if ((op == 0u || op == 1u || op == 8u || op == 14u) && src == dst) {
+            src = (src + 1u) & 7u;
+        }
+        if (aux == dst && (op == 5u || op == 7u || op == 12u || op == 13u)) {
+            aux = (aux + 2u) & 7u;
+        }
+
         uint regA = (uint)((w1 >> 3) & 3u);
-        uint regB = (uint)((w1 >> 5) & 3u);
-        uint regionA = (uint)((w1 >> 7) & 3u);
-        uint regionB = (uint)((w1 >> 9) & 3u);
-        uint jump = (uint)((w2 >> 11) & (BN_RXP_PROGRAM_SIZE - 1u));
+        uint regB = (((uint)(w1 >> 5) & 1u) != 0u) ? regA : (uint)((w1 >> 6) & 3u);
+
+        uint regionA = (uint)((w1 >> 8) & 3u);
+        uint regionB = (((uint)(w2 >> 9) & 1u) != 0u) ? regionA : (uint)((w2 >> 10) & 3u);
+
+        uint jump = (uint)((w2 ^ prev_dst ^ dst) & (ulong)(BN_RXP_PROGRAM_SIZE - 1u));
 
         prog[i] =
             (op) |
@@ -1262,10 +1395,14 @@ inline void bn_generate_program_words(
             (regionA << 23) |
             (regionB << 25) |
             (jump << 27);
+
+        prev_dst = dst;
     }
 
     *rng_state = bn_mix64(st ^ regs[(program_index + 3u) & 7u]);
 }
+
+/* ---------- persistent exec ---------- */
 
 inline void bn_exec_predict_program(
     __private uint prog[BN_RXP_PROGRAM_SIZE],
@@ -1277,49 +1414,22 @@ inline void bn_exec_predict_program(
     __private ulong scratch[BN_RXP_SCRATCH_WORDS],
     __global const ulong* dataset64,
     uint dataset_words,
-    uint program_index
+    uint program_index,
+    __private float fstate[BN_RXP_FP_LANES],
+    __private int estate[BN_RXP_FP_LANES],
+    __private ulong* l1_data,
+    __private ulong* l1_tag,
+    __private uchar* l1_valid,
+    __private uchar* l1_dirty,
+    __private ulong* l2_data,
+    __private ulong* l2_tag,
+    __private uchar* l2_valid,
+    __private uchar* l2_dirty,
+    __private ulong* l3_data,
+    __private ulong* l3_tag,
+    __private uchar* l3_valid,
+    __private uchar* l3_dirty
 ) {
-    __private float fstate[BN_RXP_FP_LANES];
-    __private int estate[BN_RXP_FP_LANES];
-
-    __private ulong l1_data[BN_RXP_L1_LINES * BN_RXP_LINE_WORDS];
-    __private ulong l1_tag[BN_RXP_L1_LINES];
-    __private uchar l1_valid[BN_RXP_L1_LINES];
-    __private uchar l1_dirty[BN_RXP_L1_LINES];
-
-    __private ulong l2_data[BN_RXP_L2_LINES * BN_RXP_LINE_WORDS];
-    __private ulong l2_tag[BN_RXP_L2_LINES];
-    __private uchar l2_valid[BN_RXP_L2_LINES];
-    __private uchar l2_dirty[BN_RXP_L2_LINES];
-
-    __private ulong l3_data[BN_RXP_L3_LINES * BN_RXP_LINE_WORDS];
-    __private ulong l3_tag[BN_RXP_L3_LINES];
-    __private uchar l3_valid[BN_RXP_L3_LINES];
-    __private uchar l3_dirty[BN_RXP_L3_LINES];
-
-    for (uint i = 0u; i < BN_RXP_FP_LANES; ++i) {
-        float a = bn_u64_to_unit_float(regs[i]);
-        float b = bn_u64_to_unit_float(regs[i + 4u]);
-        fstate[i] = a + b;
-        estate[i] = ((int)((regs[i] >> 58) & 31UL)) - 16;
-    }
-
-    for (uint i = 0u; i < BN_RXP_L1_LINES; ++i) {
-        l1_tag[i] = 0UL;
-        l1_valid[i] = (uchar)0u;
-        l1_dirty[i] = (uchar)0u;
-    }
-    for (uint i = 0u; i < BN_RXP_L2_LINES; ++i) {
-        l2_tag[i] = 0UL;
-        l2_valid[i] = (uchar)0u;
-        l2_dirty[i] = (uchar)0u;
-    }
-    for (uint i = 0u; i < BN_RXP_L3_LINES; ++i) {
-        l3_tag[i] = 0UL;
-        l3_valid[i] = (uchar)0u;
-        l3_dirty[i] = (uchar)0u;
-    }
-
     uint pc = 0u;
 
     for (uint iter = 0u; iter < BN_RXP_PROGRAM_ITERS; ++iter) {
@@ -1435,10 +1545,7 @@ inline void bn_exec_predict_program(
             float fv = ff * (1.0625f + 0.015625f * (float)(word0 + 1u));
             fv += (float)((uint)(m0 ^ m1) & 0xFFFFu) * 0.000015258789f;
             int ne = ee + (int)((m1 >> 60) & 7UL) - 3;
-            if (fv > 4.0f) {
-                fv *= 0.5f;
-                ne += 1;
-            } else if (fv < -4.0f) {
+            if (fv > 4.0f || fv < -4.0f) {
                 fv *= 0.5f;
                 ne += 1;
             }
@@ -1564,37 +1671,9 @@ inline void bn_exec_predict_program(
 
         pc = (pc + 1u) & (BN_RXP_PROGRAM_SIZE - 1u);
     }
-
-    bn_cache_flush_all(
-        scratch,
-        l1_data, l1_tag, l1_valid, l1_dirty,
-        l2_data, l2_tag, l2_valid, l2_dirty,
-        l3_data, l3_tag, l3_valid, l3_dirty,
-        seed_mix, regs
-    );
-
-    for (uint i = 0u; i < BN_RXP_FP_LANES; ++i) {
-        ulong fe = bn_pack_festate(fstate[i], estate[i]);
-        regs[i] ^= bn_mix64(fe ^ regs[i + 4u] ^ ((ulong)i << 40));
-        *seed_mix = bn_mix64(*seed_mix ^ fe ^ regs[i]);
-    }
-
-    for (uint i = 0u; i < BN_RXP_L1_LINES; ++i) {
-        if (l1_valid[i] != (uchar)0) {
-            *seed_mix = bn_mix64(*seed_mix ^ l1_tag[i] ^ ((ulong)l1_dirty[i] << 48));
-        }
-    }
-    for (uint i = 0u; i < BN_RXP_L2_LINES; ++i) {
-        if (l2_valid[i] != (uchar)0) {
-            regs[i & 7u] ^= bn_mix64(l2_tag[i] ^ ((ulong)l2_dirty[i] << 40));
-        }
-    }
-    for (uint i = 0u; i < BN_RXP_L3_LINES; ++i) {
-        if (l3_valid[i] != (uchar)0) {
-            *ma ^= bn_mix64(l3_tag[i] ^ ((ulong)l3_dirty[i] << 32));
-        }
-    }
 }
+
+/* ---------- stronger digest ensemble ---------- */
 
 inline void bn_digest_predict_state(
     __private ulong regs[8],
@@ -1605,12 +1684,22 @@ inline void bn_digest_predict_state(
     __global const ulong* dataset64,
     uint dataset_words,
     uint nonce_u32,
+    __private float fstate[BN_RXP_FP_LANES],
+    __private int estate[BN_RXP_FP_LANES],
     __private ulong outv[4]
 ) {
     ulong s0 = regs[0] ^ bn_rotl64(regs[4], 11u) ^ *ma ^ *seed_mix;
     ulong s1 = regs[1] ^ bn_rotr64(regs[5], 7u) ^ *mx;
     ulong s2 = regs[2] ^ bn_rotl64(regs[6], 17u) ^ *seed_mix;
     ulong s3 = regs[3] ^ bn_rotr64(regs[7], 13u) ^ *ma ^ *mx;
+
+    for (uint i = 0u; i < BN_RXP_FP_LANES; ++i) {
+        ulong fe = bn_pack_festate(fstate[i], estate[i]);
+        s0 = bn_mix64(s0 ^ fe ^ ((ulong)i << 48));
+        s1 = bn_mix64(s1 + bn_rotl64(fe, 11u));
+        s2 = bn_mix64(s2 ^ bn_rotr64(fe, 17u));
+        s3 = bn_mix64(s3 + fe + ((ulong)i << 32));
+    }
 
     uint line_count = BN_RXP_SCRATCH_WORDS / BN_RXP_LINE_WORDS;
     for (uint line = 0u; line < line_count; ++line) {
@@ -1638,10 +1727,15 @@ inline void bn_digest_predict_state(
         s3 = bn_avalanche64(s3 + x + bn_rotr64(s2, 27u));
     }
 
-    outv[0] = bn_avalanche64(s0 ^ regs[0] ^ regs[5]);
-    outv[1] = bn_avalanche64(s1 ^ regs[1] ^ regs[6]);
-    outv[2] = bn_avalanche64(s2 ^ regs[2] ^ regs[7]);
-    outv[3] = bn_avalanche64(s3 ^ regs[3] ^ regs[4] ^ *seed_mix);
+    ulong hA = bn_avalanche64(s0 ^ regs[0] ^ regs[5] ^ bn_rotl64(*ma, 7u));
+    ulong hB = bn_avalanche64(s1 ^ regs[1] ^ regs[6] ^ bn_rotr64(*mx, 11u));
+    ulong hC = bn_avalanche64(s2 ^ regs[2] ^ regs[7] ^ bn_rotl64(*seed_mix, 17u));
+    ulong hD = bn_avalanche64(s3 ^ regs[3] ^ regs[4] ^ bn_rotr64(*seed_mix, 23u));
+
+    outv[0] = bn_avalanche64(hA ^ bn_rotl64(hC, 9u));
+    outv[1] = bn_avalanche64(hB ^ bn_rotr64(hD, 7u));
+    outv[2] = bn_avalanche64(hC ^ bn_rotl64(hA, 13u) ^ bn_rotr64(hD, 5u));
+    outv[3] = bn_avalanche64(hD ^ bn_rotr64(hB, 17u) ^ bn_rotl64(hC, 3u));
 }
 
 inline void bn_gpu_dataset_prefilter_hash(
@@ -1659,6 +1753,24 @@ inline void bn_gpu_dataset_prefilter_hash(
     __private ulong regs[8];
     __private ulong scratch[BN_RXP_SCRATCH_WORDS];
     __private uint prog[BN_RXP_PROGRAM_SIZE];
+
+    __private float fstate[BN_RXP_FP_LANES];
+    __private int estate[BN_RXP_FP_LANES];
+
+    __private ulong l1_data[BN_RXP_L1_LINES * BN_RXP_LINE_WORDS];
+    __private ulong l1_tag[BN_RXP_L1_LINES];
+    __private uchar l1_valid[BN_RXP_L1_LINES];
+    __private uchar l1_dirty[BN_RXP_L1_LINES];
+
+    __private ulong l2_data[BN_RXP_L2_LINES * BN_RXP_LINE_WORDS];
+    __private ulong l2_tag[BN_RXP_L2_LINES];
+    __private uchar l2_valid[BN_RXP_L2_LINES];
+    __private uchar l2_dirty[BN_RXP_L2_LINES];
+
+    __private ulong l3_data[BN_RXP_L3_LINES * BN_RXP_LINE_WORDS];
+    __private ulong l3_tag[BN_RXP_L3_LINES];
+    __private uchar l3_valid[BN_RXP_L3_LINES];
+    __private uchar l3_dirty[BN_RXP_L3_LINES];
 
     if (blob_len == 0u || blob_len > BN_MAX_BLOB_BYTES || dataset_words == 0u) {
         outv[0] = 0UL;
@@ -1697,6 +1809,15 @@ inline void bn_gpu_dataset_prefilter_hash(
         scratch
     );
 
+    bn_init_predict_runtime_state(
+        regs,
+        fstate,
+        estate,
+        l1_data, l1_tag, l1_valid, l1_dirty,
+        l2_data, l2_tag, l2_valid, l2_dirty,
+        l3_data, l3_tag, l3_valid, l3_dirty
+    );
+
     for (uint p = 0u; p < BN_RXP_PROGRAM_COUNT; ++p) {
         bn_generate_program_words(&rng_state, regs, &seed_mix, p, prog);
         bn_exec_predict_program(
@@ -1709,7 +1830,12 @@ inline void bn_gpu_dataset_prefilter_hash(
             scratch,
             dataset64,
             dataset_words,
-            p
+            p,
+            fstate,
+            estate,
+            l1_data, l1_tag, l1_valid, l1_dirty,
+            l2_data, l2_tag, l2_valid, l2_dirty,
+            l3_data, l3_tag, l3_valid, l3_dirty
         );
 
         ulong fold = bn_mix64(
@@ -1730,6 +1856,19 @@ inline void bn_gpu_dataset_prefilter_hash(
         scratch[ix] ^= bn_dataset_read_mix(dataset64, dataset_words, fold ^ regs[ix & 7u]);
     }
 
+    bn_finalize_predict_runtime_state(
+        regs,
+        &ma,
+        &mx,
+        &seed_mix,
+        scratch,
+        fstate,
+        estate,
+        l1_data, l1_tag, l1_valid, l1_dirty,
+        l2_data, l2_tag, l2_valid, l2_dirty,
+        l3_data, l3_tag, l3_valid, l3_dirty
+    );
+
     bn_digest_predict_state(
         regs,
         &ma,
@@ -1739,9 +1878,13 @@ inline void bn_gpu_dataset_prefilter_hash(
         dataset64,
         dataset_words,
         nonce_u32,
+        fstate,
+        estate,
         outv
     );
 }
+
+/* ---------- unchanged ranking/staging/output path ---------- */
 
 inline void bn_stage_candidate_local(
     uint lid,
@@ -1860,7 +2003,6 @@ inline void bn_flush_local_topk(
     uint selected_count = 0u;
     uint near_picked = 0u;
 
-    /* pass first */
     while (selected_count < effective_topk) {
         ulong best_score = ~0UL;
         uint best_i = BN_LOCAL_STAGE_SIZE;
@@ -1913,7 +2055,6 @@ inline void bn_flush_local_topk(
         ++selected_count;
     }
 
-    /* controlled near reserve */
     while (selected_count < effective_topk && near_picked < near_limit) {
         ulong best_score = ~0UL;
         uint best_i = BN_LOCAL_STAGE_SIZE;
@@ -1967,7 +2108,6 @@ inline void bn_flush_local_topk(
         ++near_picked;
     }
 
-    /* fill with diversity-aware adjusted rank */
     while (selected_count < effective_topk) {
         ulong best_adj_score = ~0UL;
         uint best_i = BN_LOCAL_STAGE_SIZE;

@@ -199,7 +199,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("GPUMiner - OpenCL + Stratum / BlockNet / Solo / MoneroRPC")
-        self.resize(1760, 1160)
+        self.resize(1760, 1180)
 
         self.worker_thread: QThread | None = None
         self.worker: MinerWorker | None = None
@@ -231,7 +231,7 @@ class MainWindow(QMainWindow):
         self.left_scroll = QScrollArea()
         self.left_scroll.setWidgetResizable(True)
         self.left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.left_scroll.setMinimumWidth(820)
+        self.left_scroll.setMinimumWidth(840)
 
         self.left_container = QWidget()
         self.left_scroll.setWidget(self.left_container)
@@ -242,7 +242,7 @@ class MainWindow(QMainWindow):
 
         self.main_split.addWidget(self.left_scroll)
         self.main_split.addWidget(self._make_right_tabs())
-        self.main_split.setSizes([900, 960])
+        self.main_split.setSizes([920, 960])
 
         self.left_layout.addWidget(self._make_connection_group())
         self.left_layout.addWidget(self._make_blocknet_group())
@@ -259,6 +259,7 @@ class MainWindow(QMainWindow):
         self._sync_backend_controls()
         self._sync_scan_mode_controls()
         self._sync_verification_controls()
+        self._sync_rescue_controls()
         self._sync_tuning_controls()
         self._sync_adaptive_controls()
         self.set_status("idle")
@@ -289,8 +290,8 @@ class MainWindow(QMainWindow):
         title.setObjectName("Title")
 
         subtitle = QLabel(
-            "OpenCL scan + optional CPU verify + adaptive queue pressure control + "
-            "rank / threshold / credit / confidence tuning + brokered MoneroRPC feeder modes"
+            "OpenCL scan + optional CPU verify + CPU rescue after consecutive no-share scans + "
+            "adaptive queue pressure control + rank / threshold / credit / confidence tuning"
         )
         subtitle.setObjectName("SubTitle")
 
@@ -333,6 +334,9 @@ class MainWindow(QMainWindow):
         self.card_backend = StatCard("Backend / Mode", "-", "")
         self.card_effective_target = StatCard("Effective Target", "-", "dynamic candidate target")
         self.card_effective_work = StatCard("Effective Work", "-", "dynamic work window")
+        self.card_no_share = StatCard("No-Share Streak", "0", "consecutive scans without verified share")
+        self.card_rescue = StatCard("CPU Rescue", "0 / 0", "runs / hits")
+        self.card_rescue_skip = StatCard("Rescue Skips", "0 / 0", "old_job / busy")
 
         cards = [
             self.card_hashrate,
@@ -350,10 +354,14 @@ class MainWindow(QMainWindow):
             self.card_backend,
             self.card_effective_target,
             self.card_effective_work,
+            self.card_no_share,
+            self.card_rescue,
+            self.card_rescue_skip,
         ]
 
+        cols = 5
         for i, card in enumerate(cards):
-            grid.addWidget(card, i // 5, i % 5)
+            grid.addWidget(card, i // cols, i % cols)
 
         return wrapper
 
@@ -660,6 +668,10 @@ class MainWindow(QMainWindow):
         self.enable_cpu_tail_batch_check.setChecked(True)
         self.enable_cpu_tail_batch_check.toggled.connect(self._sync_verification_controls)
 
+        self.enable_cpu_rescue_scan_check = QCheckBox("Enable CPU rescue after no-share streak")
+        self.enable_cpu_rescue_scan_check.setChecked(True)
+        self.enable_cpu_rescue_scan_check.toggled.connect(self._sync_rescue_controls)
+
         self.enable_bucket_tuning_check = QCheckBox("Enable seed EMA tuning")
         self.enable_bucket_tuning_check.setChecked(True)
         self.enable_bucket_tuning_check.toggled.connect(self._sync_tuning_controls)
@@ -726,6 +738,22 @@ class MainWindow(QMainWindow):
         self.cpu_tail_batch_threads_spin = QSpinBox()
         self.cpu_tail_batch_threads_spin.setRange(0, 128)
         self.cpu_tail_batch_threads_spin.setValue(0)
+
+        self.cpu_rescue_after_no_share_scans_spin = QSpinBox()
+        self.cpu_rescue_after_no_share_scans_spin.setRange(1, 1000)
+        self.cpu_rescue_after_no_share_scans_spin.setValue(2)
+
+        self.cpu_rescue_job_age_max_ms_spin = QSpinBox()
+        self.cpu_rescue_job_age_max_ms_spin.setRange(1, 30000)
+        self.cpu_rescue_job_age_max_ms_spin.setValue(1800)
+
+        self.cpu_rescue_window_size_spin = QSpinBox()
+        self.cpu_rescue_window_size_spin.setRange(1, 10_000_000)
+        self.cpu_rescue_window_size_spin.setValue(4096)
+
+        self.cpu_rescue_batch_size_spin = QSpinBox()
+        self.cpu_rescue_batch_size_spin.setRange(1, 1_000_000)
+        self.cpu_rescue_batch_size_spin.setValue(1024)
 
         self.verify_queue_limit_spin = QSpinBox()
         self.verify_queue_limit_spin.setRange(1, 100_000)
@@ -803,49 +831,61 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("Tail prescreen threads (0 = auto)"), 6, 2)
         grid.addWidget(self.cpu_tail_batch_threads_spin, 6, 3)
 
-        grid.addWidget(self.enable_bucket_tuning_check, 7, 0, 1, 2)
-        grid.addWidget(self.enable_job_tuning_check, 7, 2, 1, 2)
+        grid.addWidget(self.enable_cpu_rescue_scan_check, 7, 0, 1, 2)
+        grid.addWidget(QLabel("Rescue trigger scans (no verified share)"), 7, 2)
+        grid.addWidget(self.cpu_rescue_after_no_share_scans_spin, 7, 3)
 
-        grid.addWidget(self.adaptive_queue_throttle_check, 8, 0, 1, 2)
-        grid.addWidget(self.sort_candidates_check, 8, 2, 1, 2)
+        grid.addWidget(QLabel("Rescue max job age (ms)"), 8, 0)
+        grid.addWidget(self.cpu_rescue_job_age_max_ms_spin, 8, 1)
+        grid.addWidget(QLabel("Rescue window size"), 8, 2)
+        grid.addWidget(self.cpu_rescue_window_size_spin, 8, 3)
 
-        grid.addWidget(QLabel("Chunk size"), 9, 0)
-        grid.addWidget(self.scan_chunk_spin, 9, 1)
-        grid.addWidget(QLabel("Hash batch size"), 9, 2)
-        grid.addWidget(self.hash_batch_size_spin, 9, 3)
+        grid.addWidget(QLabel("Rescue batch size"), 9, 0)
+        grid.addWidget(self.cpu_rescue_batch_size_spin, 9, 1)
 
-        grid.addWidget(QLabel("Max scan time (ms, chunk mode)"), 10, 0)
-        grid.addWidget(self.max_scan_ms_spin, 10, 1)
-        grid.addWidget(QLabel("Candidate process limit"), 10, 2)
-        grid.addWidget(self.cpu_verify_limit_spin, 10, 3)
+        grid.addWidget(self.enable_bucket_tuning_check, 10, 0, 1, 2)
+        grid.addWidget(self.enable_job_tuning_check, 10, 2, 1, 2)
 
-        grid.addWidget(QLabel("Python verify threads"), 11, 0)
-        grid.addWidget(self.verify_threads_spin, 11, 1)
-        grid.addWidget(QLabel("Verify queue limit"), 11, 2)
-        grid.addWidget(self.verify_queue_limit_spin, 11, 3)
+        grid.addWidget(self.adaptive_queue_throttle_check, 11, 0, 1, 2)
+        grid.addWidget(self.sort_candidates_check, 11, 2, 1, 2)
 
-        grid.addWidget(QLabel("Scan pause (ms)"), 12, 0)
-        grid.addWidget(self.scan_pause_ms_spin, 12, 1)
-        grid.addWidget(QLabel("Submit queue limit"), 12, 2)
-        grid.addWidget(self.submit_queue_limit_spin, 12, 3)
+        grid.addWidget(QLabel("Chunk size"), 12, 0)
+        grid.addWidget(self.scan_chunk_spin, 12, 1)
+        grid.addWidget(QLabel("Hash batch size"), 12, 2)
+        grid.addWidget(self.hash_batch_size_spin, 12, 3)
 
-        grid.addWidget(QLabel("Verify queue soft pct"), 13, 0)
-        grid.addWidget(self.verify_queue_soft_pct_spin, 13, 1)
-        grid.addWidget(QLabel("Submit queue soft pct"), 13, 2)
-        grid.addWidget(self.submit_queue_soft_pct_spin, 13, 3)
+        grid.addWidget(QLabel("Max scan time (ms, chunk mode)"), 13, 0)
+        grid.addWidget(self.max_scan_ms_spin, 13, 1)
+        grid.addWidget(QLabel("Candidate process limit"), 13, 2)
+        grid.addWidget(self.cpu_verify_limit_spin, 13, 3)
 
-        grid.addWidget(QLabel("Min candidate target"), 14, 0)
-        grid.addWidget(self.min_candidate_target_spin, 14, 1)
-        grid.addWidget(QLabel("Min dynamic work pct"), 14, 2)
-        grid.addWidget(self.min_dynamic_work_pct_spin, 14, 3)
+        grid.addWidget(QLabel("Python verify threads"), 14, 0)
+        grid.addWidget(self.verify_threads_spin, 14, 1)
+        grid.addWidget(QLabel("Verify queue limit"), 14, 2)
+        grid.addWidget(self.verify_queue_limit_spin, 14, 3)
 
-        grid.addWidget(QLabel("Job age soft (ms)"), 15, 0)
-        grid.addWidget(self.job_age_soft_ms_spin, 15, 1)
-        grid.addWidget(QLabel("Job age hard (ms)"), 15, 2)
-        grid.addWidget(self.job_age_hard_ms_spin, 15, 3)
+        grid.addWidget(QLabel("Scan pause (ms)"), 15, 0)
+        grid.addWidget(self.scan_pause_ms_spin, 15, 1)
+        grid.addWidget(QLabel("Submit queue limit"), 15, 2)
+        grid.addWidget(self.submit_queue_limit_spin, 15, 3)
 
-        grid.addWidget(QLabel("Stats update (ms)"), 16, 0)
-        grid.addWidget(self.stats_update_ms_spin, 16, 1)
+        grid.addWidget(QLabel("Verify queue soft pct"), 16, 0)
+        grid.addWidget(self.verify_queue_soft_pct_spin, 16, 1)
+        grid.addWidget(QLabel("Submit queue soft pct"), 16, 2)
+        grid.addWidget(self.submit_queue_soft_pct_spin, 16, 3)
+
+        grid.addWidget(QLabel("Min candidate target"), 17, 0)
+        grid.addWidget(self.min_candidate_target_spin, 17, 1)
+        grid.addWidget(QLabel("Min dynamic work pct"), 17, 2)
+        grid.addWidget(self.min_dynamic_work_pct_spin, 17, 3)
+
+        grid.addWidget(QLabel("Job age soft (ms)"), 18, 0)
+        grid.addWidget(self.job_age_soft_ms_spin, 18, 1)
+        grid.addWidget(QLabel("Job age hard (ms)"), 18, 2)
+        grid.addWidget(self.job_age_hard_ms_spin, 18, 3)
+
+        grid.addWidget(QLabel("Stats update (ms)"), 19, 0)
+        grid.addWidget(self.stats_update_ms_spin, 19, 1)
 
         return box
 
@@ -1023,11 +1063,16 @@ class MainWindow(QMainWindow):
         self.pressure_lbl.setObjectName("SubTitle")
         self.pressure_lbl.setWordWrap(True)
 
+        self.rescue_lbl = QLabel("NoShareStreak: 0    Rescue[runs/hits/empty]=0/0/0")
+        self.rescue_lbl.setObjectName("SubTitle")
+        self.rescue_lbl.setWordWrap(True)
+
         dash_layout.addWidget(self.summary_lbl)
         dash_layout.addWidget(self.summary_sub_lbl)
         dash_layout.addWidget(self.detail_metrics_lbl)
         dash_layout.addWidget(self.reject_breakdown_lbl)
         dash_layout.addWidget(self.pressure_lbl)
+        dash_layout.addWidget(self.rescue_lbl)
         dash_layout.addStretch(1)
 
         log_tab = QWidget()
@@ -1092,6 +1137,7 @@ class MainWindow(QMainWindow):
             self.enable_cpu_verify_batch_check,
             self.enable_cpu_hash_batch_check,
             self.enable_cpu_tail_batch_check,
+            self.enable_cpu_rescue_scan_check,
             self.enable_bucket_tuning_check,
             self.enable_job_tuning_check,
             self.adaptive_queue_throttle_check,
@@ -1140,6 +1186,10 @@ class MainWindow(QMainWindow):
             self.cpu_hash_batch_threads_spin,
             self.cpu_tail_batch_min_size_spin,
             self.cpu_tail_batch_threads_spin,
+            self.cpu_rescue_after_no_share_scans_spin,
+            self.cpu_rescue_job_age_max_ms_spin,
+            self.cpu_rescue_window_size_spin,
+            self.cpu_rescue_batch_size_spin,
             self.verify_queue_limit_spin,
             self.submit_queue_limit_spin,
             self.scan_pause_ms_spin,
@@ -1229,6 +1279,7 @@ class MainWindow(QMainWindow):
             self.submit_unverified_check.setChecked(False)
 
         self._sync_verification_controls()
+        self._sync_rescue_controls()
 
     def _sync_scan_mode_controls(self) -> None:
         mode = self.scan_mode_combo.currentText().strip().lower()
@@ -1274,6 +1325,16 @@ class MainWindow(QMainWindow):
         self.enable_cpu_tail_batch_check.setEnabled(verify_on)
         self.cpu_tail_batch_min_size_spin.setEnabled(tail_batch_on)
         self.cpu_tail_batch_threads_spin.setEnabled(tail_batch_on)
+
+    def _sync_rescue_controls(self) -> None:
+        enabled = self.enable_cpu_rescue_scan_check.isChecked()
+        for w in [
+            self.cpu_rescue_after_no_share_scans_spin,
+            self.cpu_rescue_job_age_max_ms_spin,
+            self.cpu_rescue_window_size_spin,
+            self.cpu_rescue_batch_size_spin,
+        ]:
+            w.setEnabled(enabled)
 
     def _sync_tuning_controls(self) -> None:
         enabled = self.enable_bucket_tuning_check.isChecked() or self.enable_job_tuning_check.isChecked()
@@ -1474,6 +1535,12 @@ class MainWindow(QMainWindow):
             cpu_tail_batch_min_size=int(self.cpu_tail_batch_min_size_spin.value()),
             cpu_tail_batch_threads=int(self.cpu_tail_batch_threads_spin.value()),
 
+            enable_cpu_rescue_scan=self.enable_cpu_rescue_scan_check.isChecked(),
+            cpu_rescue_after_no_share_scans=int(self.cpu_rescue_after_no_share_scans_spin.value()),
+            cpu_rescue_job_age_max_ms=int(self.cpu_rescue_job_age_max_ms_spin.value()),
+            cpu_rescue_window_size=int(self.cpu_rescue_window_size_spin.value()),
+            cpu_rescue_batch_size=int(self.cpu_rescue_batch_size_spin.value()),
+
             gpu_scan_mode=scan_mode,
             hash_batch_size=int(self.hash_batch_size_spin.value()),
 
@@ -1546,6 +1613,15 @@ class MainWindow(QMainWindow):
         backend_rejects = int(stats.get("submit_backend_error", 0))
         teacher_tail_accepted = int(stats.get("teacher_tail_accepted", 0))
 
+        no_share_scan_streak = int(stats.get("no_share_scan_streak", 0))
+        last_verified_share_scan_seq = int(stats.get("last_verified_share_scan_seq", 0))
+        last_rescue_scan_seq = int(stats.get("last_rescue_scan_seq", 0))
+        cpu_rescue_runs = int(stats.get("cpu_rescue_runs", 0))
+        cpu_rescue_hits = int(stats.get("cpu_rescue_hits", 0))
+        cpu_rescue_empty = int(stats.get("cpu_rescue_empty", 0))
+        cpu_rescue_skipped_old_job = int(stats.get("cpu_rescue_skipped_old_job", 0))
+        cpu_rescue_skipped_busy = int(stats.get("cpu_rescue_skipped_busy", 0))
+
         job_id = str(stats.get("job_id", "-"))
         height = str(stats.get("height", "-"))
         accepted_rate = int(stats.get("p2pool_rate_15m", stats.get("hashrate_est", 0)))
@@ -1562,6 +1638,12 @@ class MainWindow(QMainWindow):
         verify_batch_enabled = bool(stats.get("verification_batch_enabled", self.enable_cpu_verify_batch_check.isChecked()))
         hash_batch_enabled = bool(stats.get("hash_batch_enabled", self.enable_cpu_hash_batch_check.isChecked()))
         tail_batch_enabled = bool(stats.get("tail_batch_enabled", self.enable_cpu_tail_batch_check.isChecked()))
+        rescue_enabled = bool(stats.get("cpu_rescue_enabled", self.enable_cpu_rescue_scan_check.isChecked()))
+        rescue_trigger = int(stats.get("cpu_rescue_after_no_share_scans", self.cpu_rescue_after_no_share_scans_spin.value()))
+        rescue_age_ms = int(stats.get("cpu_rescue_job_age_max_ms", self.cpu_rescue_job_age_max_ms_spin.value()))
+        rescue_window = int(stats.get("cpu_rescue_window_size", self.cpu_rescue_window_size_spin.value()))
+        rescue_batch = int(stats.get("cpu_rescue_batch_size", self.cpu_rescue_batch_size_spin.value()))
+
         hash_batch_min_size = int(stats.get("cpu_hash_batch_min_size", self.cpu_hash_batch_min_size_spin.value()))
         tail_batch_min_size = int(stats.get("cpu_tail_batch_min_size", self.cpu_tail_batch_min_size_spin.value()))
         verify_batch_size = int(stats.get("cpu_verify_batch_size", self.cpu_verify_batch_size_spin.value()))
@@ -1603,6 +1685,18 @@ class MainWindow(QMainWindow):
         )
         self.card_effective_target.set_value(str(eff_target), f"stale_q8={stale_q8}")
         self.card_effective_work.set_value(str(eff_work), f"age_ms={job_age_ms}")
+        self.card_no_share.set_value(
+            str(no_share_scan_streak),
+            f"last_verified_seq={last_verified_share_scan_seq} last_rescue_seq={last_rescue_scan_seq}",
+        )
+        self.card_rescue.set_value(
+            f"{cpu_rescue_runs} / {cpu_rescue_hits}",
+            f"empty={cpu_rescue_empty}",
+        )
+        self.card_rescue_skip.set_value(
+            f"{cpu_rescue_skipped_old_job} / {cpu_rescue_skipped_busy}",
+            "old_job / busy",
+        )
 
         self.summary_lbl.setText(f"{accepted_rate:,} H/s")
         self.summary_sub_lbl.setText(
@@ -1614,6 +1708,7 @@ class MainWindow(QMainWindow):
             f"VerifyBatch: {'on' if verify_batch_enabled else 'off'}({verify_batch_size})    "
             f"HashTeacher: {'on' if hash_batch_enabled else 'off'}({hash_batch_min_size})    "
             f"TailBatch: {'on' if tail_batch_enabled else 'off'}({tail_batch_min_size})    "
+            f"Rescue: {'on' if rescue_enabled else 'off'}({rescue_trigger})    "
             f"JobTune: {'on' if job_tuning_enabled else 'off'}    "
             f"SplitTune: {'on' if bool(stats.get('split_tuning', True)) else 'off'}    "
             f"Launches: {launches}"
@@ -1635,6 +1730,13 @@ class MainWindow(QMainWindow):
             f"EffTarget: {eff_target}    EffWork: {eff_work}    "
             f"AgeMs: {job_age_ms}    Q8[v/s/st]={verify_q8}/{submit_q8}/{stale_q8}    "
             f"TailBins: {tail_bins}    Window: {scan_window_source}/{scan_window_count}"
+        )
+
+        self.rescue_lbl.setText(
+            f"NoShareStreak: {no_share_scan_streak}    "
+            f"Rescue[runs/hits/empty]={cpu_rescue_runs}/{cpu_rescue_hits}/{cpu_rescue_empty}    "
+            f"RescueSkips[old/busy]={cpu_rescue_skipped_old_job}/{cpu_rescue_skipped_busy}    "
+            f"RescueCfg[trigger/age/window/batch]={rescue_trigger}/{rescue_age_ms}/{rescue_window}/{rescue_batch}"
         )
 
         try:
@@ -1744,6 +1846,12 @@ class MainWindow(QMainWindow):
             "enable_cpu_tail_batch": bool(self.enable_cpu_tail_batch_check.isChecked()),
             "cpu_tail_batch_min_size": int(self.cpu_tail_batch_min_size_spin.value()),
             "cpu_tail_batch_threads": int(self.cpu_tail_batch_threads_spin.value()),
+
+            "enable_cpu_rescue_scan": bool(self.enable_cpu_rescue_scan_check.isChecked()),
+            "cpu_rescue_after_no_share_scans": int(self.cpu_rescue_after_no_share_scans_spin.value()),
+            "cpu_rescue_job_age_max_ms": int(self.cpu_rescue_job_age_max_ms_spin.value()),
+            "cpu_rescue_window_size": int(self.cpu_rescue_window_size_spin.value()),
+            "cpu_rescue_batch_size": int(self.cpu_rescue_batch_size_spin.value()),
 
             "enable_bucket_tuning": bool(self.enable_bucket_tuning_check.isChecked()),
             "enable_job_tuning": bool(self.enable_job_tuning_check.isChecked()),
@@ -1892,6 +2000,9 @@ class MainWindow(QMainWindow):
         self.enable_cpu_tail_batch_check.setChecked(
             bool(data.get("enable_cpu_tail_batch", self.enable_cpu_tail_batch_check.isChecked()))
         )
+        self.enable_cpu_rescue_scan_check.setChecked(
+            bool(data.get("enable_cpu_rescue_scan", self.enable_cpu_rescue_scan_check.isChecked()))
+        )
         self.enable_bucket_tuning_check.setChecked(
             bool(data.get("enable_bucket_tuning", self.enable_bucket_tuning_check.isChecked()))
         )
@@ -1939,6 +2050,23 @@ class MainWindow(QMainWindow):
         self.cpu_tail_batch_threads_spin.setValue(
             int(data.get("cpu_tail_batch_threads", self.cpu_tail_batch_threads_spin.value()))
         )
+
+        rescue_trigger = data.get("cpu_rescue_after_no_share_scans", None)
+        if rescue_trigger is None:
+            rescue_trigger = data.get("cpu_rescue_after_empty_scans", self.cpu_rescue_after_no_share_scans_spin.value())
+        self.cpu_rescue_after_no_share_scans_spin.setValue(
+            int(rescue_trigger or self.cpu_rescue_after_no_share_scans_spin.value())
+        )
+        self.cpu_rescue_job_age_max_ms_spin.setValue(
+            int(data.get("cpu_rescue_job_age_max_ms", self.cpu_rescue_job_age_max_ms_spin.value()))
+        )
+        self.cpu_rescue_window_size_spin.setValue(
+            int(data.get("cpu_rescue_window_size", self.cpu_rescue_window_size_spin.value()))
+        )
+        self.cpu_rescue_batch_size_spin.setValue(
+            int(data.get("cpu_rescue_batch_size", self.cpu_rescue_batch_size_spin.value()))
+        )
+
         self.verify_queue_limit_spin.setValue(int(data.get("verify_queue_limit", self.verify_queue_limit_spin.value())))
         self.submit_queue_limit_spin.setValue(int(data.get("submit_queue_limit", self.submit_queue_limit_spin.value())))
         self.scan_pause_ms_spin.setValue(int(data.get("scan_pause_ms", self.scan_pause_ms_spin.value())))
@@ -2008,6 +2136,7 @@ class MainWindow(QMainWindow):
         self._sync_backend_controls()
         self._sync_scan_mode_controls()
         self._sync_verification_controls()
+        self._sync_rescue_controls()
         self._sync_tuning_controls()
         self._sync_adaptive_controls()
 
@@ -2055,6 +2184,11 @@ class MainWindow(QMainWindow):
             f"tail_batch={'on' if cfg.enable_cpu_tail_batch else 'off'} "
             f"tail_batch_min={cfg.cpu_tail_batch_min_size} "
             f"tail_batch_threads={cfg.cpu_tail_batch_threads} "
+            f"cpu_rescue={'on' if cfg.enable_cpu_rescue_scan else 'off'} "
+            f"cpu_rescue_trigger={cfg.effective_cpu_rescue_trigger_scans()} "
+            f"cpu_rescue_job_age_ms={cfg.cpu_rescue_job_age_max_ms} "
+            f"cpu_rescue_window={cfg.cpu_rescue_window_size} "
+            f"cpu_rescue_batch={cfg.cpu_rescue_batch_size} "
             f"job_tuning={'on' if cfg.enable_job_tuning else 'off'} "
             f"seed_tuning={'on' if cfg.enable_bucket_tuning else 'off'} "
             f"adaptive={'on' if cfg.adaptive_queue_throttle else 'off'} "

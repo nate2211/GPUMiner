@@ -56,7 +56,11 @@ class MinerWorker(QObject):
         super().__init__()
         self.config = config
 
-        needs_verifier_object = bool(config.require_dataset or config.enable_cpu_verify)
+        needs_verifier_object = bool(
+            config.require_dataset
+            or config.enable_cpu_verify
+            or bool(getattr(config, "enable_cpu_rescue_scan", False))
+        )
         self.verifier = verifier
         if self.verifier is None and needs_verifier_object:
             self.verifier = CpuVerifier(
@@ -108,6 +112,18 @@ class MinerWorker(QObject):
         self._teacher_tail_screened = 0
         self._teacher_tail_accepted = 0
 
+        # rescue / scan streak tracking
+        self._scan_seq = 0
+        self._last_verified_share_scan_seq = 0
+        self._last_rescue_scan_seq = 0
+        self._no_share_scan_streak = 0
+
+        self._cpu_rescue_runs = 0
+        self._cpu_rescue_hits = 0
+        self._cpu_rescue_empty = 0
+        self._cpu_rescue_skipped_old_job = 0
+        self._cpu_rescue_skipped_busy = 0
+
         self._nonce_cursor = secrets.randbits(32)
         self._hashes_done = 0
         self._start_time = 0.0
@@ -137,7 +153,11 @@ class MinerWorker(QObject):
     def _needs_randomx_prepare(self) -> bool:
         return bool(
             self.verifier is not None
-            and (self.config.require_dataset or self.config.enable_cpu_verify)
+            and (
+                self.config.require_dataset
+                or self.config.enable_cpu_verify
+                or self._cpu_rescue_enabled()
+            )
         )
 
     def stop(self) -> None:
@@ -152,6 +172,16 @@ class MinerWorker(QObject):
             and self.verifier is not None
             and self.verifier.is_ready
         )
+
+    def _cpu_rescue_enabled(self) -> bool:
+        return bool(
+            getattr(self.config, "enable_cpu_rescue_scan", False)
+            and self.verifier is not None
+            and self.verifier.is_ready
+        )
+
+    def _cpu_rescue_trigger_scans(self) -> int:
+        return int(self.config.effective_cpu_rescue_trigger_scans())
 
     def _verify_batch_enabled(self) -> bool:
         return bool(
@@ -187,7 +217,7 @@ class MinerWorker(QObject):
         return self.config.active_scan_window()
 
     def _desired_warm_batch_vms(self) -> int:
-        if not self._verify_enabled():
+        if self.verifier is None or not self.verifier.is_ready:
             return 0
 
         desired = max(
@@ -197,6 +227,9 @@ class MinerWorker(QObject):
         )
 
         if self._verify_batch_enabled() or self._hash_batch_enabled() or self._tail_batch_enabled():
+            desired = max(desired, 1)
+
+        if self._cpu_rescue_enabled():
             desired = max(desired, 1)
 
         return max(0, desired)
@@ -484,6 +517,18 @@ class MinerWorker(QObject):
                     self._emit_stats(force=False)
                     continue
 
+                self._scan_seq += 1
+                scan_seq = int(self._scan_seq)
+
+                for cand in candidates:
+                    cand.scan_seq = scan_seq
+                    cand.source = "gpu"
+
+                self._no_share_scan_streak = max(
+                    0,
+                    int(self._scan_seq - self._last_verified_share_scan_seq),
+                )
+
                 if candidates and bool(getattr(self.config, "sort_candidates", True)):
                     candidates.sort(key=scanner.candidate_sort_key)
 
@@ -509,10 +554,25 @@ class MinerWorker(QObject):
                         f"verify_q8={scan_ctx['verify_pressure_q8']} "
                         f"submit_q8={scan_ctx['submit_pressure_q8']} "
                         f"stale_q8={scan_ctx['stale_risk_q8']} "
-                        f"target={scan_ctx['candidate_target']}"
+                        f"target={scan_ctx['candidate_target']} "
+                        f"no_share_streak={self._no_share_scan_streak}"
+                    )
+                else:
+                    self.log.emit(
+                        f"[opencl] empty candidate pass "
+                        f"job={job.job_id} start_nonce={start_nonce:08x} "
+                        f"no_share_streak={self._no_share_scan_streak}"
                     )
 
                 self._enqueue_candidates(job_generation, candidates)
+
+                self._maybe_run_cpu_rescue(
+                    job=job,
+                    job_generation=job_generation,
+                    scan_ctx=scan_ctx,
+                    scan_seq=scan_seq,
+                )
+
                 self._emit_stats(force=False)
 
                 if self.config.scan_pause_ms > 0:
@@ -549,6 +609,7 @@ class MinerWorker(QObject):
         verify_batch_enabled = self._verify_batch_enabled()
         hash_batch_enabled = self._hash_batch_enabled()
         tail_batch_enabled = self._tail_batch_enabled()
+        rescue_enabled = self._cpu_rescue_enabled()
         unverified_submit = self._unverified_submit_enabled()
 
         if verify_enabled:
@@ -556,7 +617,7 @@ class MinerWorker(QObject):
         else:
             self._candidate_queue = None
 
-        if verify_enabled or unverified_submit:
+        if verify_enabled or unverified_submit or rescue_enabled:
             self._submit_queue = queue.Queue(maxsize=max(1, int(self.config.submit_queue_limit)))
         else:
             self._submit_queue = None
@@ -588,6 +649,11 @@ class MinerWorker(QObject):
             f"verify_batch={'on' if verify_batch_enabled else 'off'} "
             f"hash_batch={'on' if hash_batch_enabled else 'off'} "
             f"tail_batch={'on' if tail_batch_enabled else 'off'} "
+            f"cpu_rescue={'on' if rescue_enabled else 'off'} "
+            f"cpu_rescue_after_no_share_scans={self._cpu_rescue_trigger_scans()} "
+            f"cpu_rescue_job_age_max_ms={int(getattr(self.config, 'cpu_rescue_job_age_max_ms', 1800))} "
+            f"cpu_rescue_window_size={int(getattr(self.config, 'cpu_rescue_window_size', 4096))} "
+            f"cpu_rescue_batch_size={int(getattr(self.config, 'cpu_rescue_batch_size', 1024))} "
             f"hash_batch_min_size={int(getattr(self.config, 'cpu_hash_batch_min_size', 8))} "
             f"hash_batch_threads={int(getattr(self.config, 'cpu_hash_batch_threads', 0))} "
             f"tail_batch_min_size={int(getattr(self.config, 'cpu_tail_batch_min_size', 32))} "
@@ -663,9 +729,11 @@ class MinerWorker(QObject):
             return
 
         blob_hex = (job.submit_blob_hex or "").strip()
-        raw = safe_bytes_from_hex(blob_hex)
-        if not raw:
+        raw0 = safe_bytes_from_hex(blob_hex)
+        if not raw0:
             return
+
+        raw = bytearray(raw0)
 
         off = int(self.config.nonce_offset)
         if len(raw) < off + 4:
@@ -673,7 +741,7 @@ class MinerWorker(QObject):
 
         nonce_u32 = int(nonce) & 0xFFFFFFFF
         raw[off:off + 4] = nonce_u32.to_bytes(4, "little", signed=False)
-        verified.solution_blob_hex = bytes(raw).hex()
+        verified.solution_blob_hex = raw.hex()
 
     def _enqueue_candidates(self, job_generation: int, candidates: list[CandidateShare]) -> None:
         if not candidates:
@@ -700,7 +768,7 @@ class MinerWorker(QObject):
                     enqueued += 1
                 except queue.Full:
                     dropped += 1
-                    if scanner is not None:
+                    if scanner is not None and getattr(cand, "source", "gpu") == "gpu":
                         scanner.record_feedback(cand, "queue_drop", 0.0, 0.0)
 
             if dropped:
@@ -726,7 +794,7 @@ class MinerWorker(QObject):
                     enqueued += 1
                 except queue.Full:
                     dropped += 1
-                    if scanner is not None:
+                    if scanner is not None and getattr(cand, "source", "gpu") == "gpu":
                         scanner.record_feedback(cand, "queue_drop", verified.credited_work, verified.quality)
 
             if dropped:
@@ -814,7 +882,7 @@ class MinerWorker(QObject):
 
         if not queued:
             scanner = self._scanner
-            if scanner is not None:
+            if scanner is not None and getattr(cand, "source", "gpu") == "gpu":
                 scanner.record_feedback(cand, "queue_drop", verified.credited_work, verified.quality)
             self.log.emit(
                 f"[worker] submit queue full/stale, dropping verified share "
@@ -826,20 +894,31 @@ class MinerWorker(QObject):
         job_generation: int,
         cand: CandidateShare,
         verified: VerifiedShare,
+        *,
+        record_scanner_feedback: bool = True,
     ) -> None:
         scanner = self._scanner
-        if scanner is None:
-            return
 
         self._attach_solution_blob(verified, cand.nonce, cand.job_id)
-        scanner.record_feedback(cand, "cpu_verified", verified.credited_work, verified.quality)
+
+        if record_scanner_feedback and scanner is not None and getattr(cand, "source", "gpu") == "gpu":
+            scanner.record_feedback(cand, "cpu_verified", verified.credited_work, verified.quality)
+
+        share_scan_seq = int(getattr(cand, "scan_seq", 0))
+        if share_scan_seq > self._last_verified_share_scan_seq:
+            self._last_verified_share_scan_seq = share_scan_seq
+        self._no_share_scan_streak = max(
+            0,
+            int(self._scan_seq - self._last_verified_share_scan_seq),
+        )
 
         with self._stats_lock:
             self._verified += 1
             self._verified_work_15m.add_work(verified.credited_work)
 
+        prefix = "[verify-rescue]" if getattr(cand, "source", "gpu") != "gpu" else "[verify]"
         self.log.emit(
-            f"[verify] share found nonce={verified.nonce_hex} "
+            f"{prefix} share found nonce={verified.nonce_hex} "
             f"job={verified.job_id} session={verified.session_id} "
             f"pred_tail={verified.predicted_tail_u64} "
             f"act_tail={verified.actual_tail_u64} "
@@ -848,10 +927,152 @@ class MinerWorker(QObject):
             f"assigned_work={verified.assigned_work:.6f} "
             f"credited_work={verified.credited_work:.6f} "
             f"quality={verified.quality:.6f}x "
-            f"predictor_match={1 if verified.predictor_hash_match else 0}"
+            f"predictor_match={1 if verified.predictor_hash_match else 0} "
+            f"scan_seq={share_scan_seq}"
         )
 
         self._queue_verified_submit(job_generation, cand, verified)
+
+    def _cpu_rescue_batch_threads(self) -> int:
+        verifier = self.verifier
+        if verifier is None:
+            return 0
+        if verifier.has_batch_hash:
+            return max(0, int(getattr(self.config, "cpu_hash_batch_threads", 0)))
+        if verifier.has_batch_verify:
+            return max(0, int(getattr(self.config, "cpu_verify_native_threads", 0)))
+        return 0
+
+    def _cpu_rescue_is_busy(self, scan_ctx: dict[str, int]) -> bool:
+        verify_soft_q8 = int(round(float(self.config.clamped_verify_soft_pct()) * 255.0))
+        submit_soft_q8 = int(round(float(self.config.clamped_submit_soft_pct()) * 255.0))
+        return bool(
+            int(scan_ctx.get("verify_pressure_q8", 0)) >= verify_soft_q8
+            or int(scan_ctx.get("submit_pressure_q8", 0)) >= submit_soft_q8
+        )
+
+    def _maybe_run_cpu_rescue(
+        self,
+        job: MiningJob,
+        job_generation: int,
+        scan_ctx: dict[str, int],
+        scan_seq: int,
+    ) -> int:
+        if not self._cpu_rescue_enabled():
+            return 0
+
+        current_streak = max(0, int(scan_seq - self._last_verified_share_scan_seq))
+        self._no_share_scan_streak = current_streak
+
+        trigger_scans = self._cpu_rescue_trigger_scans()
+        if current_streak < trigger_scans:
+            return 0
+
+        # don't rerun rescue every single scan; allow another rescue only
+        # after another full trigger window with no verified share
+        if self._last_rescue_scan_seq > self._last_verified_share_scan_seq:
+            if (scan_seq - self._last_rescue_scan_seq) < trigger_scans:
+                return 0
+
+        if self._cpu_rescue_is_busy(scan_ctx):
+            with self._stats_lock:
+                self._cpu_rescue_skipped_busy += 1
+            return 0
+
+        job_age_ms = int(scan_ctx.get("job_age_ms", 0))
+        max_job_age_ms = max(0, int(getattr(self.config, "cpu_rescue_job_age_max_ms", 1800)))
+        if job_age_ms > max_job_age_ms:
+            with self._stats_lock:
+                self._cpu_rescue_skipped_old_job += 1
+            return 0
+
+        window_size = max(1, int(getattr(self.config, "cpu_rescue_window_size", 4096)))
+        batch_size = max(1, int(getattr(self.config, "cpu_rescue_batch_size", 1024)))
+        window = self._acquire_scan_window(window_size)
+        if window is None or int(window.count) <= 0:
+            return 0
+
+        live_job, live_generation = self._get_job_state()
+        if (
+            live_generation != job_generation
+            or live_job is None
+            or live_job.job_id != job.job_id
+            or live_job.session_id != job.session_id
+        ):
+            return 0
+
+        verifier = self.verifier
+        if verifier is None:
+            return 0
+
+        self._last_rescue_scan_seq = scan_seq
+
+        self.log.emit(
+            f"[cpu-rescue] trigger job={job.job_id} "
+            f"scan_seq={scan_seq} no_share_streak={current_streak} "
+            f"job_age_ms={job_age_ms} "
+            f"window_source={window.source or 'local'} "
+            f"start_nonce={int(window.start_nonce) & 0xFFFFFFFF:08x} "
+            f"count={int(window.count)}"
+        )
+
+        rescue_hits = 0
+        try:
+            rows = verifier.rescue_scan_window(
+                job,
+                int(window.start_nonce),
+                int(window.count),
+                batch_size=batch_size,
+                max_threads=self._cpu_rescue_batch_threads(),
+            )
+        except Exception as exc:
+            self.log.emit(f"[cpu-rescue] failed for job={job.job_id}: {exc}")
+            return 0
+
+        live_job, live_generation = self._get_job_state()
+        if (
+            live_generation != job_generation
+            or live_job is None
+            or live_job.job_id != job.job_id
+            or live_job.session_id != job.session_id
+        ):
+            if rows:
+                with self._stats_lock:
+                    self._job_changed_scan_drops += len(rows)
+            self.log.emit(
+                f"[cpu-rescue] job changed before rescue-submit, dropping count={len(rows)} job={job.job_id}"
+            )
+            return 0
+
+        for cand, verified in rows:
+            cand.scan_seq = scan_seq
+            cand.source = "cpu_rescue"
+            self._handle_verified_share(
+                job_generation,
+                cand,
+                verified,
+                record_scanner_feedback=False,
+            )
+            rescue_hits += 1
+
+        with self._stats_lock:
+            self._cpu_rescue_runs += 1
+            if rescue_hits > 0:
+                self._cpu_rescue_hits += rescue_hits
+            else:
+                self._cpu_rescue_empty += 1
+
+        self._no_share_scan_streak = max(
+            0,
+            int(self._scan_seq - self._last_verified_share_scan_seq),
+        )
+
+        self.log.emit(
+            f"[cpu-rescue] done job={job.job_id} scan_seq={scan_seq} "
+            f"scanned={int(window.count)} hits={rescue_hits} "
+            f"batch_size={batch_size} threads={self._cpu_rescue_batch_threads()}"
+        )
+        return rescue_hits
 
     def _verify_loop(self) -> None:
         while not self._stop.is_set():
@@ -1067,7 +1288,7 @@ class MinerWorker(QObject):
 
                 scanner = self._scanner
                 client = self._client
-                if scanner is None or client is None:
+                if client is None:
                     continue
 
                 submit_result = client.submit(verified)
@@ -1091,7 +1312,8 @@ class MinerWorker(QObject):
                         elif outcome == "pool_backend_error":
                             self._submit_backend_error += 1
 
-                if self._verify_enabled():
+                exact_submit = bool(verified.actual_work > 0.0 or getattr(cand, "source", "gpu") != "gpu")
+                if exact_submit:
                     accepted_log_prefix = "[submit] accepted"
                     rejected_log_prefix = "[submit] rejected"
                 else:
@@ -1100,7 +1322,8 @@ class MinerWorker(QObject):
                     accepted_log_prefix = "[submit-raw] accepted"
                     rejected_log_prefix = "[submit-raw] rejected"
 
-                scanner.record_feedback(cand, outcome, verified.credited_work, verified.quality)
+                if scanner is not None and getattr(cand, "source", "gpu") == "gpu":
+                    scanner.record_feedback(cand, outcome, verified.credited_work, verified.quality)
 
                 if submit_result.accepted:
                     self.log.emit(
@@ -1153,6 +1376,16 @@ class MinerWorker(QObject):
             teacher_tail_batches = self._teacher_tail_batches
             teacher_tail_screened = self._teacher_tail_screened
             teacher_tail_accepted = self._teacher_tail_accepted
+
+            no_share_scan_streak = self._no_share_scan_streak
+            last_verified_share_scan_seq = self._last_verified_share_scan_seq
+            last_rescue_scan_seq = self._last_rescue_scan_seq
+
+            cpu_rescue_runs = self._cpu_rescue_runs
+            cpu_rescue_hits = self._cpu_rescue_hits
+            cpu_rescue_empty = self._cpu_rescue_empty
+            cpu_rescue_skipped_old_job = self._cpu_rescue_skipped_old_job
+            cpu_rescue_skipped_busy = self._cpu_rescue_skipped_busy
 
             elapsed = max(now - self._start_time, 1e-6)
             scan_rate_lifetime = int(self._hashes_done / elapsed)
@@ -1215,6 +1448,15 @@ class MinerWorker(QObject):
             "teacher_tail_accepted": teacher_tail_accepted,
             "teacher_tail_accept_rate": teacher_tail_accept_rate,
 
+            "no_share_scan_streak": no_share_scan_streak,
+            "last_verified_share_scan_seq": last_verified_share_scan_seq,
+            "last_rescue_scan_seq": last_rescue_scan_seq,
+            "cpu_rescue_runs": cpu_rescue_runs,
+            "cpu_rescue_hits": cpu_rescue_hits,
+            "cpu_rescue_empty": cpu_rescue_empty,
+            "cpu_rescue_skipped_old_job": cpu_rescue_skipped_old_job,
+            "cpu_rescue_skipped_busy": cpu_rescue_skipped_busy,
+
             "job_id": (job.job_id if job else "-"),
             "height": (job.height if job else 0),
             "backend": self.config.mining_backend_name(),
@@ -1223,6 +1465,11 @@ class MinerWorker(QObject):
             "verification_batch_enabled": self._verify_batch_enabled(),
             "hash_batch_enabled": self._hash_batch_enabled(),
             "tail_batch_enabled": self._tail_batch_enabled(),
+            "cpu_rescue_enabled": self._cpu_rescue_enabled(),
+            "cpu_rescue_after_no_share_scans": self._cpu_rescue_trigger_scans(),
+            "cpu_rescue_job_age_max_ms": int(getattr(self.config, "cpu_rescue_job_age_max_ms", 1800)),
+            "cpu_rescue_window_size": int(getattr(self.config, "cpu_rescue_window_size", 4096)),
+            "cpu_rescue_batch_size": int(getattr(self.config, "cpu_rescue_batch_size", 1024)),
             "cpu_verify_batch_size": int(getattr(self.config, "cpu_verify_batch_size", 1)),
             "cpu_verify_batch_wait_ms": int(getattr(self.config, "cpu_verify_batch_wait_ms", 0)),
             "cpu_verify_native_threads": int(getattr(self.config, "cpu_verify_native_threads", 0)),
@@ -1335,6 +1582,11 @@ class MinerWorker(QObject):
 
             self._dataset_job_id = job.job_id
             self._monerorpc_local_fallback_logged = False
+
+        self._scan_seq = 0
+        self._last_verified_share_scan_seq = 0
+        self._last_rescue_scan_seq = 0
+        self._no_share_scan_streak = 0
 
         self._drain_queue(self._candidate_queue)
         self._drain_queue(self._submit_queue)

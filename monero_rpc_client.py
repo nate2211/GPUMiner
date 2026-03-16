@@ -207,6 +207,130 @@ class MoneroRpcClient:
         self._upstream_session: str = ""
         self._upstream_job_id: str = ""
 
+        # solo feeder stability / repush control
+        self._solo_last_template_sig: str = ""
+        self._solo_last_template_height: int = 0
+        self._solo_last_template_prev_hash: str = ""
+        self._solo_last_push_sig: str = ""
+        self._solo_last_push_at: float = 0.0
+        self._solo_force_repush_s: float = 15.0
+
+    def _solo_template_signature(self, result: JsonDict) -> str:
+        prev_hash = _normalize_hex(
+            result.get("prev_hash")
+            or result.get("prev_id")
+            or result.get("top_hash")
+            or ""
+        )
+        seed_hash = _normalize_hex(result.get("seed_hash") or "")
+        height = _coerce_int(result.get("height"), 0)
+        difficulty = _coerce_int(result.get("difficulty"), 0)
+        reserved_offset = _coerce_int(result.get("reserved_offset"), 0)
+        major_version = _coerce_int(result.get("major_version"), 0)
+        minor_version = _coerce_int(result.get("minor_version"), 0)
+
+        return _stable_job_id(
+            prev_hash,
+            seed_hash,
+            str(height),
+            str(difficulty),
+            str(reserved_offset),
+            str(major_version),
+            str(minor_version),
+            "solo_template",
+        )
+
+    def _should_repush_solo_template(self, template_sig: str) -> bool:
+        now = time.time()
+        if template_sig != self._solo_last_push_sig:
+            return True
+        return (now - self._solo_last_push_at) >= self._solo_force_repush_s
+
+    def _mark_solo_template_pushed(
+            self,
+            *,
+            template_sig: str,
+            height: int,
+            prev_hash: str,
+    ) -> None:
+        self._solo_last_template_sig = template_sig
+        self._solo_last_template_height = int(height)
+        self._solo_last_template_prev_hash = prev_hash
+        self._solo_last_push_sig = template_sig
+        self._solo_last_push_at = time.time()
+
+    def _should_try_blocknet_solo_bridge(self) -> bool:
+        with self._state_lock:
+            source = (self._job_source or "").strip().lower()
+
+        relay = (self.config.blocknet_api_relay or "").strip()
+        if not relay:
+            return False
+
+        return source in {"monerod", "solo", "solo_mining"}
+
+    def _submit_to_blocknet_monero_bridge(self, verified: VerifiedShare) -> JsonDict:
+        payload = {
+            "miner_id": self._client_id,
+            "job_id": verified.job_id,
+            "nonce": verified.nonce_hex,
+            "result": verified.result_hex,
+            "solution_blob_hex": verified.solution_blob_hex,
+            "assigned_work": verified.assigned_work,
+            "actual_work": verified.actual_work,
+            "credited_work": verified.credited_work,
+            "quality": verified.quality,
+            "actual_tail_u64": verified.actual_tail_u64,
+            "predicted_tail_u64": verified.predicted_tail_u64,
+            "rank_score_u64": verified.rank_score_u64,
+            "tune_bucket": verified.tune_bucket,
+            "tune_tail_bin": verified.tune_tail_bin,
+            "rank_quality": verified.rank_quality,
+            "threshold_quality": verified.threshold_quality,
+            "gpu_hash_hex": verified.gpu_hash_hex,
+            "predictor_hash_match": bool(verified.predictor_hash_match),
+        }
+
+        if self._job_seq > 0:
+            payload["job_seq"] = int(self._job_seq)
+
+        obj = self._blocknet_post("monero_rpc/submit/share", payload)
+        if not isinstance(obj, dict):
+            raise RuntimeError(f"blocknet monero bridge returned invalid response: {obj!r}")
+
+        accepted = bool(obj.get("accepted", obj.get("ok", False)))
+        status = str(obj.get("status") or ("accepted" if accepted else "rejected"))
+        error = str(obj.get("error") or obj.get("message") or "")
+
+        return {
+            "accepted": accepted,
+            "ok": accepted,
+            "status": status,
+            "error": error,
+            "reject_class": str(obj.get("reject_class") or ""),
+            "message": str(obj.get("message") or ""),
+            "upstream": "blocknet_monero_bridge",
+            "raw_upstream": obj,
+        }
+    def _route_fingerprint(self, route: dict[str, str]) -> str:
+        return "|".join([
+            str(route.get("source") or ""),
+            str(route.get("kind") or ""),
+            str(route.get("session") or ""),
+            str(route.get("job_id") or ""),
+        ])
+
+    def _is_sessionish_error(self, text: str) -> bool:
+        s = (text or "").strip().lower()
+        return (
+                "session" in s
+                or "unknown_session" in s
+                or "not open" in s
+                or "not_open" in s
+                or "expired" in s
+                or "invalid session" in s
+        )
+
     def connect(self) -> None:
         if not self._base_url:
             raise RuntimeError("monero_rpc_url is empty")
@@ -281,8 +405,9 @@ class MoneroRpcClient:
             return self._consume_cached_window_locked(wanted)
 
     def submit(self, verified: VerifiedShare) -> SubmitResult:
-        # For blocknet-fed broker jobs, allow direct upstream submit.
         route = self._get_upstream_submit_route()
+
+        # 1) direct upstream submit for blocknet-fed p2pool jobs
         if route is not None:
             try:
                 obj = self._submit_to_blocknet_upstream(
@@ -291,16 +416,44 @@ class MoneroRpcClient:
                     verified=verified,
                 )
                 return self._parse_submit_response(obj)
+
             except Exception as exc:
+                msg = str(exc)
+
+                if self._is_sessionish_error(msg):
+                    try:
+                        self.on_log("[monerorpc] upstream submit hit stale session, refreshing broker job route")
+                        self._fetch_and_publish_job(log_missing=False)
+
+                        retry_route = self._get_upstream_submit_route()
+                        if retry_route is not None:
+                            obj = self._submit_to_blocknet_upstream(
+                                session=retry_route["session"],
+                                upstream_job_id=retry_route["job_id"],
+                                verified=verified,
+                            )
+                            return self._parse_submit_response(obj)
+                    except Exception as retry_exc:
+                        msg = f"{msg} | retry_failed={retry_exc}"
+
                 return SubmitResult(
                     accepted=False,
                     status="backend_error",
-                    error=str(exc),
-                    raw={"error": str(exc), "route": route},
+                    error=msg,
+                    raw={"error": msg, "route": route},
                     reject_class="pool_backend_error",
                     backend_error=True,
                 )
 
+        # 2) solo-fed broker jobs: try BlockNet monero bridge first if configured
+        if self._should_try_blocknet_solo_bridge():
+            try:
+                obj = self._submit_to_blocknet_monero_bridge(verified)
+                return self._parse_submit_response(obj)
+            except Exception as exc:
+                self.on_log(f"[monerorpc] blocknet solo bridge submit failed, falling back to broker submit: {exc}")
+
+        # 3) normal broker submit
         payload = {
             "miner_id": self._client_id,
             "job_id": verified.job_id,
@@ -465,23 +618,37 @@ class MoneroRpcClient:
 
         with self._state_lock:
             old = self.current_job
-            changed = (
-                old is None
-                or old.job_id != job.job_id
-                or old.blob_hex != job.blob_hex
-                or old.target_hex != job.target_hex
-                or old.seed_hash_hex != job.seed_hash_hex
-                or old.session_id != job.session_id
-            )
-            if not changed:
-                return False
 
+            old_route = {
+                "source": self._job_source,
+                "kind": self._upstream_kind,
+                "session": self._upstream_session,
+                "job_id": self._upstream_job_id,
+            }
+
+            job_changed = (
+                    old is None
+                    or old.job_id != job.job_id
+                    or old.blob_hex != job.blob_hex
+                    or old.target_hex != job.target_hex
+                    or old.seed_hash_hex != job.seed_hash_hex
+                    or old.session_id != job.session_id
+            )
+
+            route_changed = self._route_fingerprint(old_route) != self._route_fingerprint(route)
+
+            changed = job_changed or route_changed
+
+            # always refresh route fields even if the mining blob is the same
             self.current_job = job
             self.session_id = job.session_id or self.session_id
             self._job_source = route["source"]
             self._upstream_kind = route["kind"]
             self._upstream_session = route["session"]
             self._upstream_job_id = route["job_id"]
+
+        if not changed:
+            return False
 
         with self._lease_lock:
             self._lease_cache.clear()
@@ -676,11 +843,11 @@ class MoneroRpcClient:
     # ----------------------------
 
     def _submit_to_blocknet_upstream(
-        self,
-        *,
-        session: str,
-        upstream_job_id: str,
-        verified: VerifiedShare,
+            self,
+            *,
+            session: str,
+            upstream_job_id: str,
+            verified: VerifiedShare,
     ) -> JsonDict:
         if not session:
             raise RuntimeError("missing blocknet upstream session")
@@ -699,13 +866,21 @@ class MoneroRpcClient:
         if not isinstance(obj, dict):
             raise RuntimeError(f"blocknet p2pool submit returned invalid response: {obj!r}")
 
-        # normalize a few common blocknet response shapes
-        if "accepted" not in obj and "ok" in obj:
-            obj["accepted"] = bool(obj.get("ok"))
-        if "status" not in obj:
-            obj["status"] = "accepted" if bool(obj.get("accepted")) else "rejected"
+        # normalize flat BlockNet responses into the shape your SubmitResult parser expects
+        accepted = bool(obj.get("accepted", obj.get("ok", False)))
+        status = str(obj.get("status") or ("accepted" if accepted else "rejected"))
+        error = str(obj.get("error") or obj.get("message") or "")
 
-        return obj
+        return {
+            "accepted": accepted,
+            "ok": accepted,
+            "status": status,
+            "error": error,
+            "reject_class": str(obj.get("reject_class") or ""),
+            "message": str(obj.get("message") or ""),
+            "upstream": "blocknet_p2pool",
+            "raw_upstream": obj,
+        }
 
     # ----------------------------
     # Embedded feeder
@@ -771,6 +946,12 @@ class MoneroRpcClient:
 
         blob_hex = _normalize_hex(result.get("blocktemplate_blob") or "")
         seed_hash_hex = _normalize_hex(result.get("seed_hash") or "")
+        prev_hash = _normalize_hex(
+            result.get("prev_hash")
+            or result.get("prev_id")
+            or result.get("top_hash")
+            or ""
+        )
         height = _coerce_int(result.get("height"), 0)
         difficulty = _coerce_int(result.get("difficulty"), 0)
         reserved_offset = _coerce_int(result.get("reserved_offset"), 0)
@@ -782,8 +963,20 @@ class MoneroRpcClient:
         if difficulty <= 0:
             raise RuntimeError("monerod get_block_template missing difficulty")
 
+        template_sig = self._solo_template_signature(result)
         target_hex = _difficulty_to_target_hex(difficulty)
-        job_id = _stable_job_id(blob_hex, seed_hash_hex, target_hex, str(height), "solo")
+
+        # Stable job_id based on meaningful template identity instead of raw blob churn
+        job_id = _stable_job_id(
+            template_sig,
+            seed_hash_hex,
+            str(height),
+            str(difficulty),
+            "solo",
+        )
+
+        if not self._should_repush_solo_template(template_sig):
+            return False
 
         payload = {
             "job_id": job_id,
@@ -796,8 +989,28 @@ class MoneroRpcClient:
             "height": height,
             "algo": "rx/0",
             "source": "monerod",
+            "template_sig": template_sig,
+            "template_meta": {
+                "prev_hash": prev_hash,
+                "difficulty": difficulty,
+                "height": height,
+                "reserved_offset": reserved_offset,
+            },
         }
-        return self._push_job_to_broker(payload)
+
+        pushed = self._push_job_to_broker(payload)
+        if pushed:
+            self._mark_solo_template_pushed(
+                template_sig=template_sig,
+                height=height,
+                prev_hash=prev_hash,
+            )
+            self.on_log(
+                f"[monerorpc-feeder] solo template pushed "
+                f"height={height} diff={difficulty} prev={prev_hash[:16] or '-'}"
+            )
+
+        return pushed
 
     def _feed_once_blocknet(self) -> bool:
         job = self._blocknet_get_job()

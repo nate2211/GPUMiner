@@ -97,6 +97,14 @@ class MinerConfig:
     cpu_tail_batch_min_size: int = 32
     cpu_tail_batch_threads: int = 0
 
+    # CPU rescue scan
+    enable_cpu_rescue_scan: bool = True
+    # new trigger: consecutive scan cycles with no verified share
+    cpu_rescue_after_no_share_scans: int = 2
+    cpu_rescue_job_age_max_ms: int = 1800
+    cpu_rescue_window_size: int = 1024
+    cpu_rescue_batch_size: int = 1024
+
     # GPU scan mode
     gpu_scan_mode: str = "chunk"  # "chunk" | "hash_batch"
     hash_batch_size: int = 262_144
@@ -187,6 +195,17 @@ class MinerConfig:
     def clamped_min_dynamic_work_pct(self) -> float:
         return max(0.05, min(1.00, float(self.min_dynamic_work_pct)))
 
+    def effective_cpu_rescue_trigger_scans(self) -> int:
+        modern = int(getattr(self, "cpu_rescue_after_no_share_scans", 0))
+        if modern > 0:
+            return max(1, modern)
+
+        legacy = int(getattr(self, "cpu_rescue_after_empty_scans", 0))
+        if legacy > 0:
+            return max(1, legacy)
+
+        return 2
+
     @property
     def use_blocknet(self) -> bool:
         return self.mining_backend_name() == "blocknet"
@@ -243,6 +262,10 @@ class CandidateShare:
     verify_pressure_q8: int = 0
     submit_pressure_q8: int = 0
     stale_risk_q8: int = 0
+
+    # pipeline metadata
+    source: str = "gpu"          # "gpu" | "cpu_rescue"
+    scan_seq: int = 0
 
     # exact-teacher audit fields
     exact_hash_hex: str = ""

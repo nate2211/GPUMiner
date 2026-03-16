@@ -27,6 +27,22 @@ def _nonce_array(nonces: list[int] | np.ndarray | None) -> np.ndarray:
         return np.ascontiguousarray(nonces, dtype=np.uint32)
     return np.ascontiguousarray(list(nonces), dtype=np.uint32)
 
+def _nonce_range_array(start_nonce: int, count: int) -> np.ndarray:
+    count = max(0, int(count))
+    if count <= 0:
+        return np.empty((0,), dtype=np.uint32)
+    base = np.uint64(int(start_nonce) & 0xFFFFFFFF)
+    seq = (np.arange(count, dtype=np.uint64) + base) & np.uint64(0xFFFFFFFF)
+    return np.ascontiguousarray(seq.astype(np.uint32))
+
+def _nonce_range_array(start_nonce: int, count: int) -> np.ndarray:
+    count = max(0, int(count))
+    if count <= 0:
+        return np.empty((0,), dtype=np.uint32)
+    base = np.uint64(int(start_nonce) & 0xFFFFFFFF)
+    seq = (np.arange(count, dtype=np.uint64) + base) & np.uint64(0xFFFFFFFF)
+    return np.ascontiguousarray(seq.astype(np.uint32))
+
 
 def parse_target_hex_to_u64(target_hex: str) -> int:
     s = _normalize_hex(target_hex)
@@ -654,7 +670,112 @@ class CpuVerifier:
         with self._state_lock:
             prepared = self._current_prepared_job
             return prepared.seed_ctx.dataset_fingerprint if prepared is not None else None
+    def rescue_scan_window(
+        self,
+        job: MiningJob,
+        start_nonce: int,
+        count: int,
+        *,
+        batch_size: int = 1024,
+        max_threads: int = 0,
+    ) -> list[tuple[CandidateShare, VerifiedShare]]:
+        count = max(0, int(count))
+        batch_size = max(1, int(batch_size))
+        if count <= 0 or not self.is_ready:
+            return []
 
+        prepared = self._build_prepared_from_job(job)
+        handle = self._get_thread_handle()
+        handle.prepare(prepared, self.nonce_offset)
+
+        hits: list[tuple[CandidateShare, VerifiedShare]] = []
+        scanned = 0
+
+        while scanned < count:
+            this_batch = min(batch_size, count - scanned)
+            nonce_np = _nonce_range_array((int(start_nonce) + scanned) & 0xFFFFFFFF, this_batch)
+            hashes_np: Optional[np.ndarray] = None
+
+            if this_batch > 1 and self.has_batch_hash:
+                try:
+                    rc, hashes_np = handle.hash_nonces_batch(nonce_np, max_threads=max_threads)
+                    if rc != 0:
+                        raise RuntimeError(
+                            handle.last_error() or f"bnrx_hash_nonce_batch failed with rc={rc}"
+                        )
+                except Exception as exc:
+                    self._log(
+                        f"[verify] rescue hash batch fallback size={this_batch} reason={exc}"
+                    )
+                    hashes_np = None
+
+            if hashes_np is None and this_batch > 1 and self.has_batch_verify:
+                try:
+                    rc, _accepts_np, hashes_np = handle.verify_nonces_batch(
+                        nonce_np,
+                        max_threads=max_threads,
+                    )
+                    if rc != 0:
+                        raise RuntimeError(
+                            handle.last_error() or f"bnrx_verify_nonce_batch failed with rc={rc}"
+                        )
+                except Exception as exc:
+                    self._log(
+                        f"[verify] rescue verify batch fallback size={this_batch} reason={exc}"
+                    )
+                    hashes_np = None
+
+            if hashes_np is not None:
+                for idx, nonce_u32 in enumerate(nonce_np):
+                    cand = CandidateShare(
+                        nonce=int(nonce_u32),
+                        gpu_hash_hex="",
+                        job_id=job.job_id,
+                        blob_hex=job.blob_hex,
+                        session_id=job.session_id,
+                        target_hex=job.target_hex,
+                        seed_hash_hex=job.seed_hash_hex,
+                        source="cpu_rescue",
+                    )
+                    item = self._label_share_from_hash(prepared, cand, hashes_np[idx].tobytes())
+                    if item.verified is not None:
+                        hits.append((cand, item.verified))
+            else:
+                for nonce_u32 in nonce_np:
+                    nonce_i = int(nonce_u32)
+                    try:
+                        if self.has_hash_nonce:
+                            out_hash = handle.hash_nonce(nonce_i)
+                        else:
+                            rc, out_hash = handle.verify_nonce(nonce_i)
+                            if rc < 0:
+                                raise RuntimeError(
+                                    handle.last_error() or f"bnrx_verify_nonce failed with rc={rc}"
+                                )
+                    except Exception as exc:
+                        self._log(
+                            f"[verify] rescue single nonce failed nonce={nonce_i:08x}: {exc}"
+                        )
+                        continue
+
+                    cand = CandidateShare(
+                        nonce=nonce_i,
+                        gpu_hash_hex="",
+                        job_id=job.job_id,
+                        blob_hex=job.blob_hex,
+                        session_id=job.session_id,
+                        target_hex=job.target_hex,
+                        seed_hash_hex=job.seed_hash_hex,
+                        source="cpu_rescue",
+                    )
+                    item = self._label_share_from_hash(prepared, cand, out_hash)
+                    if item.verified is not None:
+                        hits.append((cand, item.verified))
+
+            scanned += this_batch
+
+        hits.sort(key=lambda row: (-float(row[1].credited_work), int(row[0].nonce)))
+        return hits
     def close(self) -> None:
         with self._handles_lock:
             export_handle = self._export_handle
@@ -835,6 +956,113 @@ class CpuVerifier:
     ) -> list[tuple[Optional[VerifiedShare], float]]:
         labeled = self.label_shares_batch_with_hashes(shares, max_threads=max_threads)
         return [(item.verified, item.credited_work) for item in labeled]
+
+    def rescue_scan_window(
+        self,
+        job: MiningJob,
+        start_nonce: int,
+        count: int,
+        *,
+        batch_size: int = 1024,
+        max_threads: int = 0,
+    ) -> list[tuple[CandidateShare, VerifiedShare]]:
+        count = max(0, int(count))
+        batch_size = max(1, int(batch_size))
+        if count <= 0 or not self.is_ready:
+            return []
+
+        prepared = self._build_prepared_from_job(job)
+        handle = self._get_thread_handle()
+        handle.prepare(prepared, self.nonce_offset)
+
+        hits: list[tuple[CandidateShare, VerifiedShare]] = []
+        scanned = 0
+
+        while scanned < count:
+            this_batch = min(batch_size, count - scanned)
+            nonce_np = _nonce_range_array((int(start_nonce) + scanned) & 0xFFFFFFFF, this_batch)
+            hashes_np: Optional[np.ndarray] = None
+
+            if this_batch > 1 and self.has_batch_hash:
+                try:
+                    rc, hashes_np = handle.hash_nonces_batch(nonce_np, max_threads=max_threads)
+                    if rc != 0:
+                        raise RuntimeError(
+                            handle.last_error() or f"bnrx_hash_nonce_batch failed with rc={rc}"
+                        )
+                except Exception as exc:
+                    self._log(
+                        f"[verify] rescue hash batch fallback size={this_batch} reason={exc}"
+                    )
+                    hashes_np = None
+
+            if hashes_np is None and this_batch > 1 and self.has_batch_verify:
+                try:
+                    rc, _accepts_np, hashes_np = handle.verify_nonces_batch(
+                        nonce_np,
+                        max_threads=max_threads,
+                    )
+                    if rc != 0:
+                        raise RuntimeError(
+                            handle.last_error() or f"bnrx_verify_nonce_batch failed with rc={rc}"
+                        )
+                except Exception as exc:
+                    self._log(
+                        f"[verify] rescue verify batch fallback size={this_batch} reason={exc}"
+                    )
+                    hashes_np = None
+
+            if hashes_np is not None:
+                for idx, nonce_u32 in enumerate(nonce_np):
+                    cand = CandidateShare(
+                        nonce=int(nonce_u32),
+                        gpu_hash_hex="",
+                        job_id=job.job_id,
+                        blob_hex=job.blob_hex,
+                        session_id=job.session_id,
+                        target_hex=job.target_hex,
+                        seed_hash_hex=job.seed_hash_hex,
+                        source="cpu_rescue",
+                    )
+                    item = self._label_share_from_hash(prepared, cand, hashes_np[idx].tobytes())
+                    if item.verified is not None:
+                        hits.append((cand, item.verified))
+            else:
+                for nonce_u32 in nonce_np:
+                    nonce_i = int(nonce_u32)
+                    try:
+                        if self.has_hash_nonce:
+                            out_hash = handle.hash_nonce(nonce_i)
+                        else:
+                            rc, out_hash = handle.verify_nonce(nonce_i)
+                            if rc < 0:
+                                raise RuntimeError(
+                                    handle.last_error() or f"bnrx_verify_nonce failed with rc={rc}"
+                                )
+                    except Exception as exc:
+                        self._log(
+                            f"[verify] rescue single nonce failed nonce={nonce_i:08x}: {exc}"
+                        )
+                        continue
+
+                    cand = CandidateShare(
+                        nonce=nonce_i,
+                        gpu_hash_hex="",
+                        job_id=job.job_id,
+                        blob_hex=job.blob_hex,
+                        session_id=job.session_id,
+                        target_hex=job.target_hex,
+                        seed_hash_hex=job.seed_hash_hex,
+                        source="cpu_rescue",
+                    )
+                    item = self._label_share_from_hash(prepared, cand, out_hash)
+                    if item.verified is not None:
+                        hits.append((cand, item.verified))
+
+            scanned += this_batch
+
+        hits.sort(key=lambda row: (-float(row[1].credited_work), int(row[0].nonce)))
+        return hits
 
     def screen_shares_batch_by_tail(
         self,
