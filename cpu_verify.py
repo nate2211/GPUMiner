@@ -13,6 +13,9 @@ import numpy as np
 from models import CandidateShare, MiningJob, VerifiedShare
 from utils import nonce_to_hex_le, safe_bytes_from_hex
 
+MAX_U64 = 0xFFFFFFFFFFFFFFFF
+MAX_U256 = (1 << 256) - 1
+
 
 def _normalize_hex(text: Optional[str]) -> str:
     if not text:
@@ -27,6 +30,7 @@ def _nonce_array(nonces: list[int] | np.ndarray | None) -> np.ndarray:
         return np.ascontiguousarray(nonces, dtype=np.uint32)
     return np.ascontiguousarray(list(nonces), dtype=np.uint32)
 
+
 def _nonce_range_array(start_nonce: int, count: int) -> np.ndarray:
     count = max(0, int(count))
     if count <= 0:
@@ -34,6 +38,30 @@ def _nonce_range_array(start_nonce: int, count: int) -> np.ndarray:
     base = np.uint64(int(start_nonce) & 0xFFFFFFFF)
     seq = (np.arange(count, dtype=np.uint64) + base) & np.uint64(0xFFFFFFFF)
     return np.ascontiguousarray(seq.astype(np.uint32))
+
+
+def parse_target_hex_to_bytes(target_hex: str) -> bytes:
+    s = _normalize_hex(target_hex)
+    raw = safe_bytes_from_hex(s)
+    if not raw:
+        return b""
+    if len(raw) >= 32:
+        return raw[:32]
+    return raw.ljust(32, b"\x00")
+
+
+def target_hex_uses_full_256(target_hex: str) -> bool:
+    raw = safe_bytes_from_hex(_normalize_hex(target_hex))
+    return bool(raw) and len(raw) >= 32
+
+
+def target_hex_to_int(target_hex: str) -> int:
+    raw = parse_target_hex_to_bytes(target_hex)
+    if not raw:
+        return 0
+    return int.from_bytes(raw, "little", signed=False)
+
+
 def parse_target_hex_to_u64(target_hex: str) -> int:
     s = _normalize_hex(target_hex)
     raw = safe_bytes_from_hex(s)
@@ -45,12 +73,10 @@ def parse_target_hex_to_u64(target_hex: str) -> int:
         if t32 == 0:
             return 0
 
-        max32 = 0xFFFFFFFF
-        max64 = 0xFFFFFFFFFFFFFFFF
-        denom = max32 // t32
+        denom = 0xFFFFFFFF // t32
         if denom == 0:
-            return max64
-        return max64 // denom
+            return MAX_U64
+        return MAX_U64 // denom
 
     if len(raw) >= 8:
         return int.from_bytes(raw[:8], "little", signed=False)
@@ -59,10 +85,26 @@ def parse_target_hex_to_u64(target_hex: str) -> int:
 
 
 def target_hex_to_assigned_work(target_hex: str) -> float:
+    raw = safe_bytes_from_hex(_normalize_hex(target_hex))
+    if not raw:
+        return 0.0
+
+    if len(raw) >= 32:
+        target_int = int.from_bytes(parse_target_hex_to_bytes(target_hex), "little", signed=False)
+        if target_int <= 0:
+            return 0.0
+        return float(MAX_U256) / float(target_int)
+
     target64 = parse_target_hex_to_u64(target_hex)
     if target64 <= 0:
         return 0.0
-    return float(0xFFFFFFFFFFFFFFFF) / float(target64)
+    return float(MAX_U64) / float(target64)
+
+
+def hash_bytes_to_actual_hash_int(hash32: bytes) -> int:
+    if not hash32 or len(hash32) < 32:
+        return 0
+    return int.from_bytes(hash32[:32], "little", signed=False)
 
 
 def hash_bytes_to_actual_tail_u64(hash32: bytes) -> int:
@@ -72,14 +114,42 @@ def hash_bytes_to_actual_tail_u64(hash32: bytes) -> int:
 
 
 def tail_u64_to_actual_work(tail_u64: int) -> float:
-    v = int(tail_u64) & 0xFFFFFFFFFFFFFFFF
+    v = int(tail_u64) & MAX_U64
     if v <= 0:
-        return float(0xFFFFFFFFFFFFFFFF)
-    return float(0xFFFFFFFFFFFFFFFF) / float(v)
+        return float(MAX_U64)
+    return float(MAX_U64) / float(v)
 
 
-def hash_bytes_to_actual_work_u64(hash32: bytes) -> float:
+def hash_bytes_to_actual_work(hash32: bytes, target_hex: str) -> float:
+    raw = safe_bytes_from_hex(_normalize_hex(target_hex))
+    if not raw:
+        return 0.0
+
+    if len(raw) >= 32:
+        v = hash_bytes_to_actual_hash_int(hash32)
+        if v <= 0:
+            return float(MAX_U256)
+        return float(MAX_U256) / float(v)
+
     return tail_u64_to_actual_work(hash_bytes_to_actual_tail_u64(hash32))
+
+
+def hash_meets_target(hash32: bytes, target_hex: str) -> bool:
+    raw = safe_bytes_from_hex(_normalize_hex(target_hex))
+    if not raw or len(hash32) < 32:
+        return False
+
+    if len(raw) >= 32:
+        target_int = int.from_bytes(parse_target_hex_to_bytes(target_hex), "little", signed=False)
+        if target_int <= 0:
+            return False
+        hash_int = hash_bytes_to_actual_hash_int(hash32)
+        return hash_int <= target_int
+
+    target64 = parse_target_hex_to_u64(target_hex)
+    if target64 <= 0:
+        return False
+    return hash_bytes_to_actual_tail_u64(hash32) <= target64
 
 
 @dataclass(frozen=True)
@@ -97,10 +167,13 @@ class _PreparedJob:
     target_hex: str
     target_b: bytes
     blob_hex_norm: str
+    target_raw: bytes
+    target_int: int
     target64: int
     assigned_work: float
     fingerprint: bytes
     seed_ctx: _PreparedSeed
+    full_target: bool
 
 
 @dataclass
@@ -660,112 +733,7 @@ class CpuVerifier:
         with self._state_lock:
             prepared = self._current_prepared_job
             return prepared.seed_ctx.dataset_fingerprint if prepared is not None else None
-    def rescue_scan_window(
-        self,
-        job: MiningJob,
-        start_nonce: int,
-        count: int,
-        *,
-        batch_size: int = 1024,
-        max_threads: int = 0,
-    ) -> list[tuple[CandidateShare, VerifiedShare]]:
-        count = max(0, int(count))
-        batch_size = max(1, int(batch_size))
-        if count <= 0 or not self.is_ready:
-            return []
 
-        prepared = self._build_prepared_from_job(job)
-        handle = self._get_thread_handle()
-        handle.prepare(prepared, self.nonce_offset)
-
-        hits: list[tuple[CandidateShare, VerifiedShare]] = []
-        scanned = 0
-
-        while scanned < count:
-            this_batch = min(batch_size, count - scanned)
-            nonce_np = _nonce_range_array((int(start_nonce) + scanned) & 0xFFFFFFFF, this_batch)
-            hashes_np: Optional[np.ndarray] = None
-
-            if this_batch > 1 and self.has_batch_hash:
-                try:
-                    rc, hashes_np = handle.hash_nonces_batch(nonce_np, max_threads=max_threads)
-                    if rc != 0:
-                        raise RuntimeError(
-                            handle.last_error() or f"bnrx_hash_nonce_batch failed with rc={rc}"
-                        )
-                except Exception as exc:
-                    self._log(
-                        f"[verify] rescue hash batch fallback size={this_batch} reason={exc}"
-                    )
-                    hashes_np = None
-
-            if hashes_np is None and this_batch > 1 and self.has_batch_verify:
-                try:
-                    rc, _accepts_np, hashes_np = handle.verify_nonces_batch(
-                        nonce_np,
-                        max_threads=max_threads,
-                    )
-                    if rc != 0:
-                        raise RuntimeError(
-                            handle.last_error() or f"bnrx_verify_nonce_batch failed with rc={rc}"
-                        )
-                except Exception as exc:
-                    self._log(
-                        f"[verify] rescue verify batch fallback size={this_batch} reason={exc}"
-                    )
-                    hashes_np = None
-
-            if hashes_np is not None:
-                for idx, nonce_u32 in enumerate(nonce_np):
-                    cand = CandidateShare(
-                        nonce=int(nonce_u32),
-                        gpu_hash_hex="",
-                        job_id=job.job_id,
-                        blob_hex=job.blob_hex,
-                        session_id=job.session_id,
-                        target_hex=job.target_hex,
-                        seed_hash_hex=job.seed_hash_hex,
-                        source="cpu_rescue",
-                    )
-                    item = self._label_share_from_hash(prepared, cand, hashes_np[idx].tobytes())
-                    if item.verified is not None:
-                        hits.append((cand, item.verified))
-            else:
-                for nonce_u32 in nonce_np:
-                    nonce_i = int(nonce_u32)
-                    try:
-                        if self.has_hash_nonce:
-                            out_hash = handle.hash_nonce(nonce_i)
-                        else:
-                            rc, out_hash = handle.verify_nonce(nonce_i)
-                            if rc < 0:
-                                raise RuntimeError(
-                                    handle.last_error() or f"bnrx_verify_nonce failed with rc={rc}"
-                                )
-                    except Exception as exc:
-                        self._log(
-                            f"[verify] rescue single nonce failed nonce={nonce_i:08x}: {exc}"
-                        )
-                        continue
-
-                    cand = CandidateShare(
-                        nonce=nonce_i,
-                        gpu_hash_hex="",
-                        job_id=job.job_id,
-                        blob_hex=job.blob_hex,
-                        session_id=job.session_id,
-                        target_hex=job.target_hex,
-                        seed_hash_hex=job.seed_hash_hex,
-                        source="cpu_rescue",
-                    )
-                    item = self._label_share_from_hash(prepared, cand, out_hash)
-                    if item.verified is not None:
-                        hits.append((cand, item.verified))
-
-            scanned += this_batch
-
-        hits.sort(key=lambda row: (-float(row[1].credited_work), int(row[0].nonce)))
-        return hits
     def close(self) -> None:
         with self._handles_lock:
             export_handle = self._export_handle
@@ -807,10 +775,7 @@ class CpuVerifier:
             if not self.is_ready:
                 raise RuntimeError(self.disabled_reason or "native verifier is not available")
             current = self._current_prepared_job
-            if (
-                current is not None
-                and current.seed_ctx.fingerprint == prepared.seed_ctx.fingerprint
-            ):
+            if current is not None and current.seed_ctx.fingerprint == prepared.seed_ctx.fingerprint:
                 return
 
         export_handle = self._require_export_handle()
@@ -828,7 +793,6 @@ class CpuVerifier:
         with self._state_lock:
             if not self.is_ready:
                 raise RuntimeError(self.disabled_reason or "native verifier is not available")
-
             current = self._current_prepared_job
             if (
                 current is not None
@@ -880,7 +844,6 @@ class CpuVerifier:
         with self._state_lock:
             if not self.is_ready:
                 raise RuntimeError(self.disabled_reason or "native verifier is not available")
-
             current = self._current_prepared_job
             if (
                 current is not None
@@ -898,6 +861,7 @@ class CpuVerifier:
         self._log(
             f"[verify] prepared job job_id={job.job_id} "
             f"height={job.height} algo={job.algo} "
+            f"full_target={1 if prepared.full_target else 0} "
             f"target64={prepared.target64} assigned_work={prepared.assigned_work:.6f}"
         )
 
@@ -923,7 +887,6 @@ class CpuVerifier:
             export_handle.prepare(prepared, self.nonce_offset)
 
         arr = export_handle.export_dataset64()
-
         mib = arr.nbytes / (1024.0 * 1024.0)
         self._log(f"[verify] exported RandomX dataset: words={arr.size} size={mib:.2f} MiB")
         return arr
@@ -981,9 +944,7 @@ class CpuVerifier:
                             handle.last_error() or f"bnrx_hash_nonce_batch failed with rc={rc}"
                         )
                 except Exception as exc:
-                    self._log(
-                        f"[verify] rescue hash batch fallback size={this_batch} reason={exc}"
-                    )
+                    self._log(f"[verify] rescue hash batch fallback size={this_batch} reason={exc}")
                     hashes_np = None
 
             if hashes_np is None and this_batch > 1 and self.has_batch_verify:
@@ -997,9 +958,7 @@ class CpuVerifier:
                             handle.last_error() or f"bnrx_verify_nonce_batch failed with rc={rc}"
                         )
                 except Exception as exc:
-                    self._log(
-                        f"[verify] rescue verify batch fallback size={this_batch} reason={exc}"
-                    )
+                    self._log(f"[verify] rescue verify batch fallback size={this_batch} reason={exc}")
                     hashes_np = None
 
             if hashes_np is not None:
@@ -1030,9 +989,7 @@ class CpuVerifier:
                                     handle.last_error() or f"bnrx_verify_nonce failed with rc={rc}"
                                 )
                     except Exception as exc:
-                        self._log(
-                            f"[verify] rescue single nonce failed nonce={nonce_i:08x}: {exc}"
-                        )
+                        self._log(f"[verify] rescue single nonce failed nonce={nonce_i:08x}: {exc}")
                         continue
 
                     cand = CandidateShare(
@@ -1093,6 +1050,15 @@ class CpuVerifier:
         handle = self._get_thread_handle()
 
         for prepared, indexed_shares in grouped.values():
+            if prepared.full_target:
+                fallback = self.label_shares_batch_with_hashes(
+                    [share for _, share in indexed_shares],
+                    max_threads=max_threads,
+                )
+                for (result_idx, _), item in zip(indexed_shares, fallback):
+                    results[result_idx] = item
+                continue
+
             try:
                 handle.prepare(prepared, self.nonce_offset)
             except Exception as exc:
@@ -1108,9 +1074,7 @@ class CpuVerifier:
                         handle.last_error() or f"bnrx_tail_nonce_batch failed with rc={rc}"
                     )
             except Exception as exc:
-                self._log(
-                    f"[verify] tail batch fallback size={len(indexed_shares)} reason={exc}"
-                )
+                self._log(f"[verify] tail batch fallback size={len(indexed_shares)} reason={exc}")
                 fallback = self.label_shares_batch_with_hashes(
                     [share for _, share in indexed_shares],
                     max_threads=max_threads,
@@ -1209,19 +1173,13 @@ class CpuVerifier:
 
             if len(indexed_shares) > 1 and self.has_batch_hash:
                 try:
-                    rc, hashes_np = handle.hash_nonces_batch(
-                        nonces,
-                        max_threads=max_threads,
-                    )
+                    rc, hashes_np = handle.hash_nonces_batch(nonces, max_threads=max_threads)
                     if rc != 0:
                         raise RuntimeError(
                             handle.last_error() or f"bnrx_hash_nonce_batch failed with rc={rc}"
                         )
                 except Exception as exc:
-                    self._log(
-                        f"[verify] hash batch fallback size={len(indexed_shares)} "
-                        f"reason={exc}"
-                    )
+                    self._log(f"[verify] hash batch fallback size={len(indexed_shares)} reason={exc}")
                     hashes_np = None
 
             if hashes_np is None and len(indexed_shares) > 1 and self.has_batch_verify:
@@ -1235,10 +1193,7 @@ class CpuVerifier:
                             handle.last_error() or f"bnrx_verify_nonce_batch failed with rc={rc}"
                         )
                 except Exception as exc:
-                    self._log(
-                        f"[verify] verify batch fallback size={len(indexed_shares)} "
-                        f"reason={exc}"
-                    )
+                    self._log(f"[verify] verify batch fallback size={len(indexed_shares)} reason={exc}")
                     hashes_np = None
 
             if hashes_np is not None:
@@ -1294,7 +1249,7 @@ class CpuVerifier:
         except Exception:
             pass
 
-        if prepared.target64 <= 0 or exact_tail_u64 >= prepared.target64:
+        if not hash_meets_target(out_hash, prepared.target_hex):
             return HashLabelResult(
                 share=share,
                 exact_hash_hex=exact_hash_hex,
@@ -1305,7 +1260,7 @@ class CpuVerifier:
             )
 
         assigned_work = prepared.assigned_work
-        actual_work = hash_bytes_to_actual_work_u64(out_hash)
+        actual_work = hash_bytes_to_actual_work(out_hash, prepared.target_hex)
         credited_work = max(assigned_work, actual_work)
         quality = (actual_work / assigned_work) if assigned_work > 0.0 else 0.0
 
@@ -1355,16 +1310,12 @@ class CpuVerifier:
 
         if not blob_hex_norm or not target_hex_norm:
             return False
-
         if blob_hex_norm != prepared.blob_hex_norm:
             return False
-
         if target_hex_norm != prepared.target_hex:
             return False
-
         if share_seed_norm and share_seed_norm != prepared.seed_ctx.seed_hex_norm:
             return False
-
         return True
 
     def _build_prepared_seed(self, seed_hex_norm: str, blob: bytes) -> _PreparedSeed:
@@ -1388,9 +1339,7 @@ class CpuVerifier:
             raise ValueError("job.blob_hex is empty or invalid")
 
         if self.nonce_offset < 0 or (self.nonce_offset + 4) > len(blob):
-            raise ValueError(
-                f"invalid nonce_offset={self.nonce_offset} for blob length {len(blob)}"
-            )
+            raise ValueError(f"invalid nonce_offset={self.nonce_offset} for blob length {len(blob)}")
 
         seed_hex_norm = _normalize_hex(job.seed_hash_hex)
         seed_ctx = self._build_prepared_seed(seed_hex_norm, blob)
@@ -1399,8 +1348,14 @@ class CpuVerifier:
         if not target_hex:
             raise ValueError("job.target_hex is empty")
 
+        target_raw = parse_target_hex_to_bytes(target_hex)
+        if not target_raw:
+            raise ValueError("job.target_hex is invalid")
+
+        full_target = target_hex_uses_full_256(target_hex)
         target_b = target_hex.encode("ascii", errors="strict")
         target64 = parse_target_hex_to_u64(target_hex)
+        target_int = int.from_bytes(target_raw, "little", signed=False) if full_target else 0
         assigned_work = target_hex_to_assigned_work(target_hex)
         fingerprint = self._job_fingerprint(blob, target_hex)
 
@@ -1410,10 +1365,13 @@ class CpuVerifier:
             target_hex=target_hex,
             target_b=target_b,
             blob_hex_norm=blob_hex_norm,
+            target_raw=target_raw,
+            target_int=target_int,
             target64=target64,
             assigned_work=assigned_work,
             fingerprint=fingerprint,
             seed_ctx=seed_ctx,
+            full_target=full_target,
         )
 
     def _build_prepared_from_share(self, share: CandidateShare) -> _PreparedJob:
@@ -1423,9 +1381,7 @@ class CpuVerifier:
             raise ValueError("candidate blob_hex is empty or invalid")
 
         if self.nonce_offset < 0 or (self.nonce_offset + 4) > len(blob):
-            raise ValueError(
-                f"invalid nonce_offset={self.nonce_offset} for blob length {len(blob)}"
-            )
+            raise ValueError(f"invalid nonce_offset={self.nonce_offset} for blob length {len(blob)}")
 
         seed_hex_norm = _normalize_hex(share.seed_hash_hex)
         seed_ctx = self._build_prepared_seed(seed_hex_norm, blob)
@@ -1434,8 +1390,14 @@ class CpuVerifier:
         if not target_hex:
             raise ValueError("candidate target_hex is empty")
 
+        target_raw = parse_target_hex_to_bytes(target_hex)
+        if not target_raw:
+            raise ValueError("candidate target_hex is invalid")
+
+        full_target = target_hex_uses_full_256(target_hex)
         target_b = target_hex.encode("ascii", errors="strict")
         target64 = parse_target_hex_to_u64(target_hex)
+        target_int = int.from_bytes(target_raw, "little", signed=False) if full_target else 0
         assigned_work = target_hex_to_assigned_work(target_hex)
         fingerprint = self._job_fingerprint(blob, target_hex)
 
@@ -1445,10 +1407,13 @@ class CpuVerifier:
             target_hex=target_hex,
             target_b=target_b,
             blob_hex_norm=blob_hex_norm,
+            target_raw=target_raw,
+            target_int=target_int,
             target64=target64,
             assigned_work=assigned_work,
             fingerprint=fingerprint,
             seed_ctx=seed_ctx,
+            full_target=full_target,
         )
 
     def _get_thread_handle(self) -> _NativeHandle:
@@ -1705,30 +1670,12 @@ class CpuVerifier:
             "[verify] dataset exports loaded="
             f"{hasattr(lib, 'bnrx_dataset_words64') and hasattr(lib, 'bnrx_export_dataset64')}"
         )
-        self._log(
-            "[verify] prepare seed loaded="
-            f"{hasattr(lib, 'bnrx_prepare_seed')}"
-        )
-        self._log(
-            "[verify] set job loaded="
-            f"{hasattr(lib, 'bnrx_set_job')}"
-        )
-        self._log(
-            "[verify] warm batch vms loaded="
-            f"{hasattr(lib, 'bnrx_warm_batch_vms')}"
-        )
-        self._log(
-            "[verify] batch verify loaded="
-            f"{hasattr(lib, 'bnrx_verify_nonce_batch')}"
-        )
-        self._log(
-            "[verify] batch hash loaded="
-            f"{hasattr(lib, 'bnrx_hash_nonce_batch')}"
-        )
-        self._log(
-            "[verify] batch tail loaded="
-            f"{hasattr(lib, 'bnrx_tail_nonce_batch')}"
-        )
+        self._log(f"[verify] prepare seed loaded={hasattr(lib, 'bnrx_prepare_seed')}")
+        self._log(f"[verify] set job loaded={hasattr(lib, 'bnrx_set_job')}")
+        self._log(f"[verify] warm batch vms loaded={hasattr(lib, 'bnrx_warm_batch_vms')}")
+        self._log(f"[verify] batch verify loaded={hasattr(lib, 'bnrx_verify_nonce_batch')}")
+        self._log(f"[verify] batch hash loaded={hasattr(lib, 'bnrx_hash_nonce_batch')}")
+        self._log(f"[verify] batch tail loaded={hasattr(lib, 'bnrx_tail_nonce_batch')}")
         return lib
 
     @staticmethod

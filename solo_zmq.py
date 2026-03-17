@@ -17,6 +17,55 @@ except Exception:
     zmq = None
 
 
+def _normalize_hex(text: str) -> str:
+    return "".join(ch for ch in str(text or "").strip().lower() if not ch.isspace())
+
+
+def _coerce_int(value, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return int(default)
+        if isinstance(value, str):
+            t = value.strip()
+            if not t:
+                return int(default)
+            if t.lower().startswith("0x"):
+                return int(t, 16)
+            return int(t)
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _full_difficulty_from_result(result: dict) -> int:
+    wide_hex = str(result.get("wide_difficulty", "") or "").strip().lower()
+    if wide_hex.startswith("0x"):
+        wide_hex = wide_hex[2:]
+    if wide_hex:
+        try:
+            return int(wide_hex, 16)
+        except Exception:
+            pass
+
+    diff_lo = _coerce_int(result.get("difficulty"), 0)
+    diff_hi = _coerce_int(result.get("difficulty_top64"), 0)
+    full = (int(diff_hi) << 64) | (int(diff_lo) & 0xFFFFFFFFFFFFFFFF)
+    return full if full > 0 else 0
+
+
+def _difficulty_result_to_target_hex(result: dict) -> str:
+    direct = _normalize_hex(result.get("target") or result.get("target_hex") or "")
+    if direct and len(direct) >= 64:
+        return direct[:64]
+
+    difficulty = _full_difficulty_from_result(result)
+    if difficulty <= 0:
+        raise RuntimeError("get_block_template missing usable difficulty / wide_difficulty")
+
+    target256 = ((1 << 256) - 1) // difficulty
+    return target256.to_bytes(32, "little", signed=False).hex()
+
+
 @dataclass
 class SoloTemplateState:
     height: int = 0
@@ -74,7 +123,7 @@ class MoneroZmqReader:
                 time.sleep(0.25)
                 continue
             try:
-                _frames = self._sock.recv_multipart()
+                self._sock.recv_multipart()
                 self.on_event()
             except Exception:
                 continue
@@ -92,6 +141,9 @@ class SoloMiningConnection:
         self.on_log = on_log
         self.on_job = on_job
         self.on_status = on_status
+
+        self.current_job: Optional[MiningJob] = None
+        self.session_id: str = "solo"
 
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -116,7 +168,11 @@ class SoloMiningConnection:
 
         self._poll_thread = threading.Thread(target=self._poll_loop, name="SoloPollThread", daemon=True)
         self._poll_thread.start()
-        self.on_status("connected")
+
+        if self.current_job is not None:
+            self.on_status("mining")
+        else:
+            self.on_status("connected")
 
     def close(self) -> None:
         self._stop.set()
@@ -148,8 +204,7 @@ class SoloMiningConnection:
 
         self.on_log(
             f"[submit] sent backend=solo nonce={verified.nonce_hex} job={verified.job_id} "
-            f"credited={verified.credited_work:.6f} "
-            f"actual={verified.actual_work:.6f} "
+            f"credited={verified.credited_work:.6f} actual={verified.actual_work:.6f} "
             f"quality={verified.quality:.6f}"
         )
 
@@ -201,7 +256,7 @@ class SoloMiningConnection:
     def _poll_loop(self) -> None:
         fallback_s = max(0.25, float(self.config.solo_poll_fallback_s))
         while not self._stop.is_set():
-            _fired = self._wake.wait(timeout=fallback_s)
+            self._wake.wait(timeout=fallback_s)
             self._wake.clear()
             if self._stop.is_set():
                 break
@@ -211,8 +266,6 @@ class SoloMiningConnection:
                 self.on_log(f"[solo] template refresh failed: {exc}")
 
     def _refresh_template(self, force_emit: bool) -> None:
-        _ = force_emit  # kept for signature compatibility
-
         wallet = (self.config.solo_wallet_address or "").strip()
         if not wallet:
             raise RuntimeError("solo wallet address is required")
@@ -229,17 +282,23 @@ class SoloMiningConnection:
             return
 
         height = int(result.get("height", 0))
-        prev_hash = str(result.get("prev_hash", "")).strip().lower()
-        seed_hash = str(result.get("seed_hash", "")).strip().lower()
+        prev_hash = _normalize_hex(result.get("prev_hash", "") or result.get("prev_id", "") or "")
+        seed_hash = _normalize_hex(result.get("seed_hash", "") or "")
+        next_seed_hash = _normalize_hex(result.get("next_seed_hash", "") or "")
 
-        submit_blob_hex = str(result.get("blocktemplate_blob", "") or "").strip()
-        hashing_blob_hex = str(result.get("blockhashing_blob", "") or submit_blob_hex).strip()
+        submit_blob_hex = _normalize_hex(result.get("blocktemplate_blob", "") or result.get("submit_blob", "") or "")
+        hashing_blob_hex = _normalize_hex(result.get("blockhashing_blob", "") or result.get("blob", "") or submit_blob_hex)
         expected_reward_atomic = int(result.get("expected_reward", 0) or 0)
+        reserved_offset = int(result.get("reserved_offset", 0) or 0)
+        target_hex = _difficulty_result_to_target_hex(result)
+        difficulty = _full_difficulty_from_result(result)
 
         if not submit_blob_hex:
             raise RuntimeError("get_block_template returned empty blocktemplate_blob")
         if not hashing_blob_hex:
             raise RuntimeError("get_block_template returned empty blockhashing_blob")
+        if not seed_hash:
+            raise RuntimeError("get_block_template returned empty seed_hash")
 
         template_fingerprint = hashlib.sha256(
             submit_blob_hex.encode("ascii", errors="ignore")
@@ -247,11 +306,8 @@ class SoloMiningConnection:
 
         job_id = f"solo:{height}:{prev_hash[:16]}:{seed_hash[:16]}:{template_fingerprint}"
 
-        if job_id == self._last.job_id:
+        if not force_emit and job_id == self._last.job_id:
             return
-
-        prefilter_u64 = self._difficulty_result_to_prefilter_u64(result)
-        target_hex = int(prefilter_u64 & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little", signed=False).hex()
 
         job = MiningJob(
             job_id=job_id,
@@ -262,11 +318,11 @@ class SoloMiningConnection:
             seed_hash_hex=seed_hash,
             height=height,
             algo="rx/0",
-            reserved_offset=int(result.get("reserved_offset", 0) or 0),
-            prefilter_target64=int(prefilter_u64),
+            reserved_offset=reserved_offset,
             backend="solo",
         )
 
+        self.current_job = job
         self._last = SoloTemplateState(
             height=height,
             prev_hash=prev_hash,
@@ -285,10 +341,14 @@ class SoloMiningConnection:
 
         self.on_log(
             f"[solo] new template height={height} prev={prev_hash[:16]} "
-            f"seed={seed_hash[:16]} tpl={template_fingerprint} "
-            f"target64=0x{prefilter_u64:016x} expected_reward_atomic={expected_reward_atomic}"
+            f"seed={seed_hash[:16]} tpl={template_fingerprint} diff={difficulty or '-'} "
+            f"target={target_hex[:16]} expected_reward_atomic={expected_reward_atomic}"
         )
+        if next_seed_hash:
+            self.on_log(f"[solo] next_seed={next_seed_hash[:16]}")
+
         self.on_job(job)
+        self.on_status("mining")
 
     def _rpc_call(self, method: str, params) -> dict:
         url = self._normalize_rpc_url(self.config.solo_daemon_rpc_url)
@@ -326,34 +386,3 @@ class SoloMiningConnection:
         if not u.endswith("/json_rpc"):
             u = u.rstrip("/") + "/json_rpc"
         return u
-
-    @staticmethod
-    def _difficulty_result_to_prefilter_u64(result: dict) -> int:
-        wide_hex = str(result.get("wide_difficulty", "") or "").strip().lower()
-        if wide_hex.startswith("0x"):
-            wide_hex = wide_hex[2:]
-
-        difficulty = 0
-        if wide_hex:
-            try:
-                difficulty = int(wide_hex, 16)
-            except Exception:
-                difficulty = 0
-
-        if difficulty <= 0:
-            try:
-                difficulty = int(result.get("difficulty", 0) or 0)
-                difficulty_top64 = int(result.get("difficulty_top64", 0) or 0)
-                if difficulty_top64 > 0:
-                    difficulty = (difficulty_top64 << 64) | difficulty
-            except Exception:
-                difficulty = 0
-
-        if difficulty <= 0:
-            return 0x0000FFFFFFFFFFFF
-
-        full_target = ((1 << 256) - 1) // difficulty
-        low64 = full_target & 0xFFFFFFFFFFFFFFFF
-        if low64 <= 0:
-            low64 = 1
-        return int(low64)
