@@ -150,6 +150,7 @@ class MinerWorker(QObject):
 
         self._accepted_work_total = 0.0
 
+        self._submit_blob_by_job_id: dict[str, str] = {}
     def _needs_randomx_prepare(self) -> bool:
         return bool(
             self.verifier is not None
@@ -724,11 +725,14 @@ class MinerWorker(QObject):
         if not (self.config.use_solo or self.config.use_monero_rpc):
             return
 
-        job, _ = self._get_job_state()
-        if job is None or job.job_id != job_id:
-            return
+        blob_hex = ""
+        with self._job_lock:
+            blob_hex = (self._submit_blob_by_job_id.get(job_id, "") or "").strip()
+            current_job = self._job
 
-        blob_hex = (job.submit_blob_hex or "").strip()
+        if not blob_hex and current_job is not None and current_job.job_id == job_id:
+            blob_hex = (current_job.submit_blob_hex or "").strip()
+
         raw0 = safe_bytes_from_hex(blob_hex)
         if not raw0:
             return
@@ -1582,7 +1586,12 @@ class MinerWorker(QObject):
 
             self._dataset_job_id = job.job_id
             self._monerorpc_local_fallback_logged = False
-
+            submit_blob_hex = str(getattr(job, "submit_blob_hex", "") or "").strip()
+            if submit_blob_hex:
+                self._submit_blob_by_job_id[job.job_id] = submit_blob_hex
+                while len(self._submit_blob_by_job_id) > 64:
+                    oldest = next(iter(self._submit_blob_by_job_id))
+                    self._submit_blob_by_job_id.pop(oldest, None)
         self._scan_seq = 0
         self._last_verified_share_scan_seq = 0
         self._last_rescue_scan_seq = 0

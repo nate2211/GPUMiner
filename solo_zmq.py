@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -22,6 +23,9 @@ class SoloTemplateState:
     prev_hash: str = ""
     seed_hash: str = ""
     job_id: str = ""
+    submit_blob_hex: str = ""
+    expected_reward_atomic: int = 0
+    template_fingerprint: str = ""
 
 
 class MoneroZmqReader:
@@ -95,6 +99,9 @@ class SoloMiningConnection:
         self._zmq_reader: Optional[MoneroZmqReader] = None
         self._last = SoloTemplateState()
 
+        self._template_lock = threading.Lock()
+        self._expected_reward_by_job_id: dict[str, int] = {}
+
     def connect(self) -> None:
         self.on_status("connecting")
         self._refresh_template(force_emit=True)
@@ -128,13 +135,15 @@ class SoloMiningConnection:
                 accepted=False,
                 status="missing_solution_blob",
                 error="solo submission requires solution_blob_hex",
+                reject_class="invalid",
+                invalid=True,
             )
 
-        if self._last.job_id and verified.job_id and verified.job_id != self._last.job_id:
-            return SubmitResult(
-                accepted=False,
-                status="STALE",
-                error=f"stale share job={verified.job_id}, current={self._last.job_id}",
+        current_job_id = self._last.job_id
+        if current_job_id and verified.job_id and verified.job_id != current_job_id:
+            self.on_log(
+                f"[submit] solo template moved share_job={verified.job_id} current={current_job_id}; "
+                "submitting exact solved blob anyway"
             )
 
         self.on_log(
@@ -149,32 +158,61 @@ class SoloMiningConnection:
             result = resp.get("result") or {}
             status = str(result.get("status", "OK"))
             accepted = "OK" in status.upper()
+
+            reward_atomic = 0
+            with self._template_lock:
+                reward_atomic = int(self._expected_reward_by_job_id.get(verified.job_id, 0) or 0)
+
+            raw = {
+                "rpc": resp,
+                "solo_expected_reward_atomic": reward_atomic,
+                "solo_expected_reward_xmr": (float(reward_atomic) / 1e12) if reward_atomic > 0 else 0.0,
+                "solo_wallet_address": (self.config.solo_wallet_address or "").strip(),
+            }
+
+            if accepted:
+                self.on_log(
+                    f"[submit] solo block accepted nonce={verified.nonce_hex} job={verified.job_id} "
+                    f"expected_reward_atomic={reward_atomic}"
+                )
+                return SubmitResult(
+                    accepted=True,
+                    status=status,
+                    error="",
+                    raw=raw,
+                )
+
             return SubmitResult(
-                accepted=accepted,
+                accepted=False,
                 status=status,
-                error="" if accepted else status,
-                raw=resp,
+                error=status,
+                raw=raw,
+                reject_class="pool_rejected",
             )
         except Exception as exc:
             return SubmitResult(
                 accepted=False,
                 status="rpc_error",
                 error=str(exc),
+                reject_class="backend_error",
+                backend_error=True,
             )
 
     def _poll_loop(self) -> None:
         fallback_s = max(0.25, float(self.config.solo_poll_fallback_s))
         while not self._stop.is_set():
-            fired = self._wake.wait(timeout=fallback_s)
+            _fired = self._wake.wait(timeout=fallback_s)
             self._wake.clear()
             if self._stop.is_set():
                 break
             try:
-                self._refresh_template(force_emit=fired)
+                self._refresh_template(force_emit=False)
             except Exception as exc:
                 self.on_log(f"[solo] template refresh failed: {exc}")
 
     def _refresh_template(self, force_emit: bool) -> None:
+        _ = force_emit  # kept for signature compatibility
+
         wallet = (self.config.solo_wallet_address or "").strip()
         if not wallet:
             raise RuntimeError("solo wallet address is required")
@@ -186,12 +224,30 @@ class SoloMiningConnection:
         resp = self._rpc_call("get_block_template", params)
         result = resp.get("result") or {}
 
+        if bool(result.get("untrusted", False)):
+            self.on_log("[solo] ignoring untrusted block template")
+            return
+
         height = int(result.get("height", 0))
         prev_hash = str(result.get("prev_hash", "")).strip().lower()
         seed_hash = str(result.get("seed_hash", "")).strip().lower()
 
-        job_id = f"solo:{height}:{prev_hash[:16]}:{seed_hash[:16]}"
-        if not force_emit and job_id == self._last.job_id:
+        submit_blob_hex = str(result.get("blocktemplate_blob", "") or "").strip()
+        hashing_blob_hex = str(result.get("blockhashing_blob", "") or submit_blob_hex).strip()
+        expected_reward_atomic = int(result.get("expected_reward", 0) or 0)
+
+        if not submit_blob_hex:
+            raise RuntimeError("get_block_template returned empty blocktemplate_blob")
+        if not hashing_blob_hex:
+            raise RuntimeError("get_block_template returned empty blockhashing_blob")
+
+        template_fingerprint = hashlib.sha256(
+            submit_blob_hex.encode("ascii", errors="ignore")
+        ).hexdigest()[:16]
+
+        job_id = f"solo:{height}:{prev_hash[:16]}:{seed_hash[:16]}:{template_fingerprint}"
+
+        if job_id == self._last.job_id:
             return
 
         prefilter_u64 = self._difficulty_result_to_prefilter_u64(result)
@@ -199,8 +255,8 @@ class SoloMiningConnection:
 
         job = MiningJob(
             job_id=job_id,
-            blob_hex=str(result.get("blockhashing_blob", "") or result.get("blocktemplate_blob", "")).strip(),
-            submit_blob_hex=str(result.get("blocktemplate_blob", "")).strip(),
+            blob_hex=hashing_blob_hex,
+            submit_blob_hex=submit_blob_hex,
             target_hex=target_hex,
             session_id="solo",
             seed_hash_hex=seed_hash,
@@ -216,11 +272,21 @@ class SoloMiningConnection:
             prev_hash=prev_hash,
             seed_hash=seed_hash,
             job_id=job_id,
+            submit_blob_hex=submit_blob_hex,
+            expected_reward_atomic=expected_reward_atomic,
+            template_fingerprint=template_fingerprint,
         )
+
+        with self._template_lock:
+            self._expected_reward_by_job_id[job_id] = expected_reward_atomic
+            while len(self._expected_reward_by_job_id) > 64:
+                oldest = next(iter(self._expected_reward_by_job_id))
+                self._expected_reward_by_job_id.pop(oldest, None)
 
         self.on_log(
             f"[solo] new template height={height} prev={prev_hash[:16]} "
-            f"seed={seed_hash[:16]} target64=0x{prefilter_u64:016x}"
+            f"seed={seed_hash[:16]} tpl={template_fingerprint} "
+            f"target64=0x{prefilter_u64:016x} expected_reward_atomic={expected_reward_atomic}"
         )
         self.on_job(job)
 

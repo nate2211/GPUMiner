@@ -215,30 +215,7 @@ class MoneroRpcClient:
         self._solo_last_push_at: float = 0.0
         self._solo_force_repush_s: float = 15.0
 
-    def _solo_template_signature(self, result: JsonDict) -> str:
-        prev_hash = _normalize_hex(
-            result.get("prev_hash")
-            or result.get("prev_id")
-            or result.get("top_hash")
-            or ""
-        )
-        seed_hash = _normalize_hex(result.get("seed_hash") or "")
-        height = _coerce_int(result.get("height"), 0)
-        difficulty = _coerce_int(result.get("difficulty"), 0)
-        reserved_offset = _coerce_int(result.get("reserved_offset"), 0)
-        major_version = _coerce_int(result.get("major_version"), 0)
-        minor_version = _coerce_int(result.get("minor_version"), 0)
 
-        return _stable_job_id(
-            prev_hash,
-            seed_hash,
-            str(height),
-            str(difficulty),
-            str(reserved_offset),
-            str(major_version),
-            str(minor_version),
-            "solo_template",
-        )
 
     def _should_repush_solo_template(self, template_sig: str) -> bool:
         now = time.time()
@@ -911,6 +888,98 @@ class MoneroRpcClient:
             finally:
                 self._stop.wait(interval_s)
 
+    def _coerce_boolish(self, value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return bool(default)
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off", ""}:
+            return False
+        return bool(default)
+
+    def _difficulty_fields_from_source(self, src: JsonDict) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+
+        diff_lo = _coerce_int(src.get("difficulty"), 0)
+        diff_hi = _coerce_int(src.get("difficulty_top64"), 0)
+
+        wide_raw = str(src.get("wide_difficulty") or "").strip()
+        wide_hex = ""
+        if wide_raw:
+            if wide_raw.lower().startswith("0x"):
+                wide_hex = wide_raw.lower()
+            else:
+                norm = _normalize_hex(wide_raw)
+                if norm:
+                    wide_hex = f"0x{norm}"
+
+        if not wide_hex and (diff_lo > 0 or diff_hi > 0):
+            full = (int(diff_hi) << 64) | (int(diff_lo) & ((1 << 64) - 1))
+            if full > 0:
+                wide_hex = hex(full)
+
+        if diff_lo > 0:
+            out["difficulty"] = int(diff_lo)
+        if diff_hi > 0:
+            out["difficulty_top64"] = int(diff_hi)
+        if wide_hex:
+            out["wide_difficulty"] = wide_hex
+
+        return out
+
+    def _solo_template_signature(self, result: JsonDict) -> str:
+        hashing_blob = _normalize_hex(
+            result.get("blockhashing_blob")
+            or result.get("blob")
+            or ""
+        )
+        submit_blob = _normalize_hex(
+            result.get("blocktemplate_blob")
+            or result.get("submit_blob")
+            or ""
+        )
+        seed_hash = _normalize_hex(result.get("seed_hash") or "")
+        next_seed_hash = _normalize_hex(result.get("next_seed_hash") or "")
+        prev_hash = _normalize_hex(
+            result.get("prev_hash")
+            or result.get("prev_id")
+            or result.get("top_hash")
+            or ""
+        )
+
+        height = _coerce_int(result.get("height"), 0)
+        difficulty = _coerce_int(result.get("difficulty"), 0)
+        difficulty_top64 = _coerce_int(result.get("difficulty_top64"), 0)
+        reserved_offset = _coerce_int(result.get("reserved_offset"), 0)
+        major_version = _coerce_int(result.get("major_version"), 0)
+        minor_version = _coerce_int(result.get("minor_version"), 0)
+        untrusted = self._coerce_boolish(result.get("untrusted"), False)
+
+        blob_material = submit_blob or hashing_blob
+        blob_fp = hashlib.sha256(blob_material.encode("ascii")).hexdigest() if blob_material else ""
+
+        wide_raw = str(result.get("wide_difficulty") or "").strip()
+        wide_norm = wide_raw.lower() if wide_raw else ""
+
+        return _stable_job_id(
+            prev_hash,
+            seed_hash,
+            next_seed_hash,
+            str(height),
+            str(difficulty),
+            str(difficulty_top64),
+            wide_norm,
+            str(reserved_offset),
+            str(major_version),
+            str(minor_version),
+            str(untrusted),
+            blob_fp,
+            "solo_template",
+        )
+
     def _feed_once_solo(self) -> bool:
         wallet = (self.config.solo_wallet_address or "").strip()
         daemon_url = (self.config.solo_daemon_rpc_url or "").strip()
@@ -944,44 +1013,70 @@ class MoneroRpcClient:
         if not isinstance(result, dict):
             raise RuntimeError(f"bad monerod get_block_template response: {obj!r}")
 
-        blob_hex = _normalize_hex(result.get("blocktemplate_blob") or "")
+        # IMPORTANT:
+        # - hashing blob for RandomX verify/mining
+        # - full blocktemplate blob for chain submit
+        hashing_blob_hex = _normalize_hex(
+            result.get("blockhashing_blob")
+            or result.get("blob")
+            or ""
+        )
+        submit_blob_hex = _normalize_hex(
+            result.get("blocktemplate_blob")
+            or result.get("submit_blob")
+            or ""
+        )
+
         seed_hash_hex = _normalize_hex(result.get("seed_hash") or "")
+        next_seed_hash_hex = _normalize_hex(result.get("next_seed_hash") or "")
         prev_hash = _normalize_hex(
             result.get("prev_hash")
             or result.get("prev_id")
             or result.get("top_hash")
             or ""
         )
+
         height = _coerce_int(result.get("height"), 0)
         difficulty = _coerce_int(result.get("difficulty"), 0)
         reserved_offset = _coerce_int(result.get("reserved_offset"), 0)
+        untrusted = self._coerce_boolish(result.get("untrusted"), False)
 
-        if not blob_hex:
+        if not hashing_blob_hex:
+            raise RuntimeError("monerod get_block_template missing blockhashing_blob")
+        if not submit_blob_hex:
             raise RuntimeError("monerod get_block_template missing blocktemplate_blob")
         if not seed_hash_hex:
             raise RuntimeError("monerod get_block_template missing seed_hash")
-        if difficulty <= 0:
-            raise RuntimeError("monerod get_block_template missing difficulty")
+        if difficulty <= 0 and not str(result.get("wide_difficulty") or "").strip():
+            raise RuntimeError("monerod get_block_template missing difficulty/wide_difficulty")
+
+        difficulty_fields = self._difficulty_fields_from_source(result)
+        target_hex = _normalize_hex(result.get("target") or "")
+        if not target_hex:
+            if difficulty <= 0:
+                raise RuntimeError("cannot derive target without difficulty")
+            target_hex = _difficulty_to_target_hex(difficulty)
 
         template_sig = self._solo_template_signature(result)
-        target_hex = _difficulty_to_target_hex(difficulty)
 
-        # Stable job_id based on meaningful template identity instead of raw blob churn
+        # fingerprint real submit material so same-height template changes do not get missed
+        submit_blob_fp = hashlib.sha256(submit_blob_hex.encode("ascii")).hexdigest()
         job_id = _stable_job_id(
             template_sig,
             seed_hash_hex,
+            next_seed_hash_hex,
             str(height),
-            str(difficulty),
+            submit_blob_fp,
             "solo",
         )
 
         if not self._should_repush_solo_template(template_sig):
             return False
 
-        payload = {
+        payload: JsonDict = {
             "job_id": job_id,
-            "blob": blob_hex,
-            "submit_blob_hex": blob_hex,
+            "blob": hashing_blob_hex,
+            "blocktemplate_blob": submit_blob_hex,
             "seed_hash": seed_hash_hex,
             "target": target_hex,
             "nonce_offset": int(self.config.nonce_offset),
@@ -989,14 +1084,21 @@ class MoneroRpcClient:
             "height": height,
             "algo": "rx/0",
             "source": "monerod",
+            "prev_hash": prev_hash,
+            "untrusted": untrusted,
             "template_sig": template_sig,
             "template_meta": {
                 "prev_hash": prev_hash,
-                "difficulty": difficulty,
                 "height": height,
                 "reserved_offset": reserved_offset,
+                "difficulty": difficulty,
             },
         }
+
+        if next_seed_hash_hex:
+            payload["next_seed_hash"] = next_seed_hash_hex
+
+        payload.update(difficulty_fields)
 
         pushed = self._push_job_to_broker(payload)
         if pushed:
@@ -1007,7 +1109,8 @@ class MoneroRpcClient:
             )
             self.on_log(
                 f"[monerorpc-feeder] solo template pushed "
-                f"height={height} diff={difficulty} prev={prev_hash[:16] or '-'}"
+                f"height={height} diff={difficulty or '-'} prev={prev_hash[:16] or '-'} "
+                f"hash_blob={hashing_blob_hex[:16]} submit_blob={submit_blob_hex[:16]}"
             )
 
         return pushed
@@ -1017,34 +1120,85 @@ class MoneroRpcClient:
         if not isinstance(job, dict):
             raise RuntimeError("blocknet feeder returned no job")
 
-        blob_hex = _normalize_hex(job.get("blob_hex") or job.get("blob") or "")
+        # Hashing blob for mining / exact hash verification
+        blob_hex = _normalize_hex(
+            job.get("blob_hex")
+            or job.get("blob")
+            or job.get("blockhashing_blob")
+            or ""
+        )
+
+        # Full submit blob for upstream block submission
+        blocktemplate_blob_hex = _normalize_hex(
+            job.get("blocktemplate_blob")
+            or job.get("submit_blob_hex")
+            or job.get("submit_blob")
+            or blob_hex
+        )
+
         seed_hash_hex = _normalize_hex(job.get("seed_hash_hex") or job.get("seed_hash") or "")
         target_hex = _normalize_hex(job.get("target_hex") or job.get("target") or "")
         height = _coerce_int(job.get("height"), 0)
         algo = str(job.get("algo") or "rx/0")
-        job_id = str(job.get("job_id") or job.get("id") or "").strip()
+        reserved_offset = _coerce_int(job.get("reserved_offset"), 0)
+        nonce_offset = _coerce_int(job.get("nonce_offset"), int(self.config.nonce_offset))
+        prev_hash = _normalize_hex(job.get("prev_hash") or "")
+        next_seed_hash_hex = _normalize_hex(job.get("next_seed_hash_hex") or job.get("next_seed_hash") or "")
+        untrusted = bool(job.get("untrusted", False))
 
+        job_id = str(job.get("job_id") or job.get("id") or "").strip()
         if not blob_hex or not target_hex:
             raise RuntimeError(f"blocknet p2pool job missing blob/target: {job!r}")
-        if not job_id:
-            job_id = _stable_job_id(blob_hex, seed_hash_hex, target_hex, str(height), "blocknet")
 
-        payload = {
+        if not job_id:
+            job_id = _stable_job_id(
+                blob_hex,
+                blocktemplate_blob_hex,
+                seed_hash_hex,
+                target_hex,
+                str(height),
+                "blocknet",
+            )
+
+        payload: JsonDict = {
             "job_id": job_id,
             "blob": blob_hex,
-            "submit_blob_hex": _normalize_hex(job.get("submit_blob_hex") or blob_hex),
+            "blocktemplate_blob": blocktemplate_blob_hex,
             "seed_hash": seed_hash_hex,
             "target": target_hex,
-            "nonce_offset": int(self.config.nonce_offset),
+            "nonce_offset": nonce_offset,
+            "reserved_offset": reserved_offset,
             "height": height,
             "algo": algo,
             "source": "blocknet_p2pool",
+            "untrusted": untrusted,
             "upstream": {
                 "kind": "blocknet_p2pool",
                 "session": self._blocknet_session,
                 "job_id": str(job.get("job_id") or job.get("id") or job_id),
             },
         }
+
+        if prev_hash:
+            payload["prev_hash"] = prev_hash
+        if next_seed_hash_hex:
+            payload["next_seed_hash"] = next_seed_hash_hex
+
+        # Carry full difficulty fields if upstream provided them.
+        if job.get("difficulty") is not None:
+            payload["difficulty"] = _coerce_int(job.get("difficulty"), 0)
+        if job.get("difficulty_top64") is not None:
+            payload["difficulty_top64"] = _coerce_int(job.get("difficulty_top64"), 0)
+
+        wide_difficulty = str(job.get("wide_difficulty") or "").strip()
+        if wide_difficulty:
+            if wide_difficulty.lower().startswith("0x"):
+                payload["wide_difficulty"] = wide_difficulty.lower()
+            else:
+                norm = _normalize_hex(wide_difficulty)
+                if norm:
+                    payload["wide_difficulty"] = f"0x{norm}"
+
         return self._push_job_to_broker(payload)
 
     def _push_job_to_broker(self, payload: JsonDict) -> bool:
