@@ -151,6 +151,81 @@ class MinerWorker(QObject):
         self._accepted_work_total = 0.0
 
         self._submit_blob_by_job_id: dict[str, str] = {}
+
+
+    def _solo_like_verify_debug_enabled(self) -> bool:
+        try:
+            backend = str(self.config.mining_backend_name() or "").strip().lower()
+        except Exception:
+            backend = ""
+        return bool(
+            getattr(self.config, "use_solo", False)
+            or getattr(self.config, "use_monero_rpc", False)
+            or backend in {"solo", "monerorpc", "monero_rpc"}
+        )
+
+    def _candidate_debug_text(self, cand: CandidateShare) -> str:
+        nonce = int(getattr(cand, "nonce", 0)) & 0xFFFFFFFF
+        pred_tail = int(getattr(cand, "predicted_tail_u64", 0))
+        rank = int(getattr(cand, "rank_score_u64", 0))
+        bucket = int(getattr(cand, "tune_bucket", -1))
+        tail_bin = int(getattr(cand, "tune_tail_bin", -1))
+        rank_quality = int(getattr(cand, "rank_quality", 128))
+        threshold_quality = int(getattr(cand, "threshold_quality", 128))
+        predictor_match = 1 if bool(getattr(cand, "predictor_hash_match", False)) else 0
+
+        gpu_hash_hex = str(getattr(cand, "gpu_hash_hex", "") or "").strip()
+        if gpu_hash_hex:
+            gpu_hash_hex = gpu_hash_hex[:24] + ("..." if len(gpu_hash_hex) > 24 else "")
+        else:
+            gpu_hash_hex = "-"
+
+        return (
+            f"nonce={nonce:08x} "
+            f"pred_tail={pred_tail} "
+            f"rank={rank} "
+            f"bucket={bucket} "
+            f"bin={tail_bin} "
+            f"rq={rank_quality} "
+            f"tq={threshold_quality} "
+            f"pm={predictor_match} "
+            f"gpu_hash={gpu_hash_hex}"
+        )
+
+    def _emit_verify_reject_debug(
+        self,
+        *,
+        stage: str,
+        job: Optional[MiningJob],
+        total: int,
+        kept: int,
+        samples: list[CandidateShare],
+        extra: str = "",
+    ) -> None:
+        if not self._solo_like_verify_debug_enabled():
+            return
+
+        now = time.time()
+        min_interval_s = float(getattr(self.config, "solo_verify_debug_min_interval_s", 1.0))
+        last_log_at = float(getattr(self, "_verify_debug_last_log_at", 0.0))
+
+        if min_interval_s > 0.0 and (now - last_log_at) < min_interval_s:
+            return
+
+        self._verify_debug_last_log_at = now
+
+        sample_cap = max(1, int(getattr(self.config, "solo_verify_debug_sample_items", 4)))
+        sample_texts = [self._candidate_debug_text(c) for c in samples[:sample_cap]]
+        if not sample_texts:
+            sample_texts = ["-"]
+
+        job_id = job.job_id if job is not None else "-"
+        extra_text = f" {extra.strip()}" if extra else ""
+
+        self.log.emit(
+            f"[verify-debug] stage={stage} job={job_id} total={total} kept={kept}"
+            f"{extra_text} samples={' || '.join(sample_texts)}"
+        )
     def _needs_randomx_prepare(self) -> bool:
         return bool(
             self.verifier is not None
@@ -1114,9 +1189,9 @@ class MinerWorker(QObject):
                 live_items: list[tuple[int, CandidateShare]] = []
                 for job_generation, cand in batch_items:
                     if (
-                        current_generation == job_generation
-                        and current_job.job_id == cand.job_id
-                        and current_job.session_id == cand.session_id
+                            current_generation == job_generation
+                            and current_job.job_id == cand.job_id
+                            and current_job.session_id == cand.session_id
                     ):
                         live_items.append((job_generation, cand))
 
@@ -1124,7 +1199,7 @@ class MinerWorker(QObject):
                     continue
 
                 if len(live_items) > 1 and self._tail_batch_enabled() and len(live_items) >= max(
-                    2, int(getattr(self.config, "cpu_tail_batch_min_size", 32))
+                        2, int(getattr(self.config, "cpu_tail_batch_min_size", 32))
                 ):
                     tail_threads = max(0, int(getattr(self.config, "cpu_tail_batch_threads", 0)))
                     shares = [cand for _, cand in live_items]
@@ -1133,17 +1208,43 @@ class MinerWorker(QObject):
                         max_threads=tail_threads,
                     )
 
+                    if len(screened) != len(live_items):
+                        raise RuntimeError(
+                            f"screen_shares_batch_by_tail returned {len(screened)} "
+                            f"results for {len(live_items)} shares"
+                        )
+
                     accepted_pairs: list[tuple[int, CandidateShare]] = []
+                    tail_rejected_samples: list[CandidateShare] = []
+
                     for (job_generation, cand), item in zip(live_items, screened):
-                        if not item.accepted_by_tail:
+                        if not bool(getattr(item, "accepted_by_tail", False)):
                             with self._stats_lock:
                                 self._verify_rejected += 1
                             scanner.record_feedback(cand, "cpu_rejected", 0.0, 0.0)
+                            if len(tail_rejected_samples) < 8:
+                                tail_rejected_samples.append(cand)
                             continue
                         accepted_pairs.append((job_generation, cand))
 
+                    tail_rejected_count = len(live_items) - len(accepted_pairs)
+
+                    if tail_rejected_count > 0:
+                        self._emit_verify_reject_debug(
+                            stage="tail_screen",
+                            job=current_job,
+                            total=len(live_items),
+                            kept=len(accepted_pairs),
+                            samples=tail_rejected_samples or [cand for _, cand in live_items[:4]],
+                            extra=(
+                                f"rejected={tail_rejected_count} "
+                                f"tail_threads={tail_threads}"
+                            ),
+                        )
+
                     accepted_count = 0
                     match_count = 0
+                    hash_rejected_samples: list[CandidateShare] = []
 
                     if accepted_pairs:
                         full_threads = max(0, int(getattr(self.config, "cpu_hash_batch_threads", 0)))
@@ -1152,18 +1253,41 @@ class MinerWorker(QObject):
                             max_threads=full_threads,
                         )
 
+                        if len(labeled) != len(accepted_pairs):
+                            raise RuntimeError(
+                                f"label_shares_batch_with_hashes returned {len(labeled)} "
+                                f"results for {len(accepted_pairs)} shares"
+                            )
+
                         for (job_generation, cand), item in zip(accepted_pairs, labeled):
-                            if item.predictor_hash_match:
+                            if bool(getattr(item, "predictor_hash_match", False)):
                                 match_count += 1
 
-                            if item.verified is None:
+                            if getattr(item, "verified", None) is None:
                                 with self._stats_lock:
                                     self._verify_rejected += 1
                                 scanner.record_feedback(cand, "cpu_rejected", 0.0, 0.0)
+                                if len(hash_rejected_samples) < 8:
+                                    hash_rejected_samples.append(cand)
                                 continue
 
                             accepted_count += 1
                             self._handle_verified_share(job_generation, cand, item.verified)
+
+                    hash_rejected_count = len(accepted_pairs) - accepted_count
+
+                    if hash_rejected_count > 0:
+                        self._emit_verify_reject_debug(
+                            stage="hash_label_after_tail",
+                            job=current_job,
+                            total=len(accepted_pairs),
+                            kept=accepted_count,
+                            samples=hash_rejected_samples or [cand for _, cand in accepted_pairs[:4]],
+                            extra=(
+                                f"rejected={hash_rejected_count} "
+                                f"predictor_matches={match_count}"
+                            ),
+                        )
 
                     with self._stats_lock:
                         self._teacher_tail_batches += 1
@@ -1182,8 +1306,8 @@ class MinerWorker(QObject):
 
                 elif len(live_items) > 1:
                     prefer_hash_batch = (
-                        self._hash_batch_enabled()
-                        and len(live_items) >= max(2, int(getattr(self.config, "cpu_hash_batch_min_size", 8)))
+                            self._hash_batch_enabled()
+                            and len(live_items) >= max(2, int(getattr(self.config, "cpu_hash_batch_min_size", 8)))
                     )
 
                     native_threads = max(
@@ -1209,19 +1333,37 @@ class MinerWorker(QObject):
 
                     accepted_count = 0
                     match_count = 0
+                    rejected_samples: list[CandidateShare] = []
 
                     for (job_generation, cand), item in zip(live_items, labeled):
-                        if item.predictor_hash_match:
+                        if bool(getattr(item, "predictor_hash_match", False)):
                             match_count += 1
 
-                        if item.verified is None:
+                        if getattr(item, "verified", None) is None:
                             with self._stats_lock:
                                 self._verify_rejected += 1
                             scanner.record_feedback(cand, "cpu_rejected", 0.0, 0.0)
+                            if len(rejected_samples) < 8:
+                                rejected_samples.append(cand)
                             continue
 
                         accepted_count += 1
                         self._handle_verified_share(job_generation, cand, item.verified)
+
+                    rejected_count = len(live_items) - accepted_count
+                    if rejected_count > 0:
+                        self._emit_verify_reject_debug(
+                            stage="batch_exact",
+                            job=current_job,
+                            total=len(live_items),
+                            kept=accepted_count,
+                            samples=rejected_samples or [cand for _, cand in live_items[:4]],
+                            extra=(
+                                f"rejected={rejected_count} "
+                                f"predictor_matches={match_count} "
+                                f"native_threads={native_threads}"
+                            ),
+                        )
 
                     if prefer_hash_batch:
                         with self._stats_lock:
@@ -1238,6 +1380,7 @@ class MinerWorker(QObject):
                             f"[verify-batch] size={len(live_items)} accepted={accepted_count} "
                             f"predictor_matches={match_count} native_threads={native_threads}"
                         )
+
                 else:
                     job_generation, cand = live_items[0]
                     verified, _credited_work = verifier.verify_with_work(cand)
@@ -1245,7 +1388,17 @@ class MinerWorker(QObject):
                         with self._stats_lock:
                             self._verify_rejected += 1
                         scanner.record_feedback(cand, "cpu_rejected", 0.0, 0.0)
+
+                        self._emit_verify_reject_debug(
+                            stage="single_exact",
+                            job=current_job,
+                            total=1,
+                            kept=0,
+                            samples=[cand],
+                            extra="rejected=1 reason=verify_with_work_none",
+                        )
                         continue
+
                     self._handle_verified_share(job_generation, cand, verified)
 
             finally:
