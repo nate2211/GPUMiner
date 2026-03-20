@@ -40,6 +40,30 @@ def _stringify_error(error: Any) -> str:
 
 
 def _classify_reject(status: str, error: str, raw: Any) -> tuple[str, bool, bool, bool, bool]:
+    if isinstance(raw, dict):
+        rc = str(raw.get("reject_class") or "").strip().lower()
+        if rc == "accepted":
+            return ("accepted", False, False, False, False)
+        if rc == "stale":
+            return ("stale", True, False, False, False)
+        if rc == "duplicate":
+            return ("duplicate", False, True, False, False)
+        if rc == "invalid":
+            return ("invalid", False, False, True, False)
+        if rc == "backend_error":
+            return ("backend_error", False, False, False, True)
+        if rc == "rejected":
+            return ("rejected", False, False, False, False)
+
+        if bool(raw.get("stale")):
+            return ("stale", True, False, False, False)
+        if bool(raw.get("duplicate")):
+            return ("duplicate", False, True, False, False)
+        if bool(raw.get("invalid")):
+            return ("invalid", False, False, True, False)
+        if bool(raw.get("backend_error")):
+            return ("backend_error", False, False, False, True)
+
     text = " ".join(
         [
             str(status or ""),
@@ -70,6 +94,7 @@ def _classify_reject(status: str, error: str, raw: Any) -> tuple[str, bool, bool
         or "ioerror" in text
         or "broken pipe" in text
         or "not connected" in text
+        or "send_failed" in text
     )
 
     if stale:
@@ -108,71 +133,102 @@ class StratumClient:
         self._reader_thread: Optional[threading.Thread] = None
         self._keepalive_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+
         self._write_lock = threading.Lock()
         self._id_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._recent_submit_lock = threading.Lock()
+        self._state_lock = threading.RLock()
+        self._connect_lock = threading.Lock()
+        self._submit_lock = threading.Lock()
 
         self._req_id = 1
         self._pending: Dict[int, PendingRequest] = {}
-        self._recent_submits: dict[tuple[str, str, str], float] = {}
+
+        # key -> (timestamp, state)
+        # state: "pending" | "accepted" | "rejected_final"
+        self._recent_submits: dict[tuple[str, str, str], tuple[float, str]] = {}
 
         self._session_id = ""
         self._current_job: Optional[MiningJob] = None
+        self._last_job_key: Optional[tuple[str, str, str, str, str]] = None
+
+        self._submit_timeout_s = max(1.0, float(getattr(config, "submit_timeout_s", 10.0)))
+        self._login_timeout_s = max(2.0, float(getattr(config, "login_timeout_s", 15.0)))
+        self._socket_timeout_s = max(2.0, float(getattr(config, "socket_connect_timeout_s", 10.0)))
+        self._keepalive_interval_s = max(10.0, float(getattr(config, "keepalive_interval_s", 30.0)))
+
+        self._recent_submit_pending_ttl_s = max(
+            5.0, float(getattr(config, "recent_submit_pending_ttl_s", 15.0))
+        )
+        self._recent_submit_final_ttl_s = max(
+            30.0, float(getattr(config, "recent_submit_final_ttl_s", 120.0))
+        )
 
     @property
     def session_id(self) -> str:
-        return self._session_id
+        with self._state_lock:
+            return self._session_id
 
     @property
     def current_job(self) -> Optional[MiningJob]:
-        return self._current_job
+        with self._state_lock:
+            return self._current_job
 
     def connect(self) -> None:
-        self.on_status("connecting")
+        with self._connect_lock:
+            if self._sock is not None:
+                return
 
-        raw = socket.create_connection((self.config.host, self.config.port), timeout=10)
+            self.on_status("connecting")
 
-        if self.config.use_tls:
-            ctx = ssl.create_default_context()
-            self._sock = ctx.wrap_socket(raw, server_hostname=self.config.host)
-        else:
-            self._sock = raw
+            raw = socket.create_connection(
+                (self.config.host, self.config.port),
+                timeout=self._socket_timeout_s,
+            )
 
-        self._sock.settimeout(None)
-        self._file = self._sock.makefile("r", encoding="utf-8", newline="\n")
-        self._stop.clear()
+            if self.config.use_tls:
+                ctx = ssl.create_default_context()
+                sock = ctx.wrap_socket(raw, server_hostname=self.config.host)
+            else:
+                sock = raw
 
-        self.on_status("connected")
-        self.on_log(f"[stratum] connected to {self.config.host}:{self.config.port}")
+            sock.settimeout(None)
+            file_obj = sock.makefile("r", encoding="utf-8", newline="\n")
 
-        self._reader_thread = threading.Thread(
-            target=self._reader_loop,
-            daemon=True,
-            name="StratumReader",
-        )
-        self._reader_thread.start()
+            self._sock = sock
+            self._file = file_obj
+            self._stop.clear()
 
-        self._send_login()
+            self.on_log(f"[stratum] connected to {self.config.host}:{self.config.port}")
 
-        self._keepalive_thread = threading.Thread(
-            target=self._keepalive_loop,
-            daemon=True,
-            name="StratumKeepalive",
-        )
-        self._keepalive_thread.start()
+            self._reader_thread = threading.Thread(
+                target=self._reader_loop,
+                daemon=True,
+                name="StratumReader",
+            )
+            self._reader_thread.start()
+
+            self._send_login_and_wait()
+
+            self._keepalive_thread = threading.Thread(
+                target=self._keepalive_loop,
+                daemon=True,
+                name="StratumKeepalive",
+            )
+            self._keepalive_thread.start()
 
     def close(self) -> None:
         self._stop.set()
 
         try:
-            if self._file:
+            if self._file is not None:
                 self._file.close()
         except Exception:
             pass
 
         try:
-            if self._sock:
+            if self._sock is not None:
                 self._sock.close()
         except Exception:
             pass
@@ -182,26 +238,32 @@ class StratumClient:
                 pending.event.set()
             self._pending.clear()
 
-        self._sock = None
-        self._file = None
-        self._session_id = ""
-        self._current_job = None
+        with self._state_lock:
+            self._sock = None
+            self._file = None
+            self._session_id = ""
+            self._current_job = None
+            self._last_job_key = None
+
         self.on_status("disconnected")
 
-    def submit(self, share: VerifiedShare, timeout: float = 10.0) -> SubmitResult:
-        if not self._sock:
+    def submit(self, share: VerifiedShare, timeout: Optional[float] = None) -> SubmitResult:
+        if timeout is None:
+            timeout = self._submit_timeout_s
+
+        if not self._is_connected():
             return SubmitResult(
-                False,
+                accepted=False,
                 status="not_connected",
                 error="socket not connected",
                 reject_class="backend_error",
                 backend_error=True,
             )
 
-        session_id = (share.session_id or self._session_id).strip()
+        session_id = (share.session_id or self.session_id).strip()
         if not session_id:
             return SubmitResult(
-                False,
+                accepted=False,
                 status="not_connected",
                 error="missing stratum session id",
                 reject_class="backend_error",
@@ -214,64 +276,259 @@ class StratumClient:
 
         if not job_id:
             return SubmitResult(
-                False,
+                accepted=False,
                 status="invalid_share",
                 error="missing job_id",
                 reject_class="invalid",
                 invalid=True,
             )
-        if not nonce_hex:
+        if len(nonce_hex) != 8 or not _is_hex(nonce_hex):
             return SubmitResult(
-                False,
+                accepted=False,
                 status="invalid_share",
-                error="missing nonce_hex",
+                error="nonce_hex must be 8 hex chars",
                 reject_class="invalid",
                 invalid=True,
             )
-        if not result_hex:
+        if len(result_hex) != 64 or not _is_hex(result_hex):
             return SubmitResult(
-                False,
+                accepted=False,
                 status="invalid_share",
-                error="missing result_hex",
-                reject_class="invalid",
-                invalid=True,
-            )
-        if not _is_hex(nonce_hex):
-            return SubmitResult(
-                False,
-                status="invalid_share",
-                error="nonce_hex is not valid hex",
-                reject_class="invalid",
-                invalid=True,
-            )
-        if not _is_hex(result_hex):
-            return SubmitResult(
-                False,
-                status="invalid_share",
-                error="result_hex is not valid hex",
+                error="result_hex must be 64 hex chars",
                 reject_class="invalid",
                 invalid=True,
             )
 
-        current_job = self._current_job
+        current_job = self.current_job
         if current_job and current_job.job_id and current_job.job_id != job_id:
-            return SubmitResult(
-                False,
-                status="STALE",
-                error=f"stale share job={job_id}, current={current_job.job_id}",
-                reject_class="stale",
-                stale=True,
+            self.on_log(
+                f"[submit] local job moved on submit_job={job_id} current_job={current_job.job_id}; "
+                "submitting anyway so server decides staleness"
             )
 
-        if self._mark_submit_seen(job_id, nonce_hex, result_hex):
+        key = (job_id, nonce_hex, result_hex)
+        recent_state = self._get_recent_submit_state(key)
+        if recent_state in {"pending", "accepted", "rejected_final"}:
             return SubmitResult(
-                False,
+                accepted=False,
                 status="duplicate_local",
-                error="share already submitted recently",
+                error=f"share already submitted recently ({recent_state})",
                 reject_class="duplicate",
                 duplicate=True,
             )
 
+        with self._submit_lock:
+            recent_state = self._get_recent_submit_state(key)
+            if recent_state in {"pending", "accepted", "rejected_final"}:
+                return SubmitResult(
+                    accepted=False,
+                    status="duplicate_local",
+                    error=f"share already submitted recently ({recent_state})",
+                    reject_class="duplicate",
+                    duplicate=True,
+                )
+
+            self._set_recent_submit_state(key, "pending")
+
+            req_id = self._next_id()
+            pending = PendingRequest()
+
+            with self._pending_lock:
+                self._pending[req_id] = pending
+
+            payload = {
+                "id": req_id,
+                "jsonrpc": "2.0",
+                "method": "submit",
+                "params": {
+                    "id": session_id,
+                    "job_id": job_id,
+                    "nonce": nonce_hex,
+                    "result": result_hex,
+                },
+            }
+
+            try:
+                self._send(payload)
+                self.on_log(
+                    f"[submit] sent backend=stratum nonce={nonce_hex} job={job_id} "
+                    f"credited={share.credited_work:.6f} "
+                    f"actual={share.actual_work:.6f} "
+                    f"quality={share.quality:.6f}"
+                )
+            except Exception as exc:
+                self._clear_recent_submit_state(key)
+                with self._pending_lock:
+                    self._pending.pop(req_id, None)
+                return SubmitResult(
+                    accepted=False,
+                    status="send_failed",
+                    error=str(exc),
+                    reject_class="backend_error",
+                    backend_error=True,
+                )
+
+            try:
+                if not pending.event.wait(float(timeout)):
+                    return SubmitResult(
+                        accepted=False,
+                        status="TIMEOUT",
+                        error="submit timed out",
+                        reject_class="backend_error",
+                        backend_error=True,
+                    )
+
+                resp = pending.response or {}
+                error = resp.get("error")
+                result = resp.get("result")
+
+                if error:
+                    err_text = _stringify_error(error)
+                    reject_class, stale, duplicate, invalid, backend_error = _classify_reject(
+                        "ERROR",
+                        err_text,
+                        resp,
+                    )
+
+                    if backend_error:
+                        self._clear_recent_submit_state(key)
+                    else:
+                        self._set_recent_submit_state(key, "rejected_final")
+
+                    return SubmitResult(
+                        False,
+                        status="ERROR",
+                        error=err_text,
+                        raw=resp,
+                        reject_class=reject_class,
+                        stale=stale,
+                        duplicate=duplicate,
+                        invalid=invalid,
+                        backend_error=backend_error,
+                    )
+
+                if isinstance(result, dict):
+                    status = str(result.get("status") or "").strip()
+                    accepted_flag = bool(result.get("accepted", False))
+
+                    if accepted_flag or (status and status.upper() in {"OK", "ACCEPTED"}):
+                        self._set_recent_submit_state(key, "accepted")
+                        return SubmitResult(True, status=status or "OK", raw=resp, reject_class="accepted")
+
+                    if status or result.get("error") or result.get("reject_class"):
+                        err_text = str(result.get("error") or status or "rejected")
+                        reject_class, stale, duplicate, invalid, backend_error = _classify_reject(
+                            status,
+                            err_text,
+                            result,
+                        )
+
+                        if backend_error:
+                            self._clear_recent_submit_state(key)
+                        else:
+                            self._set_recent_submit_state(key, "rejected_final")
+
+                        return SubmitResult(
+                            False,
+                            status=status or "ERROR",
+                            error=err_text,
+                            raw=resp,
+                            reject_class=reject_class,
+                            stale=stale,
+                            duplicate=duplicate,
+                            invalid=invalid,
+                            backend_error=backend_error,
+                        )
+
+                    self._set_recent_submit_state(key, "accepted")
+                    return SubmitResult(True, status="OK", raw=resp, reject_class="accepted")
+
+                if isinstance(result, str):
+                    status = result.strip()
+                    if status.upper() in {"OK", "ACCEPTED"}:
+                        self._set_recent_submit_state(key, "accepted")
+                        return SubmitResult(True, status=status, raw=resp, reject_class="accepted")
+
+                    reject_class, stale, duplicate, invalid, backend_error = _classify_reject(
+                        status,
+                        status,
+                        resp,
+                    )
+
+                    if backend_error:
+                        self._clear_recent_submit_state(key)
+                    else:
+                        self._set_recent_submit_state(key, "rejected_final")
+
+                    return SubmitResult(
+                        False,
+                        status=status or "ERROR",
+                        error=status,
+                        raw=resp,
+                        reject_class=reject_class,
+                        stale=stale,
+                        duplicate=duplicate,
+                        invalid=invalid,
+                        backend_error=backend_error,
+                    )
+
+                if result is False:
+                    self._set_recent_submit_state(key, "rejected_final")
+                    return SubmitResult(
+                        False,
+                        status="ERROR",
+                        error="pool returned false",
+                        raw=resp,
+                        reject_class="rejected",
+                    )
+
+                self._set_recent_submit_state(key, "accepted")
+                return SubmitResult(True, status="OK", raw=resp, reject_class="accepted")
+
+            finally:
+                with self._pending_lock:
+                    self._pending.pop(req_id, None)
+
+    def _prune_recent_submits(self, now: float) -> None:
+        dead: list[tuple[str, str, str]] = []
+        for k, (ts, state) in self._recent_submits.items():
+            age = now - ts
+            if state == "pending":
+                if age > self._recent_submit_pending_ttl_s:
+                    dead.append(k)
+            else:
+                if age > self._recent_submit_final_ttl_s:
+                    dead.append(k)
+
+        for k in dead:
+            self._recent_submits.pop(k, None)
+
+    def _get_recent_submit_state(self, key: tuple[str, str, str]) -> Optional[str]:
+        now = time.time()
+        with self._recent_submit_lock:
+            self._prune_recent_submits(now)
+            row = self._recent_submits.get(key)
+            return row[1] if row else None
+
+    def _set_recent_submit_state(self, key: tuple[str, str, str], state: str) -> None:
+        with self._recent_submit_lock:
+            self._recent_submits[key] = (time.time(), state)
+
+    def _clear_recent_submit_state(self, key: tuple[str, str, str]) -> None:
+        with self._recent_submit_lock:
+            self._recent_submits.pop(key, None)
+
+    def _is_connected(self) -> bool:
+        with self._state_lock:
+            return self._sock is not None and not self._stop.is_set()
+
+    def _next_id(self) -> int:
+        with self._id_lock:
+            rid = self._req_id
+            self._req_id += 1
+            return rid
+
+    def _send_login_and_wait(self) -> None:
         req_id = self._next_id()
         pending = PendingRequest()
 
@@ -281,132 +538,6 @@ class StratumClient:
         payload = {
             "id": req_id,
             "jsonrpc": "2.0",
-            "method": "submit",
-            "params": {
-                "id": session_id,
-                "job_id": job_id,
-                "nonce": nonce_hex,
-                "result": result_hex,
-            },
-        }
-
-        try:
-            self._send(payload)
-            self.on_log(
-                f"[submit] sent backend=stratum nonce={nonce_hex} job={job_id} "
-                f"credited={share.credited_work:.6f} "
-                f"actual={share.actual_work:.6f} "
-                f"quality={share.quality:.6f}"
-            )
-
-            if not pending.event.wait(timeout):
-                return SubmitResult(
-                    False,
-                    status="TIMEOUT",
-                    error="submit timed out",
-                    reject_class="backend_error",
-                    backend_error=True,
-                )
-
-            resp = pending.response or {}
-            error = resp.get("error")
-            result = resp.get("result")
-
-            if error:
-                err_text = _stringify_error(error)
-                reject_class, stale, duplicate, invalid, backend_error = _classify_reject(
-                    "ERROR",
-                    err_text,
-                    resp,
-                )
-                return SubmitResult(
-                    False,
-                    status="ERROR",
-                    error=err_text,
-                    raw=resp,
-                    reject_class=reject_class,
-                    stale=stale,
-                    duplicate=duplicate,
-                    invalid=invalid,
-                    backend_error=backend_error,
-                )
-
-            if isinstance(result, dict):
-                status = str(result.get("status") or "").strip()
-                if status and status.upper() not in ("OK", "ACCEPTED"):
-                    err_text = str(result.get("error") or status)
-                    reject_class, stale, duplicate, invalid, backend_error = _classify_reject(
-                        status,
-                        err_text,
-                        resp,
-                    )
-                    return SubmitResult(
-                        False,
-                        status=status,
-                        error=err_text,
-                        raw=resp,
-                        reject_class=reject_class,
-                        stale=stale,
-                        duplicate=duplicate,
-                        invalid=invalid,
-                        backend_error=backend_error,
-                    )
-                return SubmitResult(True, status=status or "OK", raw=resp, reject_class="accepted")
-
-            if isinstance(result, str):
-                status = result.strip()
-                if status.upper() in ("OK", "ACCEPTED"):
-                    return SubmitResult(True, status=status, raw=resp, reject_class="accepted")
-
-                reject_class, stale, duplicate, invalid, backend_error = _classify_reject(
-                    status,
-                    status,
-                    resp,
-                )
-                return SubmitResult(
-                    False,
-                    status=status or "ERROR",
-                    error=status,
-                    raw=resp,
-                    reject_class=reject_class,
-                    stale=stale,
-                    duplicate=duplicate,
-                    invalid=invalid,
-                    backend_error=backend_error,
-                )
-
-            return SubmitResult(True, status="OK", raw=resp, reject_class="accepted")
-
-        finally:
-            with self._pending_lock:
-                self._pending.pop(req_id, None)
-
-    def _mark_submit_seen(self, job_id: str, nonce_hex: str, result_hex: str) -> bool:
-        now = time.time()
-        key = (job_id, nonce_hex, result_hex)
-
-        with self._recent_submit_lock:
-            cutoff = now - 120.0
-            dead = [k for k, ts in self._recent_submits.items() if ts < cutoff]
-            for k in dead:
-                self._recent_submits.pop(k, None)
-
-            if key in self._recent_submits:
-                return True
-
-            self._recent_submits[key] = now
-            return False
-
-    def _next_id(self) -> int:
-        with self._id_lock:
-            rid = self._req_id
-            self._req_id += 1
-            return rid
-
-    def _send_login(self) -> None:
-        payload = {
-            "id": self._next_id(),
-            "jsonrpc": "2.0",
             "method": "login",
             "params": {
                 "login": self.config.login,
@@ -414,19 +545,56 @@ class StratumClient:
                 "agent": self.config.agent,
             },
         }
-        self._send(payload)
-        self.on_log(f"[stratum] login as {self.config.login}")
+
+        try:
+            self._send(payload)
+            self.on_log(f"[stratum] login as {self.config.login}")
+
+            if not pending.event.wait(self._login_timeout_s):
+                raise RuntimeError("login timed out")
+
+            resp = pending.response or {}
+            error = resp.get("error")
+            if error:
+                raise RuntimeError(_stringify_error(error))
+
+            result = resp.get("result") or {}
+            if not isinstance(result, dict):
+                raise RuntimeError(f"unexpected login result: {resp}")
+
+            session_id = str(result.get("id") or "").strip()
+            if not session_id:
+                raise RuntimeError("login response missing session id")
+
+            with self._state_lock:
+                self._session_id = session_id
+
+            job = result.get("job") or {}
+            if isinstance(job, dict) and job:
+                self._handle_job(job)
+
+            status = str(result.get("status") or "authorized").strip()
+            self.on_status("connected")
+            self.on_log(f"[stratum] authorized login={self.config.login} session={session_id} status={status}")
+
+        except Exception:
+            self.close()
+            raise
+        finally:
+            with self._pending_lock:
+                self._pending.pop(req_id, None)
 
     def _keepalive_loop(self) -> None:
-        while not self._stop.wait(30.0):
-            if not self._session_id:
+        while not self._stop.wait(self._keepalive_interval_s):
+            session_id = self.session_id
+            if not session_id:
                 continue
 
             payload = {
                 "id": self._next_id(),
                 "jsonrpc": "2.0",
                 "method": "keepalived",
-                "params": {"id": self._session_id},
+                "params": {"id": session_id},
             }
 
             try:
@@ -436,12 +604,13 @@ class StratumClient:
                 return
 
     def _send(self, payload: Dict[str, Any]) -> None:
-        if not self._sock:
+        sock = self._sock
+        if sock is None:
             raise RuntimeError("socket not connected")
 
         wire = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
         with self._write_lock:
-            self._sock.sendall(wire)
+            sock.sendall(wire)
 
     def _reader_loop(self) -> None:
         try:
@@ -464,37 +633,87 @@ class StratumClient:
             req_id = msg.get("id")
             with self._pending_lock:
                 pending = self._pending.get(req_id)
-            if pending:
+            if pending is not None:
                 pending.response = msg
                 pending.event.set()
+                return
 
-        result = msg.get("result") or {}
         error = msg.get("error")
         if error:
             self.on_log(f"[stratum] error: {_stringify_error(error)}")
             return
 
-        if isinstance(result, dict) and result.get("job"):
-            self._session_id = str(result.get("id") or self._session_id or "")
-            self._handle_job(result.get("job") or {})
-            self.on_log(f"[stratum] session={self._session_id}")
-            return
+        result = msg.get("result") or {}
+        if isinstance(result, dict):
+            if result.get("job"):
+                with self._state_lock:
+                    if result.get("id"):
+                        self._session_id = str(result.get("id") or self._session_id or "")
+                self._handle_job(result.get("job") or {})
+                if self.session_id:
+                    self.on_log(f"[stratum] session={self.session_id}")
+                return
 
-        status = result.get("status") if isinstance(result, dict) else None
-        if status:
-            self.on_log(f"[stratum] {status}")
+            status = result.get("status")
+            if status:
+                self.on_log(f"[stratum] {status}")
+                return
 
     def _handle_job(self, params: Dict[str, Any]) -> None:
+        if not isinstance(params, dict):
+            return
+
+        session_id = self.session_id
+
+        job_id = str(params.get("job_id") or "").strip()
+        blob_hex = str(params.get("blob") or "").strip()
+        target_hex = str(params.get("target") or "").strip()
+        seed_hash_hex = str(params.get("seed_hash") or params.get("seed") or "").strip()
+        algo = str(params.get("algo") or "rx/0").strip() or "rx/0"
+
+        try:
+            height = int(params.get("height") or 0)
+        except Exception:
+            height = 0
+
+        if not job_id or not blob_hex or not target_hex:
+            self.on_log(f"[job] ignoring incomplete payload: {params}")
+            return
+
         job = MiningJob(
-            job_id=str(params.get("job_id", "")),
-            blob_hex=str(params.get("blob", "")),
-            target_hex=str(params.get("target", "")),
-            session_id=self._session_id,
-            seed_hash_hex=str(params.get("seed_hash") or params.get("seed") or ""),
-            height=int(params.get("height") or 0),
-            algo=str(params.get("algo") or "rx/0"),
+            job_id=job_id,
+            blob_hex=blob_hex,
+            target_hex=target_hex,
+            session_id=session_id,
+            seed_hash_hex=seed_hash_hex,
+            height=height,
+            algo=algo,
         )
-        self._current_job = job
+
+        try:
+            setattr(job, "received_at", time.time())
+        except Exception:
+            pass
+
+        try:
+            setattr(job, "submit_blob_hex", blob_hex)
+        except Exception:
+            pass
+
+        key = (
+            job.session_id,
+            job.job_id,
+            job.seed_hash_hex.lower(),
+            job.target_hex.lower(),
+            job.blob_hex.lower(),
+        )
+
+        with self._state_lock:
+            self._current_job = job
+            if key == self._last_job_key:
+                return
+            self._last_job_key = key
+
         self.on_log(
             f"[job] id={job.job_id} target={job.target_hex} height={job.height} algo={job.algo}"
         )

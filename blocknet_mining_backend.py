@@ -27,6 +27,7 @@ def _hex_to_bytes(h: str) -> bytes:
 def _b64e(b: bytes) -> str:
     return base64.b64encode(b).decode("ascii")
 
+
 def _normalize_hex(text: str) -> str:
     return "".join(ch for ch in str(text or "").strip().lower() if not ch.isspace())
 
@@ -40,6 +41,16 @@ def _is_hex(text: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _make_ssl_context(verify_tls: bool) -> ssl.SSLContext:
+    if verify_tls:
+        return ssl.create_default_context()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
 
 @dataclass
 class BlockNetApiCfg:
@@ -83,32 +94,66 @@ class BlockNetApiCfg:
         return f"{base}{pref}{p}"
 
 
-def _make_ssl_context(verify_tls: bool) -> ssl.SSLContext:
-    if verify_tls:
-        return ssl.create_default_context()
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
-
-
-def _post_json_sync(cfg: BlockNetApiCfg, path: str, body: JsonDict) -> JsonDict:
-    url = cfg.full_url(path)
-    data = json.dumps(body or {}, separators=(",", ":")).encode("utf-8")
-
+def _headers_for_cfg(cfg: BlockNetApiCfg, *, content_type_json: bool) -> dict[str, str]:
     headers = {
-        "Content-Type": "application/json",
         "Accept": "application/json",
         "User-Agent": "BlockNetPythonClient/1.0",
     }
+    if content_type_json:
+        headers["Content-Type"] = "application/json"
 
     tok = (cfg.token or "").strip()
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
         headers["X-Token"] = tok
         headers["X-BlockNet-Token"] = tok
+    return headers
 
-    req = Request(url, data=data, headers=headers, method="POST")
+
+def _decode_json_response(raw: bytes, status: int, headers: dict[str, Any]) -> JsonDict:
+    if not raw:
+        return {
+            "ok": False,
+            "error": "empty response",
+            "status": status,
+            "headers": headers,
+        }
+
+    try:
+        j = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return {
+            "ok": False,
+            "error": "non-json response",
+            "status": status,
+            "headers": headers,
+            "body_preview": raw[:4000].decode("utf-8", errors="replace"),
+        }
+
+    if isinstance(j, dict):
+        if "status" not in j:
+            j["status"] = status
+        return j
+
+    return {
+        "ok": False,
+        "error": "json was not an object",
+        "status": status,
+        "headers": headers,
+        "value": j,
+    }
+
+
+def _post_json_sync(cfg: BlockNetApiCfg, path: str, body: JsonDict) -> JsonDict:
+    url = cfg.full_url(path)
+    data = json.dumps(body or {}, separators=(",", ":")).encode("utf-8")
+
+    req = Request(
+        url,
+        data=data,
+        headers=_headers_for_cfg(cfg, content_type_json=True),
+        method="POST",
+    )
 
     ssl_ctx = None
     if urlsplit(url).scheme.lower() == "https":
@@ -117,36 +162,7 @@ def _post_json_sync(cfg: BlockNetApiCfg, path: str, body: JsonDict) -> JsonDict:
     try:
         with urlopen(req, timeout=float(cfg.timeout_s), context=ssl_ctx) as resp:
             raw = resp.read() or b""
-            ct = (resp.headers.get("Content-Type") or "").lower()
-            status = getattr(resp, "status", 200)
-
-            if not raw:
-                return {
-                    "ok": False,
-                    "error": "empty response",
-                    "status": status,
-                    "headers": dict(resp.headers),
-                }
-
-            try:
-                j = json.loads(raw.decode("utf-8", errors="replace"))
-                if isinstance(j, dict):
-                    return j
-                return {
-                    "ok": False,
-                    "error": "json was not an object",
-                    "status": status,
-                    "value": j,
-                }
-            except Exception:
-                return {
-                    "ok": False,
-                    "error": "non-json response",
-                    "status": status,
-                    "headers": dict(resp.headers),
-                    "content_type": ct,
-                    "body_preview": raw[:4000].decode("utf-8", errors="replace"),
-                }
+            return _decode_json_response(raw, getattr(resp, "status", 200), dict(resp.headers))
 
     except HTTPError as e:
         raw = b""
@@ -154,13 +170,12 @@ def _post_json_sync(cfg: BlockNetApiCfg, path: str, body: JsonDict) -> JsonDict:
             raw = e.read() or b""
         except Exception:
             pass
-        preview = raw[:4000].decode("utf-8", errors="replace") if raw else ""
         return {
             "ok": False,
             "error": f"http error {getattr(e, 'code', 0)}",
             "status": getattr(e, "code", 0),
             "headers": dict(getattr(e, "headers", {}) or {}),
-            "body_preview": preview,
+            "body_preview": raw[:4000].decode("utf-8", errors="replace") if raw else "",
         }
 
     except URLError as e:
@@ -179,21 +194,15 @@ def _post_json_sync(cfg: BlockNetApiCfg, path: str, body: JsonDict) -> JsonDict:
             "headers": {},
         }
 
+
 def _get_json_sync(cfg: BlockNetApiCfg, path: str) -> JsonDict:
     url = cfg.full_url(path)
 
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "BlockNetPythonClient/1.0",
-    }
-
-    tok = (cfg.token or "").strip()
-    if tok:
-        headers["Authorization"] = f"Bearer {tok}"
-        headers["X-Token"] = tok
-        headers["X-BlockNet-Token"] = tok
-
-    req = Request(url, headers=headers, method="GET")
+    req = Request(
+        url,
+        headers=_headers_for_cfg(cfg, content_type_json=False),
+        method="GET",
+    )
 
     ssl_ctx = None
     if urlsplit(url).scheme.lower() == "https":
@@ -202,25 +211,7 @@ def _get_json_sync(cfg: BlockNetApiCfg, path: str) -> JsonDict:
     try:
         with urlopen(req, timeout=float(cfg.timeout_s), context=ssl_ctx) as resp:
             raw = resp.read() or b""
-            status = getattr(resp, "status", 200)
-
-            if not raw:
-                return {"ok": False, "error": "empty response", "status": status}
-
-            try:
-                j = json.loads(raw.decode("utf-8", errors="replace"))
-                return j if isinstance(j, dict) else {
-                    "ok": False,
-                    "error": "json was not an object",
-                    "status": status,
-                }
-            except Exception:
-                return {
-                    "ok": False,
-                    "error": "non-json response",
-                    "status": status,
-                    "body_preview": raw[:4000].decode("utf-8", errors="replace"),
-                }
+            return _decode_json_response(raw, getattr(resp, "status", 200), dict(resp.headers))
 
     except HTTPError as e:
         raw = b""
@@ -235,10 +226,14 @@ def _get_json_sync(cfg: BlockNetApiCfg, path: str) -> JsonDict:
             "headers": dict(getattr(e, "headers", {}) or {}),
             "body_preview": raw[:4000].decode("utf-8", errors="replace") if raw else "",
         }
+
     except URLError as e:
-        return {"ok": False, "error": f"connect failed: {e}", "status": 0}
+        return {"ok": False, "error": f"connect failed: {e}", "status": 0, "headers": {}}
+
     except Exception as e:
-        return {"ok": False, "error": f"request failed: {e}", "status": 0}
+        return {"ok": False, "error": f"request failed: {e}", "status": 0, "headers": {}}
+
+
 async def _post_json(cfg: BlockNetApiCfg, path: str, body: JsonDict) -> JsonDict:
     return await asyncio.to_thread(_post_json_sync, cfg, path, body)
 
@@ -252,8 +247,8 @@ class BlockNetP2PoolBackend:
       POST /v1/p2pool/submit {"session":"...","job_id":"...","nonce":"...","result":"..."}
       POST /v1/p2pool/close  {"session":"..."}
 
-      (optional)
-      POST /v1/p2pool/scan   {"session":"...","start_nonce":0,"iters":200000,"max_results":4,"nonce_offset":39,"poll_first":false}
+      optional long-poll friendly fields:
+      POST /v1/p2pool/poll   {"session":"...","after_job_seq":123,"timeout_ms":15000,"max_msgs":32}
     """
 
     def __init__(self, cfg: BlockNetApiCfg, *, logger: Optional[Callable[[str], None]] = None) -> None:
@@ -261,6 +256,7 @@ class BlockNetP2PoolBackend:
         self.logger = logger or (lambda s: None)
         self.session: str = ""
         self.miner_id: str = ""
+        self.job_seq: int = 0
         self._opened = False
 
     @property
@@ -271,6 +267,7 @@ class BlockNetP2PoolBackend:
         self._opened = False
         self.session = ""
         self.miner_id = ""
+        self.job_seq = 0
 
     def invalidate_local(self) -> None:
         self._clear_state()
@@ -308,10 +305,17 @@ class BlockNetP2PoolBackend:
 
         self.session = session
         self.miner_id = str(j.get("miner_id") or "")
+        self.job_seq = int(j.get("job_seq", 0) or 0)
         self._opened = True
         return j.get("job") or {}
 
-    async def poll(self, *, max_msgs: int = 32) -> JsonDict:
+    async def poll(
+        self,
+        *,
+        max_msgs: int = 32,
+        timeout_ms: Optional[int] = None,
+        after_job_seq: Optional[int] = None,
+    ) -> JsonDict:
         if not self.is_open:
             raise RuntimeError("p2pool session not open")
 
@@ -319,10 +323,23 @@ class BlockNetP2PoolBackend:
             "session": self.session,
             "max_msgs": int(max_msgs),
         }
+
+        if timeout_ms is not None:
+            payload["timeout_ms"] = int(timeout_ms)
+
+        if after_job_seq is not None:
+            payload["after_job_seq"] = int(after_job_seq)
+        elif self.job_seq > 0:
+            payload["after_job_seq"] = int(self.job_seq)
+
         j = await _post_json(self.cfg, "/p2pool/poll", payload)
         if not j.get("ok"):
             self._maybe_invalidate_from_error(j)
             raise RuntimeError(f"BlockNet p2pool poll failed: {j}")
+
+        self.job_seq = int(j.get("job_seq", self.job_seq or 0) or 0)
+        if j.get("miner_id"):
+            self.miner_id = str(j.get("miner_id") or "")
         return j
 
     async def job(self) -> JsonDict:
@@ -334,16 +351,15 @@ class BlockNetP2PoolBackend:
             self._maybe_invalidate_from_error(j)
             raise RuntimeError(f"BlockNet p2pool job failed: {j}")
 
+        self.job_seq = int(j.get("job_seq", self.job_seq or 0) or 0)
         if j.get("miner_id"):
             self.miner_id = str(j["miner_id"])
         return j.get("job") or {}
 
-    async def get_job(self, *, max_msgs: int = 32) -> JsonDict:
-        poll = await self.poll(max_msgs=max_msgs)
+    async def get_job(self, *, max_msgs: int = 32, timeout_ms: Optional[int] = None) -> JsonDict:
+        poll = await self.poll(max_msgs=max_msgs, timeout_ms=timeout_ms)
         job = poll.get("job") or {}
         if job:
-            if poll.get("miner_id"):
-                self.miner_id = str(poll["miner_id"])
             return job
         return await self.job()
 
@@ -357,14 +373,10 @@ class BlockNetP2PoolBackend:
 
         if not job_id:
             raise RuntimeError("missing job_id")
-        if not nonce_hex:
-            raise RuntimeError("missing nonce_hex")
-        if not result_hex:
-            raise RuntimeError("missing result_hex")
-        if not _is_hex(nonce_hex):
-            raise RuntimeError("nonce_hex is not valid hex")
-        if not _is_hex(result_hex):
-            raise RuntimeError("result_hex is not valid hex")
+        if len(nonce_hex) != 8 or not _is_hex(nonce_hex):
+            raise RuntimeError("nonce_hex must be 8 hex chars")
+        if len(result_hex) != 64 or not _is_hex(result_hex):
+            raise RuntimeError("result_hex must be 64 hex chars")
 
         payload: JsonDict = {
             "session": self.session,
@@ -372,11 +384,17 @@ class BlockNetP2PoolBackend:
             "nonce": nonce_hex,
             "result": result_hex,
         }
+        if self.job_seq > 0:
+            payload["job_seq"] = int(self.job_seq)
 
         j = await _post_json(self.cfg, "/p2pool/submit", payload)
         if not j.get("ok"):
             self._maybe_invalidate_from_error(j)
             raise RuntimeError(f"BlockNet p2pool submit failed: {j}")
+
+        self.job_seq = int(j.get("job_seq", self.job_seq or 0) or 0)
+        if j.get("miner_id"):
+            self.miner_id = str(j.get("miner_id") or "")
         return j
 
     def scan_sync(
@@ -400,11 +418,15 @@ class BlockNetP2PoolBackend:
         }
         if nonce_offset is not None:
             payload["nonce_offset"] = int(nonce_offset)
+        if self.job_seq > 0:
+            payload["job_seq"] = int(self.job_seq)
 
         j = _post_json_sync(self.cfg, "/p2pool/scan", payload)
         if not j.get("ok"):
             self._maybe_invalidate_from_error(j)
             raise RuntimeError(f"BlockNet p2pool scan failed: {j}")
+
+        self.job_seq = int(j.get("job_seq", self.job_seq or 0) or 0)
         return j
 
     async def scan(
@@ -625,8 +647,6 @@ class BlockNetGpuScanner:
         payload: JsonDict = {
             "path": path,
             "build_options": build_options,
-
-            # Recommended host defaults
             "scan_entry_base": "blocknet_randomx_vm_scan",
             "scan_entry_ext": "blocknet_randomx_vm_scan_ext",
             "hash_batch_entry_base": "blocknet_randomx_vm_hash_batch",
@@ -818,8 +838,6 @@ class BlockNetCpuScanner:
             max_results=max_results,
             threads=threads,
         )
-
-JsonDict = Dict[str, Any]
 
 
 @dataclass

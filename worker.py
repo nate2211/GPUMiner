@@ -87,7 +87,7 @@ class MinerWorker(QObject):
         self._dataset_seed_hash_hex: str = ""
 
         self._candidate_queue: Optional[queue.Queue[tuple[int, CandidateShare] | None]] = None
-        self._submit_queue: Optional[queue.Queue[tuple[int, CandidateShare, VerifiedShare] | None]] = None
+        self._submit_queue: Optional[queue.Queue[tuple[int, CandidateShare, VerifiedShare, float] | None]] = None
         self._verify_threads: list[threading.Thread] = []
         self._submit_thread: Optional[threading.Thread] = None
 
@@ -112,7 +112,6 @@ class MinerWorker(QObject):
         self._teacher_tail_screened = 0
         self._teacher_tail_accepted = 0
 
-        # rescue / scan streak tracking
         self._scan_seq = 0
         self._last_verified_share_scan_seq = 0
         self._last_rescue_scan_seq = 0
@@ -149,9 +148,7 @@ class MinerWorker(QObject):
         self._accepted_work_24h = RollingWorkMeter(24 * 60 * 60)
 
         self._accepted_work_total = 0.0
-
         self._submit_blob_by_job_id: dict[str, str] = {}
-
 
     def _solo_like_verify_debug_enabled(self) -> bool:
         try:
@@ -163,6 +160,9 @@ class MinerWorker(QObject):
             or getattr(self.config, "use_monero_rpc", False)
             or backend in {"solo", "monerorpc", "monero_rpc"}
         )
+
+    def _submit_stale_grace_ms(self) -> int:
+        return max(0, int(getattr(self.config, "submit_stale_grace_ms", 800)))
 
     def _candidate_debug_text(self, cand: CandidateShare) -> str:
         nonce = int(getattr(cand, "nonce", 0)) & 0xFFFFFFFF
@@ -226,6 +226,7 @@ class MinerWorker(QObject):
             f"[verify-debug] stage={stage} job={job_id} total={total} kept={kept}"
             f"{extra_text} samples={' || '.join(sample_texts)}"
         )
+
     def _needs_randomx_prepare(self) -> bool:
         return bool(
             self.verifier is not None
@@ -330,8 +331,19 @@ class MinerWorker(QObject):
                 "pool_invalid",
                 "pool_backend_error",
                 "pool_rejected",
+                "stale",
+                "duplicate",
+                "invalid",
+                "backend_error",
+                "rejected",
             }:
-                return rc
+                return {
+                    "stale": "pool_stale",
+                    "duplicate": "pool_duplicate",
+                    "invalid": "pool_invalid",
+                    "backend_error": "pool_backend_error",
+                    "rejected": "pool_rejected",
+                }.get(rc, rc)
 
         if getattr(result, "stale", False):
             return "pool_stale"
@@ -741,6 +753,7 @@ class MinerWorker(QObject):
             f"verify_threads={len(self._verify_threads)} "
             f"verify_queue_limit={int(self.config.verify_queue_limit)} "
             f"submit_queue_limit={int(self.config.submit_queue_limit)} "
+            f"submit_stale_grace_ms={self._submit_stale_grace_ms()} "
             f"adaptive_queue_throttle={'on' if self.config.adaptive_queue_throttle else 'off'}"
         )
 
@@ -806,14 +819,13 @@ class MinerWorker(QObject):
             current_job = self._job
 
         if not blob_hex and current_job is not None and current_job.job_id == job_id:
-            blob_hex = (current_job.submit_blob_hex or "").strip()
+            blob_hex = (getattr(current_job, "submit_blob_hex", "") or "").strip()
 
         raw0 = safe_bytes_from_hex(blob_hex)
         if not raw0:
             return
 
         raw = bytearray(raw0)
-
         off = int(self.config.nonce_offset)
         if len(raw) < off + 4:
             return
@@ -866,10 +878,11 @@ class MinerWorker(QObject):
             enqueued = 0
             dropped = 0
             scanner = self._scanner
+            now = time.time()
             for cand in candidates:
                 verified = self._candidate_to_unverified_submit(cand)
                 try:
-                    self._submit_queue.put_nowait((job_generation, cand, verified))
+                    self._submit_queue.put_nowait((job_generation, cand, verified, now))
                     enqueued += 1
                 except queue.Full:
                     dropped += 1
@@ -941,19 +954,21 @@ class MinerWorker(QObject):
             return
 
         queued = False
+        enqueued_at = time.time()
+
         while not self._stop.is_set():
-            current_job, current_generation = self._get_job_state()
-            if (
-                current_generation != job_generation
-                or current_job is None
-                or current_job.job_id != cand.job_id
-                or current_job.session_id != cand.session_id
-            ):
+            current_job, _current_generation = self._get_job_state()
+            if current_job is None:
                 with self._stats_lock:
                     self._job_changed_submit_drops += 1
                 break
+            if current_job.session_id != cand.session_id:
+                with self._stats_lock:
+                    self._job_changed_submit_drops += 1
+                break
+
             try:
-                self._submit_queue.put((job_generation, cand, verified), timeout=0.1)
+                self._submit_queue.put((job_generation, cand, verified, enqueued_at), timeout=0.1)
                 queued = True
                 break
             except queue.Full:
@@ -1047,8 +1062,6 @@ class MinerWorker(QObject):
         if current_streak < trigger_scans:
             return 0
 
-        # don't rerun rescue every single scan; allow another rescue only
-        # after another full trigger window with no verified share
         if self._last_rescue_scan_seq > self._last_verified_share_scan_seq:
             if (scan_seq - self._last_rescue_scan_seq) < trigger_scans:
                 return 0
@@ -1189,9 +1202,9 @@ class MinerWorker(QObject):
                 live_items: list[tuple[int, CandidateShare]] = []
                 for job_generation, cand in batch_items:
                     if (
-                            current_generation == job_generation
-                            and current_job.job_id == cand.job_id
-                            and current_job.session_id == cand.session_id
+                        current_generation == job_generation
+                        and current_job.job_id == cand.job_id
+                        and current_job.session_id == cand.session_id
                     ):
                         live_items.append((job_generation, cand))
 
@@ -1199,7 +1212,7 @@ class MinerWorker(QObject):
                     continue
 
                 if len(live_items) > 1 and self._tail_batch_enabled() and len(live_items) >= max(
-                        2, int(getattr(self.config, "cpu_tail_batch_min_size", 32))
+                    2, int(getattr(self.config, "cpu_tail_batch_min_size", 32))
                 ):
                     tail_threads = max(0, int(getattr(self.config, "cpu_tail_batch_threads", 0)))
                     shares = [cand for _, cand in live_items]
@@ -1306,8 +1319,8 @@ class MinerWorker(QObject):
 
                 elif len(live_items) > 1:
                     prefer_hash_batch = (
-                            self._hash_batch_enabled()
-                            and len(live_items) >= max(2, int(getattr(self.config, "cpu_hash_batch_min_size", 8)))
+                        self._hash_batch_enabled()
+                        and len(live_items) >= max(2, int(getattr(self.config, "cpu_hash_batch_min_size", 8)))
                     )
 
                     native_threads = max(
@@ -1429,18 +1442,29 @@ class MinerWorker(QObject):
                     pass
                 break
 
-            job_generation, cand, verified = item
+            job_generation, cand, verified, enqueued_at = item
 
             try:
-                current_job, current_generation = self._get_job_state()
-                if (
-                    current_generation != job_generation
-                    or current_job is None
-                    or current_job.job_id != cand.job_id
-                    or current_job.session_id != cand.session_id
-                ):
+                current_job, _current_generation = self._get_job_state()
+                if current_job is None:
                     with self._stats_lock:
                         self._job_changed_submit_drops += 1
+                    continue
+
+                if current_job.session_id != cand.session_id:
+                    with self._stats_lock:
+                        self._job_changed_submit_drops += 1
+                    continue
+
+                share_age_ms = max(0, int((time.time() - float(enqueued_at)) * 1000.0))
+                if current_job.job_id != cand.job_id and share_age_ms > self._submit_stale_grace_ms():
+                    with self._stats_lock:
+                        self._submit_stale += 1
+                        self._job_changed_submit_drops += 1
+                    self.log.emit(
+                        f"[submit] local stale drop nonce={verified.nonce_hex} "
+                        f"job={verified.job_id} current={current_job.job_id} age_ms={share_age_ms}"
+                    )
                     continue
 
                 scanner = self._scanner
@@ -1580,22 +1604,18 @@ class MinerWorker(QObject):
             "submit_backend_error": submit_backend_error,
             "job_changed_scan_drops": job_changed_scan_drops,
             "job_changed_submit_drops": job_changed_submit_drops,
-
             "scan_rate_lifetime": scan_rate_lifetime,
             "gpu_scan_rate_15m": gpu_scan_rate_15m,
             "gpu_scan_rate_1h": gpu_scan_rate_1h,
             "gpu_scan_rate_24h": gpu_scan_rate_24h,
-
             "verified_rate_15m": verified_rate_15m,
             "p2pool_rate_15m": p2pool_rate_15m,
             "p2pool_rate_1h": p2pool_rate_1h,
             "p2pool_rate_24h": p2pool_rate_24h,
             "hashrate_est": p2pool_rate_15m,
-
             "accepted_work_total": accepted_work_total,
             "verify_yield": verify_yield,
             "accept_yield": accept_yield,
-
             "teacher_hash_batches": teacher_hash_batches,
             "teacher_hash_labels": teacher_hash_labels,
             "teacher_hash_matches": teacher_hash_matches,
@@ -1604,7 +1624,6 @@ class MinerWorker(QObject):
             "teacher_tail_screened": teacher_tail_screened,
             "teacher_tail_accepted": teacher_tail_accepted,
             "teacher_tail_accept_rate": teacher_tail_accept_rate,
-
             "no_share_scan_streak": no_share_scan_streak,
             "last_verified_share_scan_seq": last_verified_share_scan_seq,
             "last_rescue_scan_seq": last_rescue_scan_seq,
@@ -1613,7 +1632,6 @@ class MinerWorker(QObject):
             "cpu_rescue_empty": cpu_rescue_empty,
             "cpu_rescue_skipped_old_job": cpu_rescue_skipped_old_job,
             "cpu_rescue_skipped_busy": cpu_rescue_skipped_busy,
-
             "job_id": (job.job_id if job else "-"),
             "height": (job.height if job else 0),
             "backend": self.config.mining_backend_name(),
@@ -1642,7 +1660,6 @@ class MinerWorker(QObject):
             "submit_queue_depth": (self._submit_queue.qsize() if self._submit_queue is not None else 0),
             "scan_launches_last": int(self._scan_launches_last),
             "python_verify_threads_active": len(self._verify_threads),
-
             "effective_candidate_target_last": int(self._last_effective_candidate_target),
             "effective_work_items_last": int(self._last_effective_work_items),
             "job_age_ms_last": int(self._last_job_age_ms),
@@ -1651,7 +1668,6 @@ class MinerWorker(QObject):
             "stale_risk_q8_last": int(self._last_stale_risk_q8),
             "scan_window_source_last": self._last_scan_window_source,
             "scan_window_count_last": int(self._last_scan_window_count),
-
             "split_tuning": True,
             "credit_tuning": True,
             "tail_bins": int(self.config.normalized_tail_bins()),
@@ -1726,6 +1742,11 @@ class MinerWorker(QObject):
 
     def _on_job(self, job: MiningJob) -> None:
         new_seed = (job.seed_hash_hex or "").lower()
+        now = time.time()
+        try:
+            setattr(job, "received_at", now)
+        except Exception:
+            pass
 
         with self._job_lock:
             old_seed = self._dataset_seed_hash_hex
@@ -1745,13 +1766,13 @@ class MinerWorker(QObject):
                 while len(self._submit_blob_by_job_id) > 64:
                     oldest = next(iter(self._submit_blob_by_job_id))
                     self._submit_blob_by_job_id.pop(oldest, None)
+
         self._scan_seq = 0
         self._last_verified_share_scan_seq = 0
         self._last_rescue_scan_seq = 0
         self._no_share_scan_streak = 0
 
         self._drain_queue(self._candidate_queue)
-        self._drain_queue(self._submit_queue)
 
     def _get_job_state(self) -> tuple[Optional[MiningJob], int]:
         with self._job_lock:

@@ -77,6 +77,8 @@ def _post_json_sync(cfg: BlockNetApiCfg, path: str, body: JsonDict) -> JsonDict:
             try:
                 j = json.loads(raw.decode("utf-8", errors="replace"))
                 if isinstance(j, dict):
+                    if "status" not in j:
+                        j["status"] = status
                     return j
                 return {
                     "ok": False,
@@ -126,6 +128,30 @@ def _post_json_sync(cfg: BlockNetApiCfg, path: str, body: JsonDict) -> JsonDict:
 
 
 def _classify_blocknet_reject(status: str, error: str, raw: Any) -> tuple[str, bool, bool, bool, bool]:
+    if isinstance(raw, dict):
+        rc = str(raw.get("reject_class") or "").strip().lower()
+        if rc == "accepted":
+            return ("accepted", False, False, False, False)
+        if rc == "stale":
+            return ("stale", True, False, False, False)
+        if rc == "duplicate":
+            return ("duplicate", False, True, False, False)
+        if rc == "invalid":
+            return ("invalid", False, False, True, False)
+        if rc == "backend_error":
+            return ("backend_error", False, False, False, True)
+        if rc == "rejected":
+            return ("rejected", False, False, False, False)
+
+        if bool(raw.get("stale")):
+            return ("stale", True, False, False, False)
+        if bool(raw.get("duplicate")):
+            return ("duplicate", False, True, False, False)
+        if bool(raw.get("invalid")):
+            return ("invalid", False, False, True, False)
+        if bool(raw.get("backend_error")):
+            return ("backend_error", False, False, False, True)
+
     text = " ".join([str(status or ""), str(error or ""), str(raw or "")]).lower()
 
     stale = "stale" in text
@@ -183,7 +209,10 @@ class BlockNetClient:
         self._recover_lock = threading.Lock()
         self._submit_lock = threading.Lock()
         self._recent_submit_lock = threading.Lock()
-        self._recent_submits: dict[tuple[str, str, str], float] = {}
+
+        # key -> (ts, state)
+        # state: "pending" | "accepted" | "rejected_final"
+        self._recent_submits: dict[tuple[str, str, str], tuple[float, str]] = {}
 
         relay = (getattr(config, "blocknet_api_relay", "") or "").strip()
         if not relay:
@@ -209,6 +238,9 @@ class BlockNetClient:
             float(getattr(config, "blocknet_poll_interval_ms", 250)) / 1000.0,
         )
         self._poll_max_msgs = max(1, int(getattr(config, "blocknet_poll_max_msgs", 32)))
+        self._poll_timeout_ms = max(0, int(getattr(config, "blocknet_poll_timeout_ms", 0)))
+        self._submit_retry_count = max(1, int(getattr(config, "blocknet_submit_retry_count", 3)))
+        self._submit_retry_base_ms = max(10, int(getattr(config, "blocknet_submit_retry_base_ms", 250)))
 
         self._stop = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
@@ -217,6 +249,7 @@ class BlockNetClient:
         self._session: str = ""
         self._miner_id: str = ""
         self._connected = False
+        self._job_seq: int = 0
         self._last_job_key: Optional[tuple[str, str, str, str, str]] = None
         self._current_job: Optional[MiningJob] = None
 
@@ -266,6 +299,7 @@ class BlockNetClient:
             self._session = ""
             self._miner_id = ""
             self._connected = False
+            self._job_seq = 0
             self._last_job_key = None
             self._current_job = None
 
@@ -294,41 +328,46 @@ class BlockNetClient:
 
         if not job_id:
             return SubmitResult(False, status="invalid_share", error="missing job_id", reject_class="invalid", invalid=True)
-        if not nonce_hex:
-            return SubmitResult(False, status="invalid_share", error="missing nonce_hex", reject_class="invalid", invalid=True)
-        if not result_hex:
-            return SubmitResult(False, status="invalid_share", error="missing result_hex", reject_class="invalid", invalid=True)
-        if not _is_hex(nonce_hex):
-            return SubmitResult(False, status="invalid_share", error="nonce_hex is not valid hex", reject_class="invalid", invalid=True)
-        if not _is_hex(result_hex):
-            return SubmitResult(False, status="invalid_share", error="result_hex is not valid hex", reject_class="invalid", invalid=True)
+        if len(nonce_hex) != 8 or not _is_hex(nonce_hex):
+            return SubmitResult(False, status="invalid_share", error="nonce_hex must be 8 hex chars", reject_class="invalid", invalid=True)
+        if len(result_hex) != 64 or not _is_hex(result_hex):
+            return SubmitResult(False, status="invalid_share", error="result_hex must be 64 hex chars", reject_class="invalid", invalid=True)
 
-        current_job = self.current_job
-        if current_job and current_job.job_id and current_job.job_id != job_id:
-            return SubmitResult(
-                accepted=False,
-                status="STALE",
-                error=f"stale share job={job_id}, current={current_job.job_id}",
-                reject_class="stale",
-                stale=True,
-            )
-
-        if self._mark_submit_seen(job_id, nonce_hex, result_hex):
+        key = (job_id, nonce_hex, result_hex)
+        recent_state = self._get_recent_submit_state(key)
+        if recent_state in {"pending", "accepted", "rejected_final"}:
             return SubmitResult(
                 accepted=False,
                 status="duplicate_local",
-                error="share already submitted recently",
+                error=f"share already submitted recently ({recent_state})",
                 reject_class="duplicate",
                 duplicate=True,
             )
 
         with self._submit_lock:
+            # check again under lock
+            recent_state = self._get_recent_submit_state(key)
+            if recent_state in {"pending", "accepted", "rejected_final"}:
+                return SubmitResult(
+                    accepted=False,
+                    status="duplicate_local",
+                    error=f"share already submitted recently ({recent_state})",
+                    reject_class="duplicate",
+                    duplicate=True,
+                )
+
             payload: JsonDict = {
                 "session": session,
                 "job_id": job_id,
                 "nonce": nonce_hex,
                 "result": result_hex,
             }
+
+            with self._mu:
+                if self._job_seq > 0:
+                    payload["job_seq"] = int(self._job_seq)
+
+            self._set_recent_submit_state(key, "pending")
 
             self.on_log(
                 f"[submit] sent backend=blocknet nonce={nonce_hex} job={job_id} "
@@ -340,11 +379,15 @@ class BlockNetClient:
             transient_5xx = 0
             last_j: JsonDict | None = None
 
-            for attempt in range(3):
+            for attempt in range(self._submit_retry_count):
                 j = _post_json_sync(self.api_cfg, "/p2pool/submit", payload)
                 last_j = j
 
                 if j.get("ok"):
+                    self._set_recent_submit_state(key, "accepted")
+                    self._update_job_seq_from_response(j)
+                    self._maybe_update_miner_id(j)
+                    self._maybe_emit_job_from_response(j)
                     return SubmitResult(
                         accepted=True,
                         status=str(j.get("status") or j.get("code") or "accepted"),
@@ -362,14 +405,9 @@ class BlockNetClient:
                 )
                 detail_l = detail.lower()
 
-                if (
-                    "unknown_session" in detail_l
-                    or "session_not_ready" in detail_l
-                    or "session socket invalid" in detail_l
-                    or "session not open" in detail_l
-                    or "p2pool session not open" in detail_l
-                ):
+                if self._is_session_error(j):
                     self.on_log("[blocknet] submit saw session error, recovering session")
+                    self._clear_recent_submit_state(key)
                     self._recover_session()
                     new_session = self.session
                     if not new_session:
@@ -382,15 +420,24 @@ class BlockNetClient:
                             backend_error=True,
                         )
                     payload["session"] = new_session
+                    with self._mu:
+                        if self._job_seq > 0:
+                            payload["job_seq"] = int(self._job_seq)
+                        else:
+                            payload.pop("job_seq", None)
+                    self._set_recent_submit_state(key, "pending")
                     continue
 
                 if http_status in (502, 503, 504) or "bad gateway" in detail_l:
                     transient_5xx += 1
                     self.on_log(
                         f"[blocknet] submit transient failure status={http_status} "
-                        f"attempt={attempt + 1}/3 job={job_id} nonce={nonce_hex}"
+                        f"attempt={attempt + 1}/{self._submit_retry_count} "
+                        f"job={job_id} nonce={nonce_hex}"
                     )
-                    time.sleep(0.25 * (attempt + 1))
+                    self._clear_recent_submit_state(key)
+                    time.sleep((self._submit_retry_base_ms / 1000.0) * (attempt + 1))
+                    self._set_recent_submit_state(key, "pending")
                     continue
 
                 status = str(j.get("status") or j.get("code") or "rejected")
@@ -405,6 +452,16 @@ class BlockNetClient:
                     error,
                     j,
                 )
+
+                if backend_error:
+                    self._clear_recent_submit_state(key)
+                else:
+                    self._set_recent_submit_state(key, "rejected_final")
+
+                self._update_job_seq_from_response(j)
+                self._maybe_update_miner_id(j)
+                self._maybe_emit_job_from_response(j)
+
                 return SubmitResult(
                     accepted=False,
                     status=status,
@@ -420,6 +477,8 @@ class BlockNetClient:
             if transient_5xx:
                 self.on_log("[blocknet] repeated submit 5xx errors, recovering session")
                 self._recover_session()
+
+            self._clear_recent_submit_state(key)
 
             j = last_j or {}
             status = str(j.get("status") or j.get("code") or "rejected")
@@ -446,21 +505,33 @@ class BlockNetClient:
                 backend_error=backend_error,
             )
 
-    def _mark_submit_seen(self, job_id: str, nonce_hex: str, result_hex: str) -> bool:
+    def _prune_recent_submits(self, now: float) -> None:
+        dead: list[tuple[str, str, str]] = []
+        for k, (ts, state) in self._recent_submits.items():
+            age = now - ts
+            if state == "pending":
+                if age > 5.0:
+                    dead.append(k)
+            else:
+                if age > 120.0:
+                    dead.append(k)
+        for k in dead:
+            self._recent_submits.pop(k, None)
+
+    def _get_recent_submit_state(self, key: tuple[str, str, str]) -> Optional[str]:
         now = time.time()
-        key = (job_id, nonce_hex, result_hex)
-
         with self._recent_submit_lock:
-            cutoff = now - 120.0
-            dead = [k for k, ts in self._recent_submits.items() if ts < cutoff]
-            for k in dead:
-                self._recent_submits.pop(k, None)
+            self._prune_recent_submits(now)
+            row = self._recent_submits.get(key)
+            return row[1] if row else None
 
-            if key in self._recent_submits:
-                return True
+    def _set_recent_submit_state(self, key: tuple[str, str, str], state: str) -> None:
+        with self._recent_submit_lock:
+            self._recent_submits[key] = (time.time(), state)
 
-            self._recent_submits[key] = now
-            return False
+    def _clear_recent_submit_state(self, key: tuple[str, str, str]) -> None:
+        with self._recent_submit_lock:
+            self._recent_submits.pop(key, None)
 
     def _open_session_or_raise(self) -> None:
         j = _post_json_sync(self.api_cfg, "/p2pool/open", {})
@@ -472,32 +543,37 @@ class BlockNetClient:
             raise RuntimeError(f"BlockNet p2pool open missing session: {j}")
 
         miner_id = str(j.get("miner_id") or "")
+        job_seq = int(j.get("job_seq", 0) or 0)
 
         with self._mu:
             self._session = session
             self._miner_id = miner_id
+            self._job_seq = job_seq
 
         self.on_log(f"[blocknet] session opened: {session}")
 
         job = j.get("job") or {}
         if not job:
-            poll = _post_json_sync(
-                self.api_cfg,
-                "/p2pool/poll",
-                {"session": session, "max_msgs": self._poll_max_msgs},
-            )
+            poll_payload: JsonDict = {"session": session, "max_msgs": self._poll_max_msgs}
+            if self._poll_timeout_ms > 0:
+                poll_payload["timeout_ms"] = self._poll_timeout_ms
+            if job_seq > 0:
+                poll_payload["after_job_seq"] = job_seq
+
+            poll = _post_json_sync(self.api_cfg, "/p2pool/poll", poll_payload)
             if poll.get("ok"):
-                if poll.get("miner_id"):
-                    with self._mu:
-                        self._miner_id = str(poll.get("miner_id") or "")
+                self._update_job_seq_from_response(poll)
+                self._maybe_update_miner_id(poll)
                 job = poll.get("job") or {}
 
         if not job:
-            direct = _post_json_sync(self.api_cfg, "/p2pool/job", {"session": session})
+            direct_payload: JsonDict = {"session": session}
+            if job_seq > 0:
+                direct_payload["job_seq"] = job_seq
+            direct = _post_json_sync(self.api_cfg, "/p2pool/job", direct_payload)
             if direct.get("ok"):
-                if direct.get("miner_id"):
-                    with self._mu:
-                        self._miner_id = str(direct.get("miner_id") or "")
+                self._update_job_seq_from_response(direct)
+                self._maybe_update_miner_id(direct)
                 job = direct.get("job") or {}
 
         if job:
@@ -513,20 +589,29 @@ class BlockNetClient:
                 continue
 
             try:
-                j = _post_json_sync(
-                    self.api_cfg,
-                    "/p2pool/poll",
-                    {"session": session, "max_msgs": self._poll_max_msgs},
-                )
+                payload: JsonDict = {
+                    "session": session,
+                    "max_msgs": self._poll_max_msgs,
+                }
+
+                with self._mu:
+                    current_job_seq = int(self._job_seq)
+
+                if self._poll_timeout_ms > 0:
+                    payload["timeout_ms"] = self._poll_timeout_ms
+                if current_job_seq > 0:
+                    payload["after_job_seq"] = current_job_seq
+
+                j = _post_json_sync(self.api_cfg, "/p2pool/poll", payload)
 
                 if not j.get("ok"):
+                    if self._is_session_error(j):
+                        raise RuntimeError(f"session error: {j}")
                     raise RuntimeError(str(j))
 
                 consecutive_failures = 0
-
-                if j.get("miner_id"):
-                    with self._mu:
-                        self._miner_id = str(j.get("miner_id") or "")
+                self._update_job_seq_from_response(j)
+                self._maybe_update_miner_id(j)
 
                 job = j.get("job") or {}
                 if job:
@@ -558,6 +643,7 @@ class BlockNetClient:
                 self._session = ""
                 self._miner_id = ""
                 self._connected = False
+                self._job_seq = 0
                 self._current_job = None
                 self._last_job_key = None
 
@@ -614,12 +700,86 @@ class BlockNetClient:
         except Exception:
             height = 0
 
-        return MiningJob(
-            job_id=job_id,
-            blob_hex=blob_hex,
-            target_hex=target_hex,
-            session_id=self.session,
-            seed_hash_hex=seed_hash_hex,
-            height=height,
-            algo=algo,
+        submit_blob_hex = str(
+            j.get("submit_blob_hex")
+            or j.get("submit_blob")
+            or j.get("blocktemplate_blob")
+            or ""
+        ).strip()
+
+        with self._mu:
+            session_id = self._session
+
+        try:
+            job = MiningJob(
+                job_id=job_id,
+                blob_hex=blob_hex,
+                target_hex=target_hex,
+                session_id=session_id,
+                seed_hash_hex=seed_hash_hex,
+                height=height,
+                algo=algo,
+            )
+        except TypeError:
+            # fallback in case MiningJob accepts fewer fields
+            job = MiningJob(
+                job_id=job_id,
+                blob_hex=blob_hex,
+                target_hex=target_hex,
+                session_id=session_id,
+                seed_hash_hex=seed_hash_hex,
+                height=height,
+            )
+
+        try:
+            setattr(job, "algo", algo)
+        except Exception:
+            pass
+        try:
+            setattr(job, "received_at", time.time())
+        except Exception:
+            pass
+        if submit_blob_hex:
+            try:
+                setattr(job, "submit_blob_hex", submit_blob_hex)
+            except Exception:
+                pass
+
+        return job
+
+    def _update_job_seq_from_response(self, j: JsonDict) -> None:
+        try:
+            job_seq = int(j.get("job_seq", 0) or 0)
+        except Exception:
+            job_seq = 0
+        if job_seq > 0:
+            with self._mu:
+                self._job_seq = job_seq
+
+    def _maybe_update_miner_id(self, j: JsonDict) -> None:
+        miner_id = str(j.get("miner_id") or "").strip()
+        if miner_id:
+            with self._mu:
+                self._miner_id = miner_id
+
+    def _maybe_emit_job_from_response(self, j: JsonDict) -> None:
+        job = j.get("job") or {}
+        if isinstance(job, dict) and job:
+            self._emit_job(job)
+
+    def _is_session_error(self, j: JsonDict) -> bool:
+        text = " ".join(
+            [
+                str(j.get("error") or ""),
+                str(j.get("detail") or ""),
+                str(j.get("body_preview") or ""),
+                str(j),
+            ]
+        ).lower()
+        return (
+            "unknown_session" in text
+            or "session_not_ready" in text
+            or "session socket invalid" in text
+            or "session not open" in text
+            or "p2pool session not open" in text
         )
