@@ -4,6 +4,7 @@ import ctypes
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -401,13 +402,27 @@ class OpenCLGpuScanner:
             return "blocknet_randomx_vm_hash_batch_ext"
         return "blocknet_randomx_vm_scan_ext"
 
+    def _is_full_target(self, target_hex: str) -> bool:
+        raw = safe_bytes_from_hex(target_hex)
+        return bool(raw) and len(raw) >= 32
+
     def _job_prefilter_target64(self, job: MiningJob) -> np.uint64:
+        # Full 256-bit targets should not be tightly tail-prefiltered or you can lose exact winners.
+        if self._is_full_target(job.target_hex):
+            return np.uint64(0xFFFFFFFFFFFFFFFF)
+
         if getattr(job, "prefilter_target64", None) is not None:
             try:
                 return np.uint64(int(job.prefilter_target64) & 0xFFFFFFFFFFFFFFFF)
             except Exception:
                 pass
         return np.uint64(target_hex_to_prefilter_u64(job.target_hex))
+
+    def _effective_max_results(self, candidate_target: int, *, full_target: bool) -> int:
+        target = max(1, int(candidate_target))
+        multiplier = 8 if full_target else 4
+        wanted = max(int(self.config.max_results), target * multiplier)
+        return max(1, min(8192, wanted))
 
     def _ensure_opencl_loader(self) -> None:
         loader = resolve_resource_path(self.config.opencl_loader)
@@ -678,6 +693,13 @@ class OpenCLGpuScanner:
         credit -= np.clip(avg_pressure * 10.0 * float(self.config.tune_pressure_penalty), 0.0, 32.0)
 
         confidence = np.clip((seen / max(1e-6, float(self.config.tune_confidence_div))) * 255.0, 0.0, 255.0)
+
+        # Keep early tuning closer to neutral until a cell has enough observations.
+        warmup_div = max(1.0, float(self.config.tune_confidence_div) * 0.25)
+        warm = np.clip(seen / warmup_div, 0.0, 1.0)
+        rank = neutral + (rank - neutral) * warm
+        threshold = neutral + (threshold - neutral) * warm
+        credit = neutral + (credit - neutral) * warm
 
         rank = np.clip(np.rint(rank), self._tune_min, self._tune_max).astype(np.uint8)
         threshold = np.clip(np.rint(threshold), self._tune_min, self._tune_max).astype(np.uint8)
@@ -1060,30 +1082,24 @@ class OpenCLGpuScanner:
         if not seed:
             seed = blob[:32].ljust(32, b"\x00")
 
+        full_target = self._is_full_target(job.target_hex)
         target64 = self._job_prefilter_target64(job)
-        max_results = int(self.config.max_results)
+
+        requested_candidate_target = max(
+            1,
+            int(candidate_target_override or self.config.scan_candidate_target),
+        )
+        max_results = self._effective_max_results(requested_candidate_target, full_target=full_target)
+        candidate_target = min(requested_candidate_target, max_results)
+
         total_work = max(1, int(work_items_override or self.config.global_work_size))
         chunk_size = max(1, int(getattr(self.config, "scan_chunk_size", 262144)))
-        candidate_target = max(
-            1,
-            min(
-                int(candidate_target_override or self.config.scan_candidate_target),
-                max_results,
-            ),
-        )
         max_scan_time_ms = max(0, int(getattr(self.config, "max_scan_time_ms", 15)))
 
         all_candidates: list[CandidateShare] = []
         scanned = 0
         chunk_count = 0
-        t0 = threading.get_native_id()  # dummy init to keep local symbol count simple
-        del t0
-        t_start = np.float64(0.0)
-        t_start = np.float64(cl._cl._get_cl_version() if False else 0.0)  # no-op, keeps import use quiet
-
-        import time as _time
-
-        started = _time.perf_counter()
+        started = time.perf_counter()
         early_stop_reason = ""
 
         with self._cl_lock:
@@ -1097,7 +1113,7 @@ class OpenCLGpuScanner:
                     break
 
                 chunk_start_nonce = (int(start_nonce) + scanned) & 0xFFFFFFFF
-                chunk_candidates, _raw_count = self._run_one_launch_unlocked(
+                chunk_candidates, raw_count = self._run_one_launch_unlocked(
                     job=job,
                     start_nonce=chunk_start_nonce,
                     blob=blob,
@@ -1118,12 +1134,14 @@ class OpenCLGpuScanner:
                 scanned += int(this_chunk)
                 chunk_count += 1
 
+                # For fresh jobs, keep scanning at least a bit longer even if the candidate target was reached.
                 if len(all_candidates) >= candidate_target:
-                    early_stop_reason = f"candidate_target={candidate_target}"
-                    break
+                    if job_age_ms >= 250 or raw_count >= max_results:
+                        early_stop_reason = f"candidate_target={candidate_target}"
+                        break
 
                 if max_scan_time_ms > 0:
-                    elapsed_ms = (_time.perf_counter() - started) * 1000.0
+                    elapsed_ms = (time.perf_counter() - started) * 1000.0
                     if elapsed_ms >= float(max_scan_time_ms):
                         early_stop_reason = f"time_budget_ms={max_scan_time_ms}"
                         break
@@ -1139,7 +1157,8 @@ class OpenCLGpuScanner:
                 f"[opencl] chunked scan job={job.job_id} chunks={chunk_count} "
                 f"scanned={scanned}/{total_work} kept={len(all_candidates)} "
                 + (f"stop={early_stop_reason} " if early_stop_reason else "")
-                + f"job_age_ms={job_age_ms} verify_q8={verify_pressure_q8} "
+                + f"full_target={1 if full_target else 0} "
+                  f"job_age_ms={job_age_ms} verify_q8={verify_pressure_q8} "
                   f"submit_q8={submit_pressure_q8} stale_q8={stale_risk_q8}"
             )
 
@@ -1180,15 +1199,19 @@ class OpenCLGpuScanner:
         if not seed:
             seed = blob[:32].ljust(32, b"\x00")
 
+        full_target = self._is_full_target(job.target_hex)
         target64 = self._job_prefilter_target64(job)
-        max_results = int(self.config.max_results)
-        work_items = max(1, int(work_items_override or getattr(self.config, "hash_batch_size", self.config.global_work_size)))
-        candidate_target = max(
+
+        requested_candidate_target = max(
             1,
-            min(
-                int(candidate_target_override or self.config.scan_candidate_target),
-                max_results,
-            ),
+            int(candidate_target_override or self.config.scan_candidate_target),
+        )
+        max_results = self._effective_max_results(requested_candidate_target, full_target=full_target)
+        candidate_target = min(requested_candidate_target, max_results)
+
+        work_items = max(
+            1,
+            int(work_items_override or getattr(self.config, "hash_batch_size", self.config.global_work_size)),
         )
 
         with self._cl_lock:
@@ -1218,6 +1241,7 @@ class OpenCLGpuScanner:
 
         self.on_log(
             f"[opencl] hash_batch job={job.job_id} work_items={work_items} kept={len(candidates)} "
+            f"full_target={1 if full_target else 0} "
             f"job_age_ms={job_age_ms} verify_q8={verify_pressure_q8} "
             f"submit_q8={submit_pressure_q8} stale_q8={stale_risk_q8}"
         )

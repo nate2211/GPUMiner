@@ -132,6 +132,8 @@ class StratumClient:
         self._file = None
         self._reader_thread: Optional[threading.Thread] = None
         self._keepalive_thread: Optional[threading.Thread] = None
+        self._reconnect_thread: Optional[threading.Thread] = None
+
         self._stop = threading.Event()
 
         self._write_lock = threading.Lock()
@@ -141,9 +143,11 @@ class StratumClient:
         self._state_lock = threading.RLock()
         self._connect_lock = threading.Lock()
         self._submit_lock = threading.Lock()
+        self._reconnect_lock = threading.Lock()
 
         self._req_id = 1
         self._pending: Dict[int, PendingRequest] = {}
+        self._pending_submit_keys: Dict[int, tuple[str, str, str]] = {}
 
         # key -> (timestamp, state)
         # state: "pending" | "accepted" | "rejected_final"
@@ -152,6 +156,8 @@ class StratumClient:
         self._session_id = ""
         self._current_job: Optional[MiningJob] = None
         self._last_job_key: Optional[tuple[str, str, str, str, str]] = None
+
+        self._conn_gen = 0
 
         self._submit_timeout_s = max(1.0, float(getattr(config, "submit_timeout_s", 10.0)))
         self._login_timeout_s = max(2.0, float(getattr(config, "login_timeout_s", 15.0)))
@@ -165,6 +171,15 @@ class StratumClient:
             30.0, float(getattr(config, "recent_submit_final_ttl_s", 120.0))
         )
 
+        self._auto_reconnect = bool(getattr(config, "auto_reconnect", True))
+        self._reconnect_initial_delay_s = max(
+            1.0, float(getattr(config, "reconnect_initial_delay_s", 2.0))
+        )
+        self._reconnect_max_delay_s = max(
+            self._reconnect_initial_delay_s,
+            float(getattr(config, "reconnect_max_delay_s", 30.0)),
+        )
+
     @property
     def session_id(self) -> str:
         with self._state_lock:
@@ -176,75 +191,20 @@ class StratumClient:
             return self._current_job
 
     def connect(self) -> None:
-        with self._connect_lock:
-            if self._sock is not None:
-                return
+        self._stop.clear()
 
-            self.on_status("connecting")
+        if self._is_connected():
+            return
 
-            raw = socket.create_connection(
-                (self.config.host, self.config.port),
-                timeout=self._socket_timeout_s,
-            )
-
-            if self.config.use_tls:
-                ctx = ssl.create_default_context()
-                sock = ctx.wrap_socket(raw, server_hostname=self.config.host)
-            else:
-                sock = raw
-
-            sock.settimeout(None)
-            file_obj = sock.makefile("r", encoding="utf-8", newline="\n")
-
-            self._sock = sock
-            self._file = file_obj
-            self._stop.clear()
-
-            self.on_log(f"[stratum] connected to {self.config.host}:{self.config.port}")
-
-            self._reader_thread = threading.Thread(
-                target=self._reader_loop,
-                daemon=True,
-                name="StratumReader",
-            )
-            self._reader_thread.start()
-
-            self._send_login_and_wait()
-
-            self._keepalive_thread = threading.Thread(
-                target=self._keepalive_loop,
-                daemon=True,
-                name="StratumKeepalive",
-            )
-            self._keepalive_thread.start()
+        self._connect_once(is_reconnect=False)
 
     def close(self) -> None:
         self._stop.set()
-
-        try:
-            if self._file is not None:
-                self._file.close()
-        except Exception:
-            pass
-
-        try:
-            if self._sock is not None:
-                self._sock.close()
-        except Exception:
-            pass
-
-        with self._pending_lock:
-            for pending in self._pending.values():
-                pending.event.set()
-            self._pending.clear()
-
-        with self._state_lock:
-            self._sock = None
-            self._file = None
-            self._session_id = ""
-            self._current_job = None
-            self._last_job_key = None
-
+        self._shutdown_connection(
+            reason="closed by user",
+            reconnect=False,
+            clear_recent_pending=True,
+        )
         self.on_status("disconnected")
 
     def submit(self, share: VerifiedShare, timeout: Optional[float] = None) -> SubmitResult:
@@ -317,6 +277,8 @@ class StratumClient:
                 duplicate=True,
             )
 
+        req_id: Optional[int] = None
+
         with self._submit_lock:
             recent_state = self._get_recent_submit_state(key)
             if recent_state in {"pending", "accepted", "rejected_final"}:
@@ -335,6 +297,7 @@ class StratumClient:
 
             with self._pending_lock:
                 self._pending[req_id] = pending
+                self._pending_submit_keys[req_id] = key
 
             payload = {
                 "id": req_id,
@@ -360,6 +323,7 @@ class StratumClient:
                 self._clear_recent_submit_state(key)
                 with self._pending_lock:
                     self._pending.pop(req_id, None)
+                    self._pending_submit_keys.pop(req_id, None)
                 return SubmitResult(
                     accepted=False,
                     status="send_failed",
@@ -370,6 +334,7 @@ class StratumClient:
 
             try:
                 if not pending.event.wait(float(timeout)):
+                    self._clear_recent_submit_state(key)
                     return SubmitResult(
                         accepted=False,
                         status="TIMEOUT",
@@ -396,7 +361,7 @@ class StratumClient:
                         self._set_recent_submit_state(key, "rejected_final")
 
                     return SubmitResult(
-                        False,
+                        accepted=False,
                         status="ERROR",
                         error=err_text,
                         raw=resp,
@@ -413,7 +378,12 @@ class StratumClient:
 
                     if accepted_flag or (status and status.upper() in {"OK", "ACCEPTED"}):
                         self._set_recent_submit_state(key, "accepted")
-                        return SubmitResult(True, status=status or "OK", raw=resp, reject_class="accepted")
+                        return SubmitResult(
+                            accepted=True,
+                            status=status or "OK",
+                            raw=resp,
+                            reject_class="accepted",
+                        )
 
                     if status or result.get("error") or result.get("reject_class"):
                         err_text = str(result.get("error") or status or "rejected")
@@ -429,7 +399,7 @@ class StratumClient:
                             self._set_recent_submit_state(key, "rejected_final")
 
                         return SubmitResult(
-                            False,
+                            accepted=False,
                             status=status or "ERROR",
                             error=err_text,
                             raw=resp,
@@ -441,13 +411,23 @@ class StratumClient:
                         )
 
                     self._set_recent_submit_state(key, "accepted")
-                    return SubmitResult(True, status="OK", raw=resp, reject_class="accepted")
+                    return SubmitResult(
+                        accepted=True,
+                        status="OK",
+                        raw=resp,
+                        reject_class="accepted",
+                    )
 
                 if isinstance(result, str):
                     status = result.strip()
                     if status.upper() in {"OK", "ACCEPTED"}:
                         self._set_recent_submit_state(key, "accepted")
-                        return SubmitResult(True, status=status, raw=resp, reject_class="accepted")
+                        return SubmitResult(
+                            accepted=True,
+                            status=status,
+                            raw=resp,
+                            reject_class="accepted",
+                        )
 
                     reject_class, stale, duplicate, invalid, backend_error = _classify_reject(
                         status,
@@ -461,7 +441,7 @@ class StratumClient:
                         self._set_recent_submit_state(key, "rejected_final")
 
                     return SubmitResult(
-                        False,
+                        accepted=False,
                         status=status or "ERROR",
                         error=status,
                         raw=resp,
@@ -475,7 +455,7 @@ class StratumClient:
                 if result is False:
                     self._set_recent_submit_state(key, "rejected_final")
                     return SubmitResult(
-                        False,
+                        accepted=False,
                         status="ERROR",
                         error="pool returned false",
                         raw=resp,
@@ -483,11 +463,195 @@ class StratumClient:
                     )
 
                 self._set_recent_submit_state(key, "accepted")
-                return SubmitResult(True, status="OK", raw=resp, reject_class="accepted")
+                return SubmitResult(
+                    accepted=True,
+                    status="OK",
+                    raw=resp,
+                    reject_class="accepted",
+                )
 
             finally:
-                with self._pending_lock:
-                    self._pending.pop(req_id, None)
+                if req_id is not None:
+                    with self._pending_lock:
+                        self._pending.pop(req_id, None)
+                        self._pending_submit_keys.pop(req_id, None)
+
+    def _connect_once(self, *, is_reconnect: bool) -> None:
+        with self._connect_lock:
+            if self._stop.is_set():
+                raise RuntimeError("client is stopping")
+            if self._is_connected():
+                return
+
+            self.on_status("reconnecting" if is_reconnect else "connecting")
+
+            raw = socket.create_connection(
+                (self.config.host, self.config.port),
+                timeout=self._socket_timeout_s,
+            )
+
+            try:
+                if self.config.use_tls:
+                    ctx = ssl.create_default_context()
+                    sock = ctx.wrap_socket(raw, server_hostname=self.config.host)
+                else:
+                    sock = raw
+
+                sock.settimeout(None)
+                file_obj = sock.makefile("r", encoding="utf-8", newline="\n")
+
+                gen = self._install_connection(sock, file_obj)
+                self.on_log(f"[stratum] connected to {self.config.host}:{self.config.port}")
+
+                try:
+                    self._send_login_and_wait()
+                except Exception:
+                    self._shutdown_connection(
+                        reason="login failed",
+                        reconnect=False,
+                        clear_recent_pending=True,
+                    )
+                    raise
+
+                self._start_keepalive_thread(gen)
+            except Exception:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+                raise
+
+    def _install_connection(self, sock: socket.socket, file_obj: Any) -> int:
+        with self._state_lock:
+            self._conn_gen += 1
+            gen = self._conn_gen
+            self._sock = sock
+            self._file = file_obj
+            self._session_id = ""
+            self._current_job = None
+            self._last_job_key = None
+
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop,
+            args=(gen,),
+            daemon=True,
+            name=f"StratumReader-{gen}",
+        )
+        self._reader_thread.start()
+        return gen
+
+    def _start_keepalive_thread(self, gen: int) -> None:
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop,
+            args=(gen,),
+            daemon=True,
+            name=f"StratumKeepalive-{gen}",
+        )
+        self._keepalive_thread.start()
+
+    def _start_reconnect_loop(self) -> None:
+        if self._stop.is_set() or not self._auto_reconnect:
+            return
+
+        with self._reconnect_lock:
+            if self._reconnect_thread is not None and self._reconnect_thread.is_alive():
+                return
+
+            self._reconnect_thread = threading.Thread(
+                target=self._reconnect_loop,
+                daemon=True,
+                name="StratumReconnect",
+            )
+            self._reconnect_thread.start()
+
+    def _reconnect_loop(self) -> None:
+        delay = self._reconnect_initial_delay_s
+        current = threading.current_thread()
+
+        try:
+            while not self._stop.is_set():
+                if self._is_connected():
+                    return
+
+                try:
+                    self._connect_once(is_reconnect=True)
+                    self.on_log("[stratum] reconnected")
+                    return
+                except Exception as exc:
+                    self.on_log(f"[reconnect] failed: {exc}")
+                    if self._stop.wait(delay):
+                        return
+                    delay = min(self._reconnect_max_delay_s, delay * 2.0)
+        finally:
+            with self._reconnect_lock:
+                if self._reconnect_thread is current:
+                    self._reconnect_thread = None
+
+    def _shutdown_connection(
+        self,
+        *,
+        reason: str,
+        reconnect: bool,
+        clear_recent_pending: bool,
+    ) -> None:
+        with self._state_lock:
+            sock = self._sock
+            file_obj = self._file
+            was_connected = self._sock is not None or self._file is not None or bool(self._session_id)
+
+            self._sock = None
+            self._file = None
+            self._session_id = ""
+            self._current_job = None
+            self._last_job_key = None
+            self._conn_gen += 1
+
+        if file_obj is not None:
+            try:
+                file_obj.close()
+            except Exception:
+                pass
+
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        self._fail_all_pending(reason=reason, clear_recent_pending=clear_recent_pending)
+
+        if reconnect and not self._stop.is_set() and self._auto_reconnect:
+            if was_connected:
+                self.on_log(f"[stratum] disconnected: {reason}")
+            self.on_status("reconnecting")
+            self._start_reconnect_loop()
+        else:
+            if was_connected:
+                self.on_log(f"[stratum] disconnected: {reason}")
+            self.on_status("disconnected")
+
+    def _fail_all_pending(self, *, reason: str, clear_recent_pending: bool) -> None:
+        with self._pending_lock:
+            pending_items = list(self._pending.items())
+            pending_submit_keys = dict(self._pending_submit_keys)
+            self._pending.clear()
+            self._pending_submit_keys.clear()
+
+        for req_id, pending in pending_items:
+            if clear_recent_pending:
+                key = pending_submit_keys.get(req_id)
+                if key is not None:
+                    self._clear_recent_submit_state(key)
+
+            pending.response = {
+                "error": {
+                    "message": reason,
+                    "code": "DISCONNECTED",
+                },
+                "reject_class": "backend_error",
+                "backend_error": True,
+            }
+            pending.event.set()
 
     def _prune_recent_submits(self, now: float) -> None:
         dead: list[tuple[str, str, str]] = []
@@ -577,16 +741,17 @@ class StratumClient:
             self.on_status("connected")
             self.on_log(f"[stratum] authorized login={self.config.login} session={session_id} status={status}")
 
-        except Exception:
-            self.close()
-            raise
         finally:
             with self._pending_lock:
                 self._pending.pop(req_id, None)
 
-    def _keepalive_loop(self) -> None:
+    def _keepalive_loop(self, gen: int) -> None:
         while not self._stop.wait(self._keepalive_interval_s):
-            session_id = self.session_id
+            with self._state_lock:
+                if gen != self._conn_gen or self._sock is None:
+                    return
+                session_id = self._session_id
+
             if not session_id:
                 continue
 
@@ -601,6 +766,11 @@ class StratumClient:
                 self._send(payload)
             except Exception as exc:
                 self.on_log(f"[keepalive] error: {exc}")
+                self._shutdown_connection(
+                    reason=f"keepalive failed: {exc}",
+                    reconnect=True,
+                    clear_recent_pending=True,
+                )
                 return
 
     def _send(self, payload: Dict[str, Any]) -> None:
@@ -612,16 +782,28 @@ class StratumClient:
         with self._write_lock:
             sock.sendall(wire)
 
-    def _reader_loop(self) -> None:
+    def _reader_loop(self, gen: int) -> None:
         try:
-            while not self._stop.is_set() and self._file is not None:
-                line = self._file.readline()
+            while not self._stop.is_set():
+                with self._state_lock:
+                    if gen != self._conn_gen:
+                        return
+                    file_obj = self._file
+
+                if file_obj is None:
+                    return
+
+                line = file_obj.readline()
                 if not line:
                     raise ConnectionError("stratum connection closed")
                 self._handle_message(json.loads(line))
         except Exception as exc:
             self.on_log(f"[stratum] reader stopped: {exc}")
-            self.close()
+            self._shutdown_connection(
+                reason=str(exc),
+                reconnect=True,
+                clear_recent_pending=True,
+            )
 
     def _handle_message(self, msg: Dict[str, Any]) -> None:
         method = msg.get("method")

@@ -29,7 +29,7 @@
 #endif
 
 #ifndef BN_LOCAL_TOPK
-#define BN_LOCAL_TOPK 32u
+#define BN_LOCAL_TOPK 64u
 #endif
 
 #ifndef BN_PREFILTER_ROUNDS_FAST
@@ -227,7 +227,7 @@ inline ulong bn_adjust_target64(ulong target64, uint threshold_quality) {
 
     if (threshold_quality < BN_TUNE_NEUTRAL) {
         uint delta = BN_TUNE_NEUTRAL - threshold_quality;
-        ulong tighten = ((target64 >> 2) * (ulong)delta) / (ulong)BN_TUNE_NEUTRAL;
+        ulong tighten = ((target64 >> 3) * (ulong)delta) / (ulong)BN_TUNE_NEUTRAL;
         if (tighten >= target64) {
             return 1UL;
         }
@@ -236,7 +236,7 @@ inline ulong bn_adjust_target64(ulong target64, uint threshold_quality) {
 
     if (threshold_quality > BN_TUNE_NEUTRAL) {
         uint delta = threshold_quality - BN_TUNE_NEUTRAL;
-        ulong loosen = ((target64 >> 3) * (ulong)delta) / (ulong)BN_TUNE_NEUTRAL;
+        ulong loosen = ((target64 >> 2) * (ulong)delta) / (ulong)BN_TUNE_NEUTRAL;
         if (target64 > (~0UL - loosen)) {
             return ~0UL;
         }
@@ -257,10 +257,20 @@ inline ulong bn_apply_operational_tightening(
         return target64;
     }
 
+    if (job_age_ms < 250u) {
+        verify_pressure_q8 >>= 2;
+        submit_pressure_q8 >>= 2;
+        stale_risk_q8 >>= 2;
+    } else if (job_age_ms < 750u) {
+        verify_pressure_q8 >>= 1;
+        submit_pressure_q8 >>= 1;
+        stale_risk_q8 >>= 1;
+    }
+
     uint pressure = bn_max_u32(verify_pressure_q8, bn_max_u32(submit_pressure_q8, stale_risk_q8));
-    ulong tighten_pressure = ((target64 >> 4) * (ulong)pressure) / 255UL;
-    uint age_ms = bn_min_u32(job_age_ms, 4000u);
-    ulong tighten_age = ((target64 >> 4) * (ulong)age_ms) / 4000UL;
+    ulong tighten_pressure = ((target64 >> 5) * (ulong)pressure) / 255UL;
+    uint age_ms = bn_min_u32(job_age_ms, 5000u);
+    ulong tighten_age = ((target64 >> 5) * (ulong)age_ms) / 5000UL;
     ulong tighten = tighten_pressure + tighten_age;
 
     if (tighten >= target64) {
@@ -278,12 +288,14 @@ inline ulong bn_apply_early_job_relaxation(
     uint confidence_quality
 ) {
     uint pressure = bn_max_u32(verify_pressure_q8, bn_max_u32(submit_pressure_q8, stale_risk_q8));
-    if (job_age_ms > 900u || pressure > 64u) {
+    if (job_age_ms > 1400u || pressure > 96u) {
         return target64;
     }
 
-    ulong bonus = target64 >> 2;
+    ulong bonus = target64 >> 1;
     if (confidence_quality >= 96u) {
+        bonus += (target64 >> 3);
+    } else if (confidence_quality >= 48u) {
         bonus += (target64 >> 4);
     }
 
@@ -294,11 +306,13 @@ inline ulong bn_apply_early_job_relaxation(
 }
 
 inline ulong bn_near_target64(ulong target64, uint confidence_quality) {
-    ulong bonus = target64 >> 2;
+    ulong bonus = target64 >> 1;
 
     if (confidence_quality >= 96u) {
+        bonus += (target64 >> 2);
+    } else if (confidence_quality >= 48u) {
         bonus += (target64 >> 3);
-    } else if (confidence_quality < 32u) {
+    } else if (confidence_quality < 16u) {
         bonus >>= 1;
     }
 
@@ -348,6 +362,16 @@ inline ulong bn_apply_operational_penalty(
     uint submit_pressure_q8,
     uint stale_risk_q8
 ) {
+    if (job_age_ms < 250u) {
+        verify_pressure_q8 >>= 2;
+        submit_pressure_q8 >>= 2;
+        stale_risk_q8 >>= 2;
+    } else if (job_age_ms < 750u) {
+        verify_pressure_q8 >>= 1;
+        submit_pressure_q8 >>= 1;
+        stale_risk_q8 >>= 1;
+    }
+
     uint pressure = bn_max_u32(verify_pressure_q8, bn_max_u32(submit_pressure_q8, stale_risk_q8));
     ulong penalty = (((ulong)pressure) << 30);
     uint age_ms = bn_min_u32(job_age_ms, 4000u);
@@ -539,10 +563,16 @@ inline uint bn_effective_local_topk(
     uint topk = BN_LOCAL_TOPK;
     uint pressure = bn_max_u32(verify_pressure_q8, bn_max_u32(submit_pressure_q8, stale_risk_q8));
 
-    if (pressure >= 224u || job_age_ms >= 3200u) {
-        topk = bn_max_u32(1u, topk / 2u);
-    } else if (pressure >= 160u || job_age_ms >= 2400u) {
-        topk = bn_max_u32(2u, topk - 2u);
+    if (job_age_ms < 250u && pressure < 96u) {
+        return bn_max_u32(1u, bn_min_u32((uint)BN_LOCAL_TOPK, topk));
+    }
+
+    if (pressure >= 240u || job_age_ms >= 3600u) {
+        topk = bn_max_u32(8u, topk / 2u);
+    } else if (pressure >= 192u || job_age_ms >= 2800u) {
+        topk = bn_max_u32(12u, topk - 8u);
+    } else if (pressure >= 128u || job_age_ms >= 1800u) {
+        topk = bn_max_u32(16u, topk - 4u);
     }
 
     return bn_max_u32(1u, bn_min_u32((uint)BN_LOCAL_TOPK, topk));
@@ -560,16 +590,21 @@ inline uint bn_effective_local_near_limit(
     if (effective_topk <= 1u) {
         return 0u;
     }
-    if (pressure >= 240u || job_age_ms >= 3500u) {
+
+    if (job_age_ms < 250u && pressure < 96u) {
+        return bn_min_u32(bn_max_u32(2u, effective_topk / 2u), effective_topk - 1u);
+    }
+
+    if (pressure >= 248u || job_age_ms >= 3800u) {
         return 0u;
     }
-    if (pressure >= 128u || job_age_ms >= 2200u) {
+    if (pressure >= 192u || job_age_ms >= 3000u) {
         return 1u;
     }
-    if (pressure >= 64u || job_age_ms >= 1200u) {
+    if (pressure >= 128u || job_age_ms >= 1800u) {
         return bn_min_u32(2u, effective_topk - 1u);
     }
-    return bn_max_u32(1u, effective_topk / 2u);
+    return bn_min_u32(bn_max_u32(2u, effective_topk / 2u), effective_topk - 1u);
 }
 
 inline ulong bn_local_pick_penalty(
@@ -874,9 +909,9 @@ inline void bn_rank_and_stage(
     ulong near_target = bn_near_target64(adjusted_target, confidence_q);
 
     uint stage_class = BN_STAGE_REJECT;
-    if (soft_tail < adjusted_target || tail_best < adjusted_target) {
+    if (soft_tail <= adjusted_target || tail_best <= adjusted_target) {
         stage_class = BN_STAGE_PASS;
-    } else if (tail_best < near_target && confidence_q >= 16u) {
+    } else if (tail_best <= near_target && confidence_q >= 16u) {
         stage_class = BN_STAGE_NEAR;
     }
 
