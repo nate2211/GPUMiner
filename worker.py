@@ -88,8 +88,17 @@ class MinerWorker(QObject):
 
         self._candidate_queue: Optional[queue.Queue[tuple[int, CandidateShare] | None]] = None
         self._submit_queue: Optional[queue.Queue[tuple[int, CandidateShare, VerifiedShare, float] | None]] = None
+
         self._verify_threads: list[threading.Thread] = []
         self._submit_thread: Optional[threading.Thread] = None
+
+        # Background nonce-window prefetch.
+        self._window_queue_limit = max(2, int(getattr(config, "prefetch_window_queue_limit", 8)))
+        self._window_queue: queue.Queue[tuple[int, str, str, NonceWindow] | None] = queue.Queue(
+            maxsize=self._window_queue_limit
+        )
+        self._window_prefetch_thread: Optional[threading.Thread] = None
+        self._window_prefetch_stop = threading.Event()
 
         self._accepted = 0
         self._rejected = 0
@@ -239,6 +248,7 @@ class MinerWorker(QObject):
 
     def stop(self) -> None:
         self._stop.set()
+        self._window_prefetch_stop.set()
 
     def _scan_mode(self) -> str:
         return self.config.normalized_scan_mode()
@@ -434,7 +444,7 @@ class MinerWorker(QObject):
                     min(base_candidate_target, int(round(base_candidate_target * factor))),
                 )
                 effective_work_items = max(
-                    1024,
+                    int(getattr(self.config, "min_dynamic_work_items", 16384)),
                     min(base_work_items, int(round(base_work_items * factor))),
                 )
 
@@ -485,6 +495,91 @@ class MinerWorker(QObject):
         self._last_scan_window_source = "local"
         self._last_scan_window_count = span
         return NonceWindow(start_nonce=start, count=span, source="local")
+
+    def _window_prefetch_loop(self) -> None:
+        while not self._window_prefetch_stop.is_set() and not self._stop.is_set():
+            try:
+                if self._window_queue.full():
+                    time.sleep(0.005)
+                    continue
+
+                job, job_generation = self._get_job_state()
+                if job is None:
+                    time.sleep(0.02)
+                    continue
+
+                scan_ctx = self._build_scan_context(job)
+                requested_span = int(scan_ctx["work_items"])
+
+                window = self._acquire_scan_window(requested_span)
+                if window is None or int(getattr(window, "count", 0)) <= 0:
+                    time.sleep(0.02)
+                    continue
+
+                item = (
+                    int(job_generation),
+                    str(job.job_id),
+                    str(job.session_id),
+                    window,
+                )
+
+                try:
+                    self._window_queue.put(item, timeout=0.1)
+                except queue.Full:
+                    continue
+
+            except Exception as exc:
+                self.log.emit(f"[window-prefetch] error: {exc}")
+                time.sleep(0.05)
+
+    def _dequeue_prefetched_window(
+        self,
+        job: MiningJob,
+        job_generation: int,
+        timeout_s: float = 0.05,
+    ) -> Optional[NonceWindow]:
+        deadline = time.time() + max(0.01, float(timeout_s))
+
+        while not self._stop.is_set():
+            remaining = deadline - time.time()
+            if remaining <= 0.0:
+                return None
+
+            try:
+                item = self._window_queue.get(timeout=remaining)
+            except queue.Empty:
+                return None
+
+            if item is None:
+                try:
+                    self._window_queue.task_done()
+                except Exception:
+                    pass
+                return None
+
+            queued_generation, queued_job_id, queued_session_id, window = item
+            try:
+                self._window_queue.task_done()
+            except Exception:
+                pass
+
+            live_job, live_generation = self._get_job_state()
+            if live_job is None:
+                continue
+
+            if (
+                queued_generation != job_generation
+                or live_generation != job_generation
+                or queued_job_id != job.job_id
+                or queued_session_id != job.session_id
+                or live_job.job_id != job.job_id
+                or live_job.session_id != job.session_id
+            ):
+                continue
+
+            return window
+
+        return None
 
     def run(self) -> None:
         scanner = OpenCLGpuScanner(self.config, self.log.emit)
@@ -566,9 +661,13 @@ class MinerWorker(QObject):
                     continue
 
                 scan_ctx = self._build_scan_context(job)
-                window = self._acquire_scan_window(scan_ctx["work_items"])
+
+                window = self._dequeue_prefetched_window(
+                    job=job,
+                    job_generation=job_generation,
+                    timeout_s=0.05,
+                )
                 if window is None or int(window.count) <= 0:
-                    time.sleep(0.05)
                     self._emit_stats(force=False)
                     continue
 
@@ -671,6 +770,7 @@ class MinerWorker(QObject):
             self.status.emit("error")
         finally:
             self._stop.set()
+            self._window_prefetch_stop.set()
             self._stop_pipeline_threads()
 
             try:
@@ -731,6 +831,14 @@ class MinerWorker(QObject):
         else:
             self._submit_thread = None
 
+        self._window_prefetch_stop.clear()
+        self._window_prefetch_thread = threading.Thread(
+            target=self._window_prefetch_loop,
+            name="WindowPrefetchThread",
+            daemon=True,
+        )
+        self._window_prefetch_thread.start()
+
         self.log.emit(
             f"[worker] pipeline: "
             f"verify={'on' if verify_enabled else 'off'} "
@@ -754,10 +862,13 @@ class MinerWorker(QObject):
             f"verify_queue_limit={int(self.config.verify_queue_limit)} "
             f"submit_queue_limit={int(self.config.submit_queue_limit)} "
             f"submit_stale_grace_ms={self._submit_stale_grace_ms()} "
-            f"adaptive_queue_throttle={'on' if self.config.adaptive_queue_throttle else 'off'}"
+            f"adaptive_queue_throttle={'on' if self.config.adaptive_queue_throttle else 'off'} "
+            f"prefetch_window_queue_limit={self._window_queue_limit}"
         )
 
     def _stop_pipeline_threads(self) -> None:
+        self._window_prefetch_stop.set()
+
         if self._candidate_queue is not None:
             for _ in self._verify_threads:
                 try:
@@ -770,6 +881,11 @@ class MinerWorker(QObject):
                 self._submit_queue.put_nowait(None)
             except Exception:
                 pass
+
+        try:
+            self._window_queue.put_nowait(None)
+        except Exception:
+            pass
 
         for t in self._verify_threads:
             try:
@@ -784,6 +900,13 @@ class MinerWorker(QObject):
             except Exception:
                 pass
             self._submit_thread = None
+
+        if self._window_prefetch_thread is not None:
+            try:
+                self._window_prefetch_thread.join(timeout=2.0)
+            except Exception:
+                pass
+            self._window_prefetch_thread = None
 
     def _candidate_to_unverified_submit(self, cand: CandidateShare) -> VerifiedShare:
         assigned_work = target_hex_to_assigned_work(cand.target_hex)
@@ -1658,6 +1781,7 @@ class MinerWorker(QObject):
             "device_index": int(self.config.device_index),
             "candidate_queue_depth": (self._candidate_queue.qsize() if self._candidate_queue is not None else 0),
             "submit_queue_depth": (self._submit_queue.qsize() if self._submit_queue is not None else 0),
+            "prefetch_queue_depth": self._window_queue.qsize(),
             "scan_launches_last": int(self._scan_launches_last),
             "python_verify_threads_active": len(self._verify_threads),
             "effective_candidate_target_last": int(self._last_effective_candidate_target),
@@ -1773,6 +1897,7 @@ class MinerWorker(QObject):
         self._no_share_scan_streak = 0
 
         self._drain_queue(self._candidate_queue)
+        self._drain_queue(self._window_queue)
 
     def _get_job_state(self) -> tuple[Optional[MiningJob], int]:
         with self._job_lock:
@@ -1791,7 +1916,7 @@ class MinerWorker(QObject):
             return
         while True:
             try:
-                item = q.get_nowait()
+                _item = q.get_nowait()
             except queue.Empty:
                 break
             else:
@@ -1799,5 +1924,3 @@ class MinerWorker(QObject):
                     q.task_done()
                 except Exception:
                     pass
-                if item is None:
-                    continue
