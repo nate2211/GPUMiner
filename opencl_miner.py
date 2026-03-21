@@ -398,6 +398,9 @@ class OpenCLGpuScanner:
         return self.config.normalized_scan_mode()
 
     def _selected_kernel_entry(self) -> str:
+        configured = str(getattr(self.config, "kernel_entry", "") or "").strip()
+        if configured and self.config.normalized_hash_engine() != "virtualasic":
+            return configured
         if self._scan_mode() == "hash_batch":
             return "blocknet_randomx_vm_hash_batch_ext"
         return "blocknet_randomx_vm_scan_ext"

@@ -1281,6 +1281,202 @@ inline void bn_run_core(
     );
 }
 
+// @vasic_mode candidate_merge
+// @vasic_count_arg 14
+// @vasic_merge_buffer 7:32
+// @vasic_merge_buffer 8:4
+// @vasic_merge_buffer 9:8
+// @vasic_merge_buffer 10:4
+// @vasic_merge_buffer 11:1
+// @vasic_merge_buffer 12:1
+// @vasic_merge_buffer 13:1
+// @vasic_partition global_offset
+__kernel void blocknet_randomx_vm_scan_vasic(
+    __global const uchar* blob,
+    const uint blob_len,
+    const uint nonce_offset,
+    const uint start_nonce,
+    const uint target64_lo,
+    const uint target64_hi,
+    const uint max_results,
+    __global uchar* out_hashes,
+    __global uint* out_nonces,
+    __global ulong* out_scores,
+    __global uint* out_buckets,
+    __global uchar* out_rankq,
+    __global uchar* out_threshq,
+    __global uchar* out_tailbin,
+    __global uint* out_count,
+    __global const uchar* seed,
+    const uint seed_len,
+    __global const ulong* dataset64,
+    const uint dataset_words,
+    __global const uchar* seed_tune,
+    const uint seed_tune_buckets,
+    const uint seed_tune_tail_bins,
+    __global const uchar* job_tune,
+    const uint job_tune_buckets,
+    const uint job_tune_tail_bins,
+    const uint job_age_ms,
+    const uint verify_pressure_q8,
+    const uint submit_pressure_q8,
+    const uint stale_risk_q8
+) {
+    const ulong target64 = ((ulong)target64_lo) | (((ulong)target64_hi) << 32);
+
+    __local ulong l_score[BN_LOCAL_STAGE_SIZE];
+    __local uint  l_nonce[BN_LOCAL_STAGE_SIZE];
+    __local ulong l_h0[BN_LOCAL_STAGE_SIZE];
+    __local ulong l_h1[BN_LOCAL_STAGE_SIZE];
+    __local ulong l_h2[BN_LOCAL_STAGE_SIZE];
+    __local ulong l_h3[BN_LOCAL_STAGE_SIZE];
+    __local uint  l_bucket[BN_LOCAL_STAGE_SIZE];
+    __local uchar l_rankq[BN_LOCAL_STAGE_SIZE];
+    __local uchar l_threshq[BN_LOCAL_STAGE_SIZE];
+    __local uchar l_tailbin[BN_LOCAL_STAGE_SIZE];
+    __local uchar l_class[BN_LOCAL_STAGE_SIZE];
+
+    bn_run_core(
+        blob,
+        blob_len,
+        nonce_offset,
+        start_nonce,
+        target64,
+        max_results,
+        out_hashes,
+        out_nonces,
+        out_scores,
+        out_buckets,
+        out_rankq,
+        out_threshq,
+        out_tailbin,
+        out_count,
+        seed,
+        seed_len,
+        dataset64,
+        dataset_words,
+        seed_tune,
+        seed_tune_buckets,
+        seed_tune_tail_bins,
+        job_tune,
+        job_tune_buckets,
+        job_tune_tail_bins,
+        job_age_ms,
+        verify_pressure_q8,
+        submit_pressure_q8,
+        stale_risk_q8,
+        l_score,
+        l_nonce,
+        l_h0,
+        l_h1,
+        l_h2,
+        l_h3,
+        l_bucket,
+        l_rankq,
+        l_threshq,
+        l_tailbin,
+        l_class
+    );
+}
+
+// @vasic_mode candidate_merge
+// @vasic_count_arg 14
+// @vasic_merge_buffer 7:32
+// @vasic_merge_buffer 8:4
+// @vasic_merge_buffer 9:8
+// @vasic_merge_buffer 10:4
+// @vasic_merge_buffer 11:1
+// @vasic_merge_buffer 12:1
+// @vasic_merge_buffer 13:1
+// @vasic_partition global_offset
+__kernel void blocknet_randomx_vm_hash_batch_vasic(
+    __global const uchar* blob,
+    const uint blob_len,
+    const uint nonce_offset,
+    const uint start_nonce,
+    const uint target64_lo,
+    const uint target64_hi,
+    const uint max_results,
+    __global uchar* out_hashes,
+    __global uint* out_nonces,
+    __global ulong* out_scores,
+    __global uint* out_buckets,
+    __global uchar* out_rankq,
+    __global uchar* out_threshq,
+    __global uchar* out_tailbin,
+    __global uint* out_count,
+    __global const uchar* seed,
+    const uint seed_len,
+    __global const ulong* dataset64,
+    const uint dataset_words,
+    __global const uchar* seed_tune,
+    const uint seed_tune_buckets,
+    const uint seed_tune_tail_bins,
+    __global const uchar* job_tune,
+    const uint job_tune_buckets,
+    const uint job_tune_tail_bins,
+    const uint job_age_ms,
+    const uint verify_pressure_q8,
+    const uint submit_pressure_q8,
+    const uint stale_risk_q8
+) {
+    const ulong target64 = ((ulong)target64_lo) | (((ulong)target64_hi) << 32);
+
+    __local ulong l_score[BN_LOCAL_STAGE_SIZE];
+    __local uint  l_nonce[BN_LOCAL_STAGE_SIZE];
+    __local ulong l_h0[BN_LOCAL_STAGE_SIZE];
+    __local ulong l_h1[BN_LOCAL_STAGE_SIZE];
+    __local ulong l_h2[BN_LOCAL_STAGE_SIZE];
+    __local ulong l_h3[BN_LOCAL_STAGE_SIZE];
+    __local uint  l_bucket[BN_LOCAL_STAGE_SIZE];
+    __local uchar l_rankq[BN_LOCAL_STAGE_SIZE];
+    __local uchar l_threshq[BN_LOCAL_STAGE_SIZE];
+    __local uchar l_tailbin[BN_LOCAL_STAGE_SIZE];
+    __local uchar l_class[BN_LOCAL_STAGE_SIZE];
+
+    bn_run_core(
+        blob,
+        blob_len,
+        nonce_offset,
+        start_nonce,
+        target64,
+        max_results,
+        out_hashes,
+        out_nonces,
+        out_scores,
+        out_buckets,
+        out_rankq,
+        out_threshq,
+        out_tailbin,
+        out_count,
+        seed,
+        seed_len,
+        dataset64,
+        dataset_words,
+        seed_tune,
+        seed_tune_buckets,
+        seed_tune_tail_bins,
+        job_tune,
+        job_tune_buckets,
+        job_tune_tail_bins,
+        job_age_ms,
+        verify_pressure_q8,
+        submit_pressure_q8,
+        stale_risk_q8,
+        l_score,
+        l_nonce,
+        l_h0,
+        l_h1,
+        l_h2,
+        l_h3,
+        l_bucket,
+        l_rankq,
+        l_threshq,
+        l_tailbin,
+        l_class
+    );
+}
+
 __kernel void blocknet_randomx_vm_scan_ext(
     __global const uchar* blob,
     const uint blob_len,

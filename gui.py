@@ -257,6 +257,7 @@ class MainWindow(QMainWindow):
         self._connect_autosave_signals()
         self.load_config()
         self._sync_backend_controls()
+        self._sync_hash_engine_controls()
         self._sync_scan_mode_controls()
         self._sync_verification_controls()
         self._sync_rescue_controls()
@@ -551,8 +552,14 @@ class MainWindow(QMainWindow):
         box = QGroupBox("OpenCL / RandomX")
         grid = QGridLayout(box)
 
+        self.hash_engine_combo = QComboBox()
+        self.hash_engine_combo.addItems(["opencl", "virtualasic"])
+        self.hash_engine_combo.currentTextChanged.connect(self._sync_hash_engine_controls)
+        self.hash_engine_combo.currentTextChanged.connect(self.schedule_save)
+
         self.kernel_edit = QLineEdit("kernels/blocknet_randomx_vm_opencl.cl")
         self.loader_edit = QLineEdit("OpenCL.dll")
+        self.virtualasic_dll_edit = QLineEdit("virtualasic.dll")
 
         self.verifier_dll_edit = QLineEdit("randomx_verify.dll")
         self.randomx_runtime_dll_edit = QLineEdit("randomx-dll.dll")
@@ -596,47 +603,55 @@ class MainWindow(QMainWindow):
         browse_loader_btn = QPushButton("Browse…")
         browse_loader_btn.clicked.connect(self.browse_loader)
 
+        browse_virtualasic_btn = QPushButton("Browse…")
+        browse_virtualasic_btn.clicked.connect(self.browse_virtualasic_dll)
+
         browse_verifier_btn = QPushButton("Browse…")
         browse_verifier_btn.clicked.connect(self.browse_verifier_dll)
 
         browse_runtime_btn = QPushButton("Browse…")
         browse_runtime_btn.clicked.connect(self.browse_randomx_runtime_dll)
 
-        grid.addWidget(QLabel("Kernel path"), 0, 0)
-        grid.addWidget(self.kernel_edit, 0, 1, 1, 2)
-        grid.addWidget(browse_kernel_btn, 0, 3)
+        grid.addWidget(QLabel("Hash engine"), 0, 0)
+        grid.addWidget(self.hash_engine_combo, 0, 1)
+        grid.addWidget(QLabel("Kernel path"), 0, 2)
+        grid.addWidget(self.kernel_edit, 0, 3)
 
-        grid.addWidget(QLabel("Verifier DLL"), 1, 0)
-        grid.addWidget(self.verifier_dll_edit, 1, 1, 1, 2)
-        grid.addWidget(browse_verifier_btn, 1, 3)
+        grid.addWidget(QLabel("VirtualASIC DLL"), 1, 0)
+        grid.addWidget(self.virtualasic_dll_edit, 1, 1, 1, 2)
+        grid.addWidget(browse_virtualasic_btn, 1, 3)
 
-        grid.addWidget(QLabel("RandomX runtime DLL"), 2, 0)
-        grid.addWidget(self.randomx_runtime_dll_edit, 2, 1, 1, 2)
-        grid.addWidget(browse_runtime_btn, 2, 3)
+        grid.addWidget(QLabel("Verifier DLL"), 2, 0)
+        grid.addWidget(self.verifier_dll_edit, 2, 1, 1, 2)
+        grid.addWidget(browse_verifier_btn, 2, 3)
 
-        grid.addWidget(QLabel("OpenCL loader"), 3, 0)
-        grid.addWidget(self.loader_edit, 3, 1, 1, 2)
-        grid.addWidget(browse_loader_btn, 3, 3)
+        grid.addWidget(QLabel("RandomX runtime DLL"), 3, 0)
+        grid.addWidget(self.randomx_runtime_dll_edit, 3, 1, 1, 2)
+        grid.addWidget(browse_runtime_btn, 3, 3)
 
-        grid.addWidget(self.preload_randomx_runtime_check, 4, 0, 1, 2)
+        grid.addWidget(QLabel("OpenCL loader"), 4, 0)
+        grid.addWidget(self.loader_edit, 4, 1, 1, 2)
+        grid.addWidget(browse_loader_btn, 4, 3)
 
-        grid.addWidget(QLabel("Build options"), 5, 0)
-        grid.addWidget(self.build_opts_edit, 5, 1, 1, 3)
+        grid.addWidget(self.preload_randomx_runtime_check, 5, 0, 1, 2)
 
-        grid.addWidget(QLabel("Platform index"), 6, 0)
-        grid.addWidget(self.platform_spin, 6, 1)
-        grid.addWidget(QLabel("Device index"), 6, 2)
-        grid.addWidget(self.device_spin, 6, 3)
+        grid.addWidget(QLabel("Build options"), 6, 0)
+        grid.addWidget(self.build_opts_edit, 6, 1, 1, 3)
 
-        grid.addWidget(QLabel("Global work size (chunk mode)"), 7, 0)
-        grid.addWidget(self.gws_spin, 7, 1)
-        grid.addWidget(QLabel("Local work size (0 = auto)"), 7, 2)
-        grid.addWidget(self.lws_spin, 7, 3)
+        grid.addWidget(QLabel("Platform index"), 7, 0)
+        grid.addWidget(self.platform_spin, 7, 1)
+        grid.addWidget(QLabel("Device index"), 7, 2)
+        grid.addWidget(self.device_spin, 7, 3)
 
-        grid.addWidget(QLabel("Max GPU results"), 8, 0)
-        grid.addWidget(self.max_results_spin, 8, 1)
-        grid.addWidget(QLabel("Nonce offset"), 8, 2)
-        grid.addWidget(self.nonce_offset_spin, 8, 3)
+        grid.addWidget(QLabel("Global work size (chunk mode)"), 8, 0)
+        grid.addWidget(self.gws_spin, 8, 1)
+        grid.addWidget(QLabel("Local work size (0 = auto)"), 8, 2)
+        grid.addWidget(self.lws_spin, 8, 3)
+
+        grid.addWidget(QLabel("Max GPU results"), 9, 0)
+        grid.addWidget(self.max_results_spin, 9, 1)
+        grid.addWidget(QLabel("Nonce offset"), 9, 2)
+        grid.addWidget(self.nonce_offset_spin, 9, 3)
 
         return box
 
@@ -1111,6 +1126,7 @@ class MainWindow(QMainWindow):
             self.agent_edit,
             self.kernel_edit,
             self.loader_edit,
+            self.virtualasic_dll_edit,
             self.verifier_dll_edit,
             self.randomx_runtime_dll_edit,
             self.build_opts_edit,
@@ -1149,6 +1165,7 @@ class MainWindow(QMainWindow):
 
         for combo in [
             self.backend_combo,
+            self.hash_engine_combo,
             self.scan_mode_combo,
             self.blocknet_force_scheme_combo,
             self.monero_rpc_force_scheme_combo,
@@ -1281,6 +1298,17 @@ class MainWindow(QMainWindow):
         self._sync_verification_controls()
         self._sync_rescue_controls()
 
+    def _sync_hash_engine_controls(self) -> None:
+        engine = self.hash_engine_combo.currentText().strip().lower()
+        using_virtualasic = engine == "virtualasic"
+
+        self.loader_edit.setEnabled(not using_virtualasic)
+        self.platform_spin.setEnabled(not using_virtualasic)
+        self.device_spin.setEnabled(not using_virtualasic)
+        self.build_opts_edit.setEnabled(not using_virtualasic)
+
+        self.virtualasic_dll_edit.setEnabled(using_virtualasic)
+
     def _sync_scan_mode_controls(self) -> None:
         mode = self.scan_mode_combo.currentText().strip().lower()
         is_chunk = mode == "chunk"
@@ -1411,6 +1439,16 @@ class MainWindow(QMainWindow):
         if path:
             self.loader_edit.setText(path)
 
+    def browse_virtualasic_dll(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select VirtualASIC DLL",
+            self.virtualasic_dll_edit.text().strip() or "",
+            "Libraries (*.dll *.so *.dylib);;All files (*)",
+        )
+        if path:
+            self.virtualasic_dll_edit.setText(path)
+
     def clear_logs(self) -> None:
         self.log_edit.clear()
         self.raw_stats_edit.clear()
@@ -1419,10 +1457,12 @@ class MainWindow(QMainWindow):
         lws = self.lws_spin.value() or None
 
         backend = self.backend_combo.currentText().strip().lower()
+        hash_engine = self.hash_engine_combo.currentText().strip().lower()
         feeder_mode = self._monero_feeder_mode()
         host = self.host_edit.text().strip()
         kernel_path = self.kernel_edit.text().strip()
         opencl_loader = self.loader_edit.text().strip()
+        virtualasic_dll_path = self.virtualasic_dll_edit.text().strip()
         verifier_dll_path = self.verifier_dll_edit.text().strip()
         randomx_runtime_dll_path = self.randomx_runtime_dll_edit.text().strip()
         scan_mode = self.scan_mode_combo.currentText().strip().lower()
@@ -1430,8 +1470,12 @@ class MainWindow(QMainWindow):
 
         if not kernel_path:
             raise ValueError("Kernel path is required.")
-        if not opencl_loader:
+        if hash_engine not in {"opencl", "virtualasic"}:
+            raise ValueError("Hash engine must be 'opencl' or 'virtualasic'.")
+        if hash_engine == "opencl" and not opencl_loader:
             raise ValueError("OpenCL loader is required.")
+        if hash_engine == "virtualasic" and not virtualasic_dll_path:
+            raise ValueError("VirtualASIC DLL path is required.")
         if not verifier_dll_path:
             raise ValueError("Verifier DLL path is required.")
         if scan_mode not in {"chunk", "hash_batch"}:
@@ -1468,6 +1512,7 @@ class MainWindow(QMainWindow):
 
         return MinerConfig(
             mining_backend=backend,
+            hash_engine=hash_engine,
 
             host=host,
             port=int(self.port_spin.value()),
@@ -1507,6 +1552,7 @@ class MainWindow(QMainWindow):
 
             kernel_path=kernel_path,
             opencl_loader=opencl_loader,
+            virtualasic_dll_path=virtualasic_dll_path,
             build_options=self.build_opts_edit.text().strip(),
             platform_index=int(self.platform_spin.value()),
             device_index=int(self.device_spin.value()),
@@ -1631,6 +1677,7 @@ class MainWindow(QMainWindow):
         cq = int(stats.get("candidate_queue_depth", 0))
         sq = int(stats.get("submit_queue_depth", 0))
         backend = str(stats.get("backend", "unknown"))
+        hash_engine = str(stats.get("hash_engine", self.hash_engine_combo.currentText()))
         scan_mode = str(stats.get("scan_mode", self.scan_mode_combo.currentText()))
         launches = int(stats.get("scan_launches_last", 0))
 
@@ -1680,7 +1727,7 @@ class MainWindow(QMainWindow):
         self.card_height.set_value(height, "")
         self.card_queues.set_value(f"{cq} / {sq}", "verify / submit")
         self.card_backend.set_value(
-            f"{backend} / {scan_mode}",
+            f"{backend} / {hash_engine} / {scan_mode}",
             f"verify={'on' if verify_enabled else 'off'} window={scan_window_source}/{scan_window_count}",
         )
         self.card_effective_target.set_value(str(eff_target), f"stale_q8={stale_q8}")
@@ -1703,7 +1750,7 @@ class MainWindow(QMainWindow):
             f"Accepted: {accepted}    Rejected: {rejected}    Candidates: {candidates}    "
             f"Verified: {verified}    VerifyReject: {verify_rejected}    TailAccept: {teacher_tail_accepted}    "
             f"RawSubmits: {submitted_unverified}    Job: {job_id}    Height: {height}    Queues: {cq}/{sq}    "
-            f"Mode: {scan_mode}    Backend: {backend}    Window: {scan_window_source}/{scan_window_count}    "
+            f"Mode: {scan_mode}    Engine: {hash_engine}    Backend: {backend}    Window: {scan_window_source}/{scan_window_count}    "
             f"Verify: {'on' if verify_enabled else 'off'}    "
             f"VerifyBatch: {'on' if verify_batch_enabled else 'off'}({verify_batch_size})    "
             f"HashTeacher: {'on' if hash_batch_enabled else 'off'}({hash_batch_min_size})    "
@@ -1784,6 +1831,7 @@ class MainWindow(QMainWindow):
     def _config_to_dict(self) -> dict[str, Any]:
         return {
             "mining_backend": self.backend_combo.currentText().strip(),
+            "hash_engine": self.hash_engine_combo.currentText().strip(),
             "host": self.host_edit.text().strip(),
             "port": int(self.port_spin.value()),
             "login": self.login_edit.text().strip(),
@@ -1822,6 +1870,7 @@ class MainWindow(QMainWindow):
 
             "kernel_path": self.kernel_edit.text().strip(),
             "opencl_loader": self.loader_edit.text().strip(),
+            "virtualasic_dll_path": self.virtualasic_dll_edit.text().strip(),
             "build_options": self.build_opts_edit.text().strip(),
             "platform_index": int(self.platform_spin.value()),
             "device_index": int(self.device_spin.value()),
@@ -1971,6 +2020,7 @@ class MainWindow(QMainWindow):
 
         self.kernel_edit.setText(str(data.get("kernel_path", self.kernel_edit.text())))
         self.loader_edit.setText(str(data.get("opencl_loader", self.loader_edit.text())))
+        self.virtualasic_dll_edit.setText(str(data.get("virtualasic_dll_path", self.virtualasic_dll_edit.text())))
         self.build_opts_edit.setText(str(data.get("build_options", self.build_opts_edit.text())))
         self.verifier_dll_edit.setText(str(data.get("randomx_dll_path", self.verifier_dll_edit.text())))
         self.randomx_runtime_dll_edit.setText(
@@ -2134,6 +2184,7 @@ class MainWindow(QMainWindow):
             self.tabs.setCurrentIndex(tab_index)
 
         self._sync_backend_controls()
+        self._sync_hash_engine_controls()
         self._sync_scan_mode_controls()
         self._sync_verification_controls()
         self._sync_rescue_controls()

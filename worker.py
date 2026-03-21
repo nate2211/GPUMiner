@@ -12,6 +12,7 @@ from PyQt5.QtCore import QObject, pyqtSignal
 from cpu_verify import CpuVerifier, target_hex_to_assigned_work
 from models import CandidateShare, MinerConfig, MiningJob, NonceWindow, SubmitResult, VerifiedShare
 from opencl_miner import OpenCLGpuScanner
+from virtualasic import VirtualAsicScanner
 from stratum_connection import MiningConnection
 from utils import nonce_to_hex_le, safe_bytes_from_hex
 
@@ -582,7 +583,12 @@ class MinerWorker(QObject):
         return None
 
     def run(self) -> None:
-        scanner = OpenCLGpuScanner(self.config, self.log.emit)
+        engine_name = self.config.normalized_hash_engine()
+        scanner = (
+            VirtualAsicScanner(self.config, self.log.emit)
+            if engine_name == "virtualasic"
+            else OpenCLGpuScanner(self.config, self.log.emit)
+        )
         client = MiningConnection(
             self.config,
             on_log=self.log.emit,
@@ -732,7 +738,7 @@ class MinerWorker(QObject):
 
                 if candidates:
                     self.log.emit(
-                        f"[opencl] candidates={len(candidates)} "
+                        f"[scan] candidates={len(candidates)} "
                         f"job={job.job_id} start_nonce={start_nonce:08x} "
                         f"mode={self._scan_mode()} backend={self.config.mining_backend_name()} "
                         f"window_source={self._last_scan_window_source} "
@@ -746,7 +752,7 @@ class MinerWorker(QObject):
                     )
                 else:
                     self.log.emit(
-                        f"[opencl] empty candidate pass "
+                        f"[scan] empty candidate pass "
                         f"job={job.job_id} start_nonce={start_nonce:08x} "
                         f"no_share_streak={self._no_share_scan_streak}"
                     )
@@ -1758,6 +1764,7 @@ class MinerWorker(QObject):
             "job_id": (job.job_id if job else "-"),
             "height": (job.height if job else 0),
             "backend": self.config.mining_backend_name(),
+            "hash_engine": self.config.normalized_hash_engine(),
             "scan_mode": self._scan_mode(),
             "verification_enabled": self._verify_enabled(),
             "verification_batch_enabled": self._verify_batch_enabled(),

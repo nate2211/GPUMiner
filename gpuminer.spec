@@ -19,12 +19,14 @@ datas = [
     (str(project_dir / "stratum_connection.py"), "."),
     (str(project_dir / "utils.py"), "."),
     (str(project_dir / "worker.py"), "."),
+    (str(project_dir / "virtualasic.py"), "."),
 ]
 
 binaries = [
     (str(project_dir / "MiningProject.dll"), "."),
     (str(project_dir / "OpenCL.dll"), "."),
     (str(project_dir / "randomx-dll.dll"), "."),
+    (str(project_dir / "VirtualASIC.dll"), "."),
 ]
 
 hiddenimports = [

@@ -10,6 +10,9 @@ class MinerConfig:
     # backend: "stratum" | "blocknet" | "solo" | "monerorpc"
     mining_backend: str = "stratum"
 
+    # hash engine: "opencl" | "virtualasic"
+    hash_engine: str = "opencl"
+
     # direct stratum
     host: str = "127.0.0.1"
     port: int = 3333
@@ -53,10 +56,11 @@ class MinerConfig:
     solo_poll_fallback_s: float = 2.0
     solo_reserve_size: int = 60
 
-    # OpenCL / RandomX
+    # Kernel / hashing runtime
     kernel_path: str = "kernels/blocknet_randomx_vm_opencl.cl"
     kernel_entry: str = "blocknet_randomx_vm_scan_ext"
     opencl_loader: str = "OpenCL.dll"
+    virtualasic_dll_path: str = "virtualasic.dll"
     build_options: str = (
         "-cl-std=CL1.2 "
         "-DBN_PREFILTER_ROUNDS=96 "
@@ -99,17 +103,16 @@ class MinerConfig:
 
     # CPU rescue scan
     enable_cpu_rescue_scan: bool = True
-    # new trigger: consecutive scan cycles with no verified share
     cpu_rescue_after_no_share_scans: int = 2
     cpu_rescue_job_age_max_ms: int = 1800
     cpu_rescue_window_size: int = 1024
     cpu_rescue_batch_size: int = 1024
 
-    # GPU scan mode
+    # GPU / hybrid scan mode
     gpu_scan_mode: str = "chunk"  # "chunk" | "hash_batch"
     hash_batch_size: int = 262_144
 
-    # GPU scan settings
+    # Scan settings
     global_work_size: int = 2_097_152
     local_work_size: Optional[int] = 128
     max_results: int = 4096
@@ -165,6 +168,10 @@ class MinerConfig:
     def normalized_scan_mode(self) -> str:
         mode = (self.gpu_scan_mode or "chunk").strip().lower()
         return mode if mode in {"chunk", "hash_batch"} else "chunk"
+
+    def normalized_hash_engine(self) -> str:
+        value = (self.hash_engine or "opencl").strip().lower()
+        return value if value in {"opencl", "virtualasic"} else "opencl"
 
     def active_scan_window(self) -> int:
         if self.normalized_scan_mode() == "hash_batch":
