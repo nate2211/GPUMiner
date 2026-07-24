@@ -1,6 +1,6 @@
 /*
  * blocknet_randomx_fused_all_kernels.cl
- * Fused from the two uploaded OpenCL snippets.
+ * RandomX-structured predictive OpenCL core with ABI-compatible wrappers.
  *
  * Included entry kernels:
  *   - blocknet_randomx_basic_hash          (simple per-work-item hash dump)
@@ -18,10 +18,16 @@
  *   - blocknet_randomx_vm_hash_batch_vasic (original vasic wrapper, target lo/hi)
  *
  * Notes:
- *   - This is an OpenCL-C source file. Do not include <CL/cl.h> inside it.
- *   - BN_* constants are guarded with #ifndef so the host can override via build options.
- *   - The GPU hash here is the existing dataset-prefilter hash from the pasted scripts;
- *     host-side CPU/full RandomX verification is still required for consensus-valid shares.
+ *   - This is OpenCL C. Do not include <CL/cl.h> inside this file.
+ *   - Every public kernel name and argument list from the uploaded source is preserved.
+ *   - The predictor now follows the RandomX data flow: BLAKE2b input seed, RandomX AES
+ *     scratchpad/program generation, RandomX opcode frequencies, integer VM operations,
+ *     aligned 64-byte Dataset reads, chained programs, scratchpad fingerprinting, and
+ *     BLAKE2b finalization.
+ *   - It deliberately uses bounded predictor constants so the existing ABI remains
+ *     launchable without a separate 2 MiB mutable scratchpad allocation per hash.
+ *     Therefore its 32-byte result is a predictor/ranking digest, NOT a consensus
+ *     RandomX hash. CPU/native full-RandomX verification remains mandatory.
  */
 
 #pragma OPENCL EXTENSION cl_khr_byte_addressable_store : enable
@@ -68,6 +74,69 @@
 
 #ifndef BN_FAST_ABSORB_STRIDE
 #define BN_FAST_ABSORB_STRIDE 4u
+#endif
+
+/*
+ * ABI-preserving RandomX predictor profile.
+ *
+ * Consensus RandomX uses a 2 MiB scratchpad, 256 instructions, 2048 program
+ * iterations, and 8 programs. Those values require a multi-kernel pipeline and
+ * a host-provided mutable scratchpad buffer. The current public ABI has no such
+ * buffer, so the defaults below intentionally bound the private working set.
+ *
+ * They may be raised with OpenCL build options for experiments, but raising
+ * them does not make this digest consensus-valid: the scratchpad is still
+ * smaller than the mandatory RandomX L3 scratchpad.
+ */
+#ifndef BN_RX_PREDICT_SCRATCH_WORDS
+#define BN_RX_PREDICT_SCRATCH_WORDS 64u
+#endif
+
+#ifndef BN_RX_PREDICT_PROGRAM_SIZE
+#define BN_RX_PREDICT_PROGRAM_SIZE 32u
+#endif
+
+#ifndef BN_RX_PREDICT_ITERATIONS
+#define BN_RX_PREDICT_ITERATIONS 8u
+#endif
+
+#ifndef BN_RX_PREDICT_PROGRAMS
+#define BN_RX_PREDICT_PROGRAMS 2u
+#endif
+
+#ifndef BN_RX_PREDICT_MAX_BRANCH_STEPS
+#define BN_RX_PREDICT_MAX_BRANCH_STEPS (BN_RX_PREDICT_PROGRAM_SIZE * 4u)
+#endif
+
+#if BN_RX_PREDICT_SCRATCH_WORDS < 64u
+#error "BN_RX_PREDICT_SCRATCH_WORDS must be at least 64"
+#endif
+
+#if (BN_RX_PREDICT_SCRATCH_WORDS & (BN_RX_PREDICT_SCRATCH_WORDS - 1u)) != 0u
+#error "BN_RX_PREDICT_SCRATCH_WORDS must be a power of two"
+#endif
+
+#if (BN_RX_PREDICT_SCRATCH_WORDS & 7u) != 0u
+#error "BN_RX_PREDICT_SCRATCH_WORDS must contain whole 64-byte lines"
+#endif
+
+#if BN_RX_PREDICT_PROGRAM_SIZE < 16u || BN_RX_PREDICT_PROGRAM_SIZE > 256u
+#error "BN_RX_PREDICT_PROGRAM_SIZE must be in [16, 256]"
+#endif
+
+#if BN_RX_PREDICT_ITERATIONS < 1u
+#error "BN_RX_PREDICT_ITERATIONS must be positive"
+#endif
+
+#if BN_RX_PREDICT_PROGRAMS < 1u || BN_RX_PREDICT_PROGRAMS > 8u
+#error "BN_RX_PREDICT_PROGRAMS must be in [1, 8]"
+#endif
+
+#if defined(cl_khr_fp64)
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+#define BN_RX_HAVE_FP64 1
+#else
+#define BN_RX_HAVE_FP64 0
 #endif
 
 #define BN_U64_C(x) ((ulong)(x##UL))
@@ -666,7 +735,1054 @@ inline ulong bn_local_pick_penalty(
     return penalty;
 }
 
+// ============================================================
+// RANDOMX-STRUCTURED PREDICTOR PRIMITIVES
+// ============================================================
+
+/*
+ * BLAKE2b is used by consensus RandomX for the input seed, chained
+ * register-file seeds, and the final 256-bit digest. These routines implement
+ * that primitive directly in OpenCL C and support the nonce overlay without
+ * copying the input blob.
+ */
+__constant ulong BN_BLAKE2B_IV[8] = {
+    BN_U64_C(0x6a09e667f3bcc908), BN_U64_C(0xbb67ae8584caa73b),
+    BN_U64_C(0x3c6ef372fe94f82b), BN_U64_C(0xa54ff53a5f1d36f1),
+    BN_U64_C(0x510e527fade682d1), BN_U64_C(0x9b05688c2b3e6c1f),
+    BN_U64_C(0x1f83d9abfb41bd6b), BN_U64_C(0x5be0cd19137e2179)
+};
+
+__constant uchar BN_BLAKE2B_SIGMA[12][16] = {
+    { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15 },
+    {14,10, 4, 8, 9,15,13, 6, 1,12, 0, 2,11, 7, 5, 3 },
+    {11, 8,12, 0, 5, 2,15,13,10,14, 3, 6, 7, 1, 9, 4 },
+    { 7, 9, 3, 1,13,12,11,14, 2, 6, 5,10, 4, 0,15, 8 },
+    { 9, 0, 5, 7, 2, 4,10,15,14, 1,11,12, 6, 8, 3,13 },
+    { 2,12, 6,10, 0,11, 8, 3, 4,13, 7, 5,15,14, 1, 9 },
+    {12, 5, 1,15,14,13, 4,10, 0, 7, 6, 3, 9, 2, 8,11 },
+    {13,11, 7,14,12, 1, 3, 9, 5, 0,15, 4, 8, 6, 2,10 },
+    { 6,15,14, 9,11, 3, 0, 8,12, 2,13, 7, 1, 4,10, 5 },
+    {10, 2, 8, 4, 7, 6, 1, 5,15,11, 9,14, 3,12,13, 0 },
+    { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15 },
+    {14,10, 4, 8, 9,15,13, 6, 1,12, 0, 2,11, 7, 5, 3 }
+};
+
+inline void bn_blake2b_g(
+    __private ulong* a,
+    __private ulong* b,
+    __private ulong* c,
+    __private ulong* d,
+    ulong x,
+    ulong y
+) {
+    *a = *a + *b + x;
+    *d = bn_rotr64(*d ^ *a, 32u);
+    *c = *c + *d;
+    *b = bn_rotr64(*b ^ *c, 24u);
+    *a = *a + *b + y;
+    *d = bn_rotr64(*d ^ *a, 16u);
+    *c = *c + *d;
+    *b = bn_rotr64(*b ^ *c, 63u);
+}
+
+inline void bn_blake2b_compress(
+    __private ulong h[8],
+    __private const ulong m[16],
+    ulong t0,
+    ulong t1,
+    uint is_last
+) {
+    ulong v[16];
+
+    for (uint i = 0u; i < 8u; ++i) {
+        v[i] = h[i];
+        v[i + 8u] = BN_BLAKE2B_IV[i];
+    }
+
+    v[12] ^= t0;
+    v[13] ^= t1;
+    if (is_last != 0u) {
+        v[14] = ~v[14];
+    }
+
+    for (uint r = 0u; r < 12u; ++r) {
+        __constant const uchar* s = BN_BLAKE2B_SIGMA[r];
+
+        bn_blake2b_g(&v[0], &v[4], &v[ 8], &v[12], m[s[ 0]], m[s[ 1]]);
+        bn_blake2b_g(&v[1], &v[5], &v[ 9], &v[13], m[s[ 2]], m[s[ 3]]);
+        bn_blake2b_g(&v[2], &v[6], &v[10], &v[14], m[s[ 4]], m[s[ 5]]);
+        bn_blake2b_g(&v[3], &v[7], &v[11], &v[15], m[s[ 6]], m[s[ 7]]);
+        bn_blake2b_g(&v[0], &v[5], &v[10], &v[15], m[s[ 8]], m[s[ 9]]);
+        bn_blake2b_g(&v[1], &v[6], &v[11], &v[12], m[s[10]], m[s[11]]);
+        bn_blake2b_g(&v[2], &v[7], &v[ 8], &v[13], m[s[12]], m[s[13]]);
+        bn_blake2b_g(&v[3], &v[4], &v[ 9], &v[14], m[s[14]], m[s[15]]);
+    }
+
+    for (uint i = 0u; i < 8u; ++i) {
+        h[i] ^= v[i] ^ v[i + 8u];
+    }
+}
+
+inline void bn_blake2b_overlay(
+    __global const uchar* blob,
+    uint blob_len,
+    uint nonce_offset,
+    uint nonce_u32,
+    uint out_words,
+    __private ulong outv[8]
+) {
+    ulong h[8];
+    ulong m[16];
+    ulong t0 = 0UL;
+    ulong t1 = 0UL;
+    uint out_bytes = out_words * 8u;
+    uint blocks = bn_max_u32(1u, (blob_len + 127u) >> 7);
+
+    for (uint i = 0u; i < 8u; ++i) {
+        h[i] = BN_BLAKE2B_IV[i];
+    }
+    h[0] ^= (BN_U64_C(0x01010000) ^ (ulong)out_bytes);
+
+    for (uint b = 0u; b < blocks; ++b) {
+        uint off = b << 7;
+        uint block_bytes = (off < blob_len) ? bn_min_u32(128u, blob_len - off) : 0u;
+
+        for (uint i = 0u; i < 16u; ++i) {
+            m[i] = bn_blob_load_u64_overlay(
+                blob,
+                blob_len,
+                nonce_offset,
+                nonce_u32,
+                off + (i << 3)
+            );
+        }
+
+        ulong prev = t0;
+        t0 += (ulong)block_bytes;
+        if (t0 < prev) {
+            ++t1;
+        }
+
+        bn_blake2b_compress(h, m, t0, t1, (b + 1u == blocks) ? 1u : 0u);
+    }
+
+    for (uint i = 0u; i < 8u; ++i) {
+        outv[i] = (i < out_words) ? h[i] : 0UL;
+    }
+}
+
+inline void bn_blake2b_private_words(
+    __private const ulong* words,
+    uint word_count,
+    uint out_words,
+    __private ulong outv[8]
+) {
+    ulong h[8];
+    ulong m[16];
+    ulong t0 = 0UL;
+    ulong t1 = 0UL;
+    uint out_bytes = out_words * 8u;
+    uint blocks = bn_max_u32(1u, (word_count + 15u) >> 4);
+
+    for (uint i = 0u; i < 8u; ++i) {
+        h[i] = BN_BLAKE2B_IV[i];
+    }
+    h[0] ^= (BN_U64_C(0x01010000) ^ (ulong)out_bytes);
+
+    for (uint b = 0u; b < blocks; ++b) {
+        uint first = b << 4;
+        uint remaining = (first < word_count) ? word_count - first : 0u;
+        uint used = bn_min_u32(16u, remaining);
+
+        for (uint i = 0u; i < 16u; ++i) {
+            m[i] = (i < used) ? words[first + i] : 0UL;
+        }
+
+        ulong bytes = (ulong)(used << 3);
+        ulong prev = t0;
+        t0 += bytes;
+        if (t0 < prev) {
+            ++t1;
+        }
+
+        bn_blake2b_compress(h, m, t0, t1, (b + 1u == blocks) ? 1u : 0u);
+    }
+
+    for (uint i = 0u; i < 8u; ++i) {
+        outv[i] = (i < out_words) ? h[i] : 0UL;
+    }
+}
+
+__constant uchar BN_AES_SBOX[256] = {
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+};
+
+__constant uchar BN_AES_ISBOX[256] = {
+    0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
+    0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
+    0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
+    0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
+    0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
+    0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
+    0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
+    0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
+    0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
+    0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
+    0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
+    0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
+    0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
+    0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
+    0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
+    0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
+};
+
+__constant uint BN_RX_AES1_KEYS[16] = {
+    0x6daca553u,0x62716609u,0xdbb5552bu,0xb4f44917u,
+    0x6d7caf07u,0x846a710du,0x1725d378u,0x0da1dc4eu,
+    0x3f1262f1u,0x9f947ec6u,0xf4c0794fu,0x3e20e345u,
+    0x6aef8135u,0xb1ba317cu,0x16314c88u,0x49169154u
+};
+
+__constant uint BN_RX_AES4_KEYS[32] = {
+    0x6421aaddu,0xd1833ddbu,0x2f546d2bu,0x99e5d23fu,
+    0xb20e3450u,0xb6913f55u,0x06f79d53u,0xa5dfcde5u,
+    0x5c3ed904u,0x515e7bafu,0x0aa4679fu,0x171c02bfu,
+    0x85623763u,0xe78f5d08u,0xcd673785u,0xd8ded291u,
+    0xb5826f73u,0xe3d6a7a6u,0x3d518b6du,0x229effb4u,
+    0xc7566bf3u,0x9c10b3d9u,0xe9024d4eu,0xb272b7d2u,
+    0xf273c9e7u,0xf765a38bu,0x2ba9660au,0xf63befa7u,
+    0x7a7cd609u,0x915839deu,0x0c06d1fdu,0xc0b0762du
+};
+
+__constant uint BN_RX_AES_HASH_STATE[16] = {
+    0x92b52c0du,0x9fa856deu,0xcc82db47u,0xd7983aadu,
+    0x338d996eu,0x15c7b798u,0xf59e125au,0xace78057u,
+    0x6a770017u,0xae62c7d0u,0x5079506bu,0xe8a07ce4u,
+    0x630a240cu,0x07ad828du,0x79a10005u,0x7e994948u
+};
+
+__constant uint BN_RX_AES_HASH_XKEYS[8] = {
+    0xf6fa8389u,0x8b24949fu,0x90dc56bfu,0x06890201u,
+    0x61b263d1u,0x51f4e03cu,0xee1043c6u,0xed18f99bu
+};
+
+inline uchar bn_aes_xtime(uchar x) {
+    return (uchar)(((uint)x << 1) ^ (((x & (uchar)0x80u) != 0) ? 0x1bu : 0u));
+}
+
+inline void bn_aes_key_xor(
+    __private uchar state[16],
+    uint k0,
+    uint k1,
+    uint k2,
+    uint k3
+) {
+    uint k[4] = { k0, k1, k2, k3 };
+    for (uint i = 0u; i < 16u; ++i) {
+        state[i] ^= (uchar)((k[i >> 2] >> ((i & 3u) << 3)) & 0xffu);
+    }
+}
+
+inline void bn_aes_enc_round(
+    __private uchar state[16],
+    uint k0,
+    uint k1,
+    uint k2,
+    uint k3
+) {
+    uchar t[16];
+    uchar o[16];
+
+    for (uint c = 0u; c < 4u; ++c) {
+        for (uint r = 0u; r < 4u; ++r) {
+            uint src_c = (c + r) & 3u;
+            t[(c << 2) + r] = BN_AES_SBOX[state[(src_c << 2) + r]];
+        }
+    }
+
+    for (uint c = 0u; c < 4u; ++c) {
+        uint p = c << 2;
+        uchar a0 = t[p + 0u];
+        uchar a1 = t[p + 1u];
+        uchar a2 = t[p + 2u];
+        uchar a3 = t[p + 3u];
+        uchar x0 = bn_aes_xtime(a0);
+        uchar x1 = bn_aes_xtime(a1);
+        uchar x2 = bn_aes_xtime(a2);
+        uchar x3 = bn_aes_xtime(a3);
+
+        o[p + 0u] = x0 ^ (x1 ^ a1) ^ a2 ^ a3;
+        o[p + 1u] = a0 ^ x1 ^ (x2 ^ a2) ^ a3;
+        o[p + 2u] = a0 ^ a1 ^ x2 ^ (x3 ^ a3);
+        o[p + 3u] = (x0 ^ a0) ^ a1 ^ a2 ^ x3;
+    }
+
+    for (uint i = 0u; i < 16u; ++i) {
+        state[i] = o[i];
+    }
+    bn_aes_key_xor(state, k0, k1, k2, k3);
+}
+
+inline void bn_aes_dec_round(
+    __private uchar state[16],
+    uint k0,
+    uint k1,
+    uint k2,
+    uint k3
+) {
+    uchar t[16];
+    uchar o[16];
+
+    for (uint c = 0u; c < 4u; ++c) {
+        for (uint r = 0u; r < 4u; ++r) {
+            uint src_c = (c + 4u - r) & 3u;
+            t[(c << 2) + r] = BN_AES_ISBOX[state[(src_c << 2) + r]];
+        }
+    }
+
+    for (uint c = 0u; c < 4u; ++c) {
+        uint p = c << 2;
+        uchar a0 = t[p + 0u];
+        uchar a1 = t[p + 1u];
+        uchar a2 = t[p + 2u];
+        uchar a3 = t[p + 3u];
+        uchar a0x2 = bn_aes_xtime(a0);
+        uchar a1x2 = bn_aes_xtime(a1);
+        uchar a2x2 = bn_aes_xtime(a2);
+        uchar a3x2 = bn_aes_xtime(a3);
+        uchar a0x4 = bn_aes_xtime(a0x2);
+        uchar a1x4 = bn_aes_xtime(a1x2);
+        uchar a2x4 = bn_aes_xtime(a2x2);
+        uchar a3x4 = bn_aes_xtime(a3x2);
+        uchar a0x8 = bn_aes_xtime(a0x4);
+        uchar a1x8 = bn_aes_xtime(a1x4);
+        uchar a2x8 = bn_aes_xtime(a2x4);
+        uchar a3x8 = bn_aes_xtime(a3x4);
+
+        uchar a0x9  = a0x8 ^ a0;
+        uchar a0x11 = a0x8 ^ a0x2 ^ a0;
+        uchar a0x13 = a0x8 ^ a0x4 ^ a0;
+        uchar a0x14 = a0x8 ^ a0x4 ^ a0x2;
+        uchar a1x9  = a1x8 ^ a1;
+        uchar a1x11 = a1x8 ^ a1x2 ^ a1;
+        uchar a1x13 = a1x8 ^ a1x4 ^ a1;
+        uchar a1x14 = a1x8 ^ a1x4 ^ a1x2;
+        uchar a2x9  = a2x8 ^ a2;
+        uchar a2x11 = a2x8 ^ a2x2 ^ a2;
+        uchar a2x13 = a2x8 ^ a2x4 ^ a2;
+        uchar a2x14 = a2x8 ^ a2x4 ^ a2x2;
+        uchar a3x9  = a3x8 ^ a3;
+        uchar a3x11 = a3x8 ^ a3x2 ^ a3;
+        uchar a3x13 = a3x8 ^ a3x4 ^ a3;
+        uchar a3x14 = a3x8 ^ a3x4 ^ a3x2;
+
+        o[p + 0u] = a0x14 ^ a1x11 ^ a2x13 ^ a3x9;
+        o[p + 1u] = a0x9  ^ a1x14 ^ a2x11 ^ a3x13;
+        o[p + 2u] = a0x13 ^ a1x9  ^ a2x14 ^ a3x11;
+        o[p + 3u] = a0x11 ^ a1x13 ^ a2x9  ^ a3x14;
+    }
+
+    for (uint i = 0u; i < 16u; ++i) {
+        state[i] = o[i];
+    }
+    bn_aes_key_xor(state, k0, k1, k2, k3);
+}
+
+inline void bn_store_u64_le_p(__private uchar* p, ulong v) {
+    for (uint i = 0u; i < 8u; ++i) {
+        p[i] = (uchar)((v >> (i << 3)) & 0xffUL);
+    }
+}
+
+inline ulong bn_load_u64_le_p(__private const uchar* p) {
+    ulong v = 0UL;
+    for (uint i = 0u; i < 8u; ++i) {
+        v |= ((ulong)p[i]) << (i << 3);
+    }
+    return v;
+}
+
+inline void bn_rx_words_to_aes_state(
+    __private const ulong words[8],
+    __private uchar state[64]
+) {
+    for (uint i = 0u; i < 8u; ++i) {
+        bn_store_u64_le_p(state + (i << 3), words[i]);
+    }
+}
+
+inline void bn_rx_aes_state_to_words(
+    __private const uchar state[64],
+    __private ulong words[8]
+) {
+    for (uint i = 0u; i < 8u; ++i) {
+        words[i] = bn_load_u64_le_p(state + (i << 3));
+    }
+}
+
+inline void bn_rx_aes1_step(__private uchar state[64]) {
+    bn_aes_dec_round(state +  0u, BN_RX_AES1_KEYS[ 0], BN_RX_AES1_KEYS[ 1], BN_RX_AES1_KEYS[ 2], BN_RX_AES1_KEYS[ 3]);
+    bn_aes_enc_round(state + 16u, BN_RX_AES1_KEYS[ 4], BN_RX_AES1_KEYS[ 5], BN_RX_AES1_KEYS[ 6], BN_RX_AES1_KEYS[ 7]);
+    bn_aes_dec_round(state + 32u, BN_RX_AES1_KEYS[ 8], BN_RX_AES1_KEYS[ 9], BN_RX_AES1_KEYS[10], BN_RX_AES1_KEYS[11]);
+    bn_aes_enc_round(state + 48u, BN_RX_AES1_KEYS[12], BN_RX_AES1_KEYS[13], BN_RX_AES1_KEYS[14], BN_RX_AES1_KEYS[15]);
+}
+
+inline void bn_rx_aes4_step(__private uchar state[64]) {
+    for (uint r = 0u; r < 4u; ++r) {
+        uint a = r << 2;
+        uint b = (r + 4u) << 2;
+        bn_aes_dec_round(state +  0u, BN_RX_AES4_KEYS[a + 0u], BN_RX_AES4_KEYS[a + 1u], BN_RX_AES4_KEYS[a + 2u], BN_RX_AES4_KEYS[a + 3u]);
+        bn_aes_enc_round(state + 16u, BN_RX_AES4_KEYS[a + 0u], BN_RX_AES4_KEYS[a + 1u], BN_RX_AES4_KEYS[a + 2u], BN_RX_AES4_KEYS[a + 3u]);
+        bn_aes_dec_round(state + 32u, BN_RX_AES4_KEYS[b + 0u], BN_RX_AES4_KEYS[b + 1u], BN_RX_AES4_KEYS[b + 2u], BN_RX_AES4_KEYS[b + 3u]);
+        bn_aes_enc_round(state + 48u, BN_RX_AES4_KEYS[b + 0u], BN_RX_AES4_KEYS[b + 1u], BN_RX_AES4_KEYS[b + 2u], BN_RX_AES4_KEYS[b + 3u]);
+    }
+}
+
+inline void bn_rx_aes_hash_scratch(
+    __private const ulong scratch[BN_RX_PREDICT_SCRATCH_WORDS],
+    __private ulong outv[8]
+) {
+    uchar state[64];
+
+    for (uint lane = 0u; lane < 4u; ++lane) {
+        uint k = lane << 2;
+        for (uint w = 0u; w < 4u; ++w) {
+            uint kw = BN_RX_AES_HASH_STATE[k + w];
+            uint p = (lane << 4) + (w << 2);
+            state[p + 0u] = (uchar)(kw & 0xffu);
+            state[p + 1u] = (uchar)((kw >> 8) & 0xffu);
+            state[p + 2u] = (uchar)((kw >> 16) & 0xffu);
+            state[p + 3u] = (uchar)((kw >> 24) & 0xffu);
+        }
+    }
+
+    for (uint base = 0u; base < BN_RX_PREDICT_SCRATCH_WORDS; base += 8u) {
+        for (uint lane = 0u; lane < 4u; ++lane) {
+            ulong lo = scratch[base + (lane << 1) + 0u];
+            ulong hi = scratch[base + (lane << 1) + 1u];
+            uint k0 = (uint)lo;
+            uint k1 = (uint)(lo >> 32);
+            uint k2 = (uint)hi;
+            uint k3 = (uint)(hi >> 32);
+
+            if ((lane & 1u) == 0u) {
+                bn_aes_enc_round(state + (lane << 4), k0, k1, k2, k3);
+            } else {
+                bn_aes_dec_round(state + (lane << 4), k0, k1, k2, k3);
+            }
+        }
+    }
+
+    for (uint xr = 0u; xr < 2u; ++xr) {
+        uint k = xr << 2;
+        for (uint lane = 0u; lane < 4u; ++lane) {
+            if ((lane & 1u) == 0u) {
+                bn_aes_enc_round(
+                    state + (lane << 4),
+                    BN_RX_AES_HASH_XKEYS[k + 0u],
+                    BN_RX_AES_HASH_XKEYS[k + 1u],
+                    BN_RX_AES_HASH_XKEYS[k + 2u],
+                    BN_RX_AES_HASH_XKEYS[k + 3u]
+                );
+            } else {
+                bn_aes_dec_round(
+                    state + (lane << 4),
+                    BN_RX_AES_HASH_XKEYS[k + 0u],
+                    BN_RX_AES_HASH_XKEYS[k + 1u],
+                    BN_RX_AES_HASH_XKEYS[k + 2u],
+                    BN_RX_AES_HASH_XKEYS[k + 3u]
+                );
+            }
+        }
+    }
+
+    bn_rx_aes_state_to_words(state, outv);
+}
+
+// RandomX v1 opcode ceilings. The frequencies total exactly 256.
+#define BN_RX_CEIL_IADD_RS  16u
+#define BN_RX_CEIL_IADD_M   23u
+#define BN_RX_CEIL_ISUB_R   39u
+#define BN_RX_CEIL_ISUB_M   46u
+#define BN_RX_CEIL_IMUL_R   62u
+#define BN_RX_CEIL_IMUL_M   66u
+#define BN_RX_CEIL_IMULH_R  70u
+#define BN_RX_CEIL_IMULH_M  71u
+#define BN_RX_CEIL_ISMULH_R 75u
+#define BN_RX_CEIL_ISMULH_M 76u
+#define BN_RX_CEIL_IMUL_RCP 84u
+#define BN_RX_CEIL_INEG_R   86u
+#define BN_RX_CEIL_IXOR_R   101u
+#define BN_RX_CEIL_IXOR_M   106u
+#define BN_RX_CEIL_IROR_R   114u
+#define BN_RX_CEIL_IROL_R   116u
+#define BN_RX_CEIL_ISWAP_R  120u
+#define BN_RX_CEIL_FSWAP_R  124u
+#define BN_RX_CEIL_FADD_R   140u
+#define BN_RX_CEIL_FADD_M   145u
+#define BN_RX_CEIL_FSUB_R   161u
+#define BN_RX_CEIL_FSUB_M   166u
+#define BN_RX_CEIL_FSCAL_R  172u
+#define BN_RX_CEIL_FMUL_R   204u
+#define BN_RX_CEIL_FDIV_M   208u
+#define BN_RX_CEIL_FSQRT_R  214u
+#define BN_RX_CEIL_CBRANCH  239u
+#define BN_RX_CEIL_CFROUND  240u
+#define BN_RX_CEIL_ISTORE   256u
+
+inline ulong bn_smulh64(ulong a, ulong b) {
+    return (ulong)mul_hi((long)a, (long)b);
+}
+
+inline uint bn_is_zero_or_power_of_two_u32(uint x) {
+    return ((x & (x - 1u)) == 0u) ? 1u : 0u;
+}
+
+inline ulong bn_rx_reciprocal(uint divisor) {
+    if (divisor == 0u || bn_is_zero_or_power_of_two_u32(divisor) != 0u) {
+        return 0UL;
+    }
+
+    ulong d = (ulong)divisor;
+    ulong p2exp63 = BN_U64_C(0x8000000000000000);
+    ulong q = p2exp63 / d;
+    ulong r = p2exp63 % d;
+    uint shift = 32u - clz(divisor);
+    return (q << shift) + ((r << shift) / d);
+}
+
+inline ulong bn_rx_small_positive_float_bits(ulong entropy) {
+    ulong exponent = entropy >> 59;
+    ulong mantissa = entropy & BN_U64_C(0x000fffffffffffff);
+    exponent = (exponent + 1023UL) & 0x7ffUL;
+    return (exponent << 52) | mantissa;
+}
+
+inline ulong bn_rx_float_mask(ulong entropy) {
+    ulong exponent = BN_U64_C(0x300) | ((entropy >> 60) << 4);
+    return (entropy & BN_U64_C(0x3fffff)) | (exponent << 52);
+}
+
+inline ulong bn_rx_swap32_halves(ulong x) {
+    return (x << 32) | (x >> 32);
+}
+
+inline ulong bn_rx_fp_from_i32(uint x) {
+#if BN_RX_HAVE_FP64
+    return as_ulong((double)((int)x));
+#else
+    return bn_mix64((ulong)x ^ BN_U64_C(0x3ff0000000000000));
+#endif
+}
+
+inline ulong bn_rx_fp_e_from_i32(uint x, ulong e_mask) {
+#if BN_RX_HAVE_FP64
+    ulong bits = as_ulong((double)((int)x));
+    bits &= BN_U64_C(0x00ffffffffffffff);
+    bits |= e_mask;
+    return bits;
+#else
+    return (bn_mix64((ulong)x) & BN_U64_C(0x000fffffffffffff)) | e_mask;
+#endif
+}
+
+inline ulong bn_rx_fp_add(ulong a, ulong b) {
+#if BN_RX_HAVE_FP64
+    return as_ulong(as_double(a) + as_double(b));
+#else
+    return bn_mix64(a + bn_rotl64(b, 17u));
+#endif
+}
+
+inline ulong bn_rx_fp_sub(ulong a, ulong b) {
+#if BN_RX_HAVE_FP64
+    return as_ulong(as_double(a) - as_double(b));
+#else
+    return bn_mix64(a - bn_rotl64(b, 11u));
+#endif
+}
+
+inline ulong bn_rx_fp_mul(ulong a, ulong b) {
+#if BN_RX_HAVE_FP64
+    return as_ulong(as_double(a) * as_double(b));
+#else
+    return bn_mix64(a ^ bn_mulh64(a | 1UL, b | 1UL) ^ b);
+#endif
+}
+
+inline ulong bn_rx_fp_div(ulong a, ulong b) {
+#if BN_RX_HAVE_FP64
+    double d = as_double(b);
+    if (d == 0.0) {
+        d = 1.0;
+    }
+    return as_ulong(as_double(a) / d);
+#else
+    return bn_mix64(a ^ bn_rotr64(b | 1UL, 23u));
+#endif
+}
+
+inline ulong bn_rx_fp_sqrt(ulong a) {
+#if BN_RX_HAVE_FP64
+    double d = as_double(a);
+    if (d < 0.0) {
+        d = -d;
+    }
+    return as_ulong(sqrt(d));
+#else
+    return bn_mix64(a ^ (a >> 1));
+#endif
+}
+
+inline uint bn_rx_scratch_index(ulong byte_address, uint mod_mem, uint force_l3) {
+    uint words;
+
+    if (force_l3 != 0u) {
+        words = BN_RX_PREDICT_SCRATCH_WORDS;
+    } else if (mod_mem != 0u) {
+        words = BN_RX_PREDICT_SCRATCH_WORDS >> 3;
+    } else {
+        words = BN_RX_PREDICT_SCRATCH_WORDS >> 1;
+    }
+
+    return (uint)((byte_address >> 3) & (ulong)(words - 1u));
+}
+
+inline ulong bn_rx_scratch_load(
+    __private const ulong scratch[BN_RX_PREDICT_SCRATCH_WORDS],
+    ulong address_reg,
+    uint imm32,
+    uint mod_mem,
+    uint force_l3
+) {
+    ulong address = address_reg + (ulong)(long)(int)imm32;
+    return scratch[bn_rx_scratch_index(address, mod_mem, force_l3)];
+}
+
+inline void bn_rx_scratch_store(
+    __private ulong scratch[BN_RX_PREDICT_SCRATCH_WORDS],
+    ulong address_reg,
+    uint imm32,
+    uint mod_mem,
+    uint force_l3,
+    ulong value
+) {
+    ulong address = address_reg + (ulong)(long)(int)imm32;
+    scratch[bn_rx_scratch_index(address, mod_mem, force_l3)] = value;
+}
+
+inline void bn_rx_generate_program(
+    __private uchar aes_state[64],
+    __private ulong config[16],
+    __private ulong program[BN_RX_PREDICT_PROGRAM_SIZE]
+) {
+    ulong block[8];
+
+    for (uint base = 0u; base < 16u; base += 8u) {
+        bn_rx_aes4_step(aes_state);
+        bn_rx_aes_state_to_words(aes_state, block);
+        for (uint i = 0u; i < 8u; ++i) {
+            config[base + i] = block[i];
+        }
+    }
+
+    for (uint base = 0u; base < BN_RX_PREDICT_PROGRAM_SIZE; base += 8u) {
+        bn_rx_aes4_step(aes_state);
+        bn_rx_aes_state_to_words(aes_state, block);
+        for (uint i = 0u; i < 8u && base + i < BN_RX_PREDICT_PROGRAM_SIZE; ++i) {
+            program[base + i] = block[i];
+        }
+    }
+}
+
+inline void bn_rx_build_branch_targets(
+    __private const ulong program[BN_RX_PREDICT_PROGRAM_SIZE],
+    __private ushort branch_target[BN_RX_PREDICT_PROGRAM_SIZE]
+) {
+    ushort last_write[8];
+
+    for (uint r = 0u; r < 8u; ++r) {
+        last_write[r] = (ushort)0xffffu;
+    }
+
+    for (uint pc = 0u; pc < BN_RX_PREDICT_PROGRAM_SIZE; ++pc) {
+        ulong inst = program[pc];
+        uint opcode = (uint)(inst & 0xffUL);
+        uint dst = (uint)((inst >> 8) & 7UL);
+        uint src = (uint)((inst >> 16) & 7UL);
+        uint imm32 = (uint)(inst >> 32);
+
+        branch_target[pc] = (ushort)0xffffu;
+
+        if (opcode < BN_RX_CEIL_IROL_R) {
+            if (opcode >= BN_RX_CEIL_IMUL_RCP - 8u && opcode < BN_RX_CEIL_IMUL_RCP) {
+                if (bn_is_zero_or_power_of_two_u32(imm32) == 0u) {
+                    last_write[dst] = (ushort)pc;
+                }
+            } else {
+                last_write[dst] = (ushort)pc;
+            }
+        } else if (opcode < BN_RX_CEIL_ISWAP_R) {
+            if (src != dst) {
+                last_write[dst] = (ushort)pc;
+                last_write[src] = (ushort)pc;
+            }
+        } else if (opcode >= BN_RX_CEIL_FSQRT_R && opcode < BN_RX_CEIL_CBRANCH) {
+            branch_target[pc] = last_write[dst];
+            for (uint r = 0u; r < 8u; ++r) {
+                last_write[r] = (ushort)pc;
+            }
+        }
+    }
+}
+
+inline void bn_rx_execute_program(
+    __private const ulong program[BN_RX_PREDICT_PROGRAM_SIZE],
+    __private const ushort branch_target[BN_RX_PREDICT_PROGRAM_SIZE],
+    __private ulong r[8],
+    __private ulong f[8],
+    __private ulong e[8],
+    __private const ulong a[8],
+    __private const ulong e_mask[2],
+    __private ulong scratch[BN_RX_PREDICT_SCRATCH_WORDS],
+    __private uint* fprc
+) {
+    uint pc = 0u;
+    uint steps = 0u;
+
+    while (pc < BN_RX_PREDICT_PROGRAM_SIZE && steps < BN_RX_PREDICT_MAX_BRANCH_STEPS) {
+        ulong inst = program[pc];
+        uint opcode = (uint)(inst & 0xffUL);
+        uint dst = (uint)((inst >> 8) & 7UL);
+        uint src = (uint)((inst >> 16) & 7UL);
+        uint mod = (uint)((inst >> 24) & 0xffUL);
+        uint imm32 = (uint)(inst >> 32);
+        uint next_pc = pc + 1u;
+
+        if (opcode < BN_RX_CEIL_IADD_RS) {
+            uint shift = (mod >> 2) & 3u;
+            ulong displacement = (dst == 5u) ? (ulong)(long)(int)imm32 : 0UL;
+            r[dst] += (r[src] << shift) + displacement;
+        } else if (opcode < BN_RX_CEIL_IADD_M) {
+            r[dst] += bn_rx_scratch_load(scratch, (src == dst) ? 0UL : r[src], imm32, mod & 3u, (src == dst) ? 1u : 0u);
+        } else if (opcode < BN_RX_CEIL_ISUB_R) {
+            r[dst] -= (src == dst) ? (ulong)(long)(int)imm32 : r[src];
+        } else if (opcode < BN_RX_CEIL_ISUB_M) {
+            r[dst] -= bn_rx_scratch_load(scratch, (src == dst) ? 0UL : r[src], imm32, mod & 3u, (src == dst) ? 1u : 0u);
+        } else if (opcode < BN_RX_CEIL_IMUL_R) {
+            r[dst] *= (src == dst) ? (ulong)(long)(int)imm32 : r[src];
+        } else if (opcode < BN_RX_CEIL_IMUL_M) {
+            r[dst] *= bn_rx_scratch_load(scratch, (src == dst) ? 0UL : r[src], imm32, mod & 3u, (src == dst) ? 1u : 0u);
+        } else if (opcode < BN_RX_CEIL_IMULH_R) {
+            r[dst] = bn_mulh64(r[dst], r[src]);
+        } else if (opcode < BN_RX_CEIL_IMULH_M) {
+            r[dst] = bn_mulh64(r[dst], bn_rx_scratch_load(scratch, (src == dst) ? 0UL : r[src], imm32, mod & 3u, (src == dst) ? 1u : 0u));
+        } else if (opcode < BN_RX_CEIL_ISMULH_R) {
+            r[dst] = bn_smulh64(r[dst], r[src]);
+        } else if (opcode < BN_RX_CEIL_ISMULH_M) {
+            r[dst] = bn_smulh64(r[dst], bn_rx_scratch_load(scratch, (src == dst) ? 0UL : r[src], imm32, mod & 3u, (src == dst) ? 1u : 0u));
+        } else if (opcode < BN_RX_CEIL_IMUL_RCP) {
+            ulong reciprocal = bn_rx_reciprocal(imm32);
+            if (reciprocal != 0UL) {
+                r[dst] *= reciprocal;
+            }
+        } else if (opcode < BN_RX_CEIL_INEG_R) {
+            r[dst] = ~r[dst] + 1UL;
+        } else if (opcode < BN_RX_CEIL_IXOR_R) {
+            r[dst] ^= (src == dst) ? (ulong)(long)(int)imm32 : r[src];
+        } else if (opcode < BN_RX_CEIL_IXOR_M) {
+            r[dst] ^= bn_rx_scratch_load(scratch, (src == dst) ? 0UL : r[src], imm32, mod & 3u, (src == dst) ? 1u : 0u);
+        } else if (opcode < BN_RX_CEIL_IROR_R) {
+            ulong count = (src == dst) ? (ulong)imm32 : r[src];
+            r[dst] = bn_rotr64(r[dst], (uint)(count & 63UL));
+        } else if (opcode < BN_RX_CEIL_IROL_R) {
+            ulong count = (src == dst) ? (ulong)imm32 : r[src];
+            r[dst] = bn_rotl64(r[dst], (uint)(count & 63UL));
+        } else if (opcode < BN_RX_CEIL_ISWAP_R) {
+            if (src != dst) {
+                ulong tmp = r[dst];
+                r[dst] = r[src];
+                r[src] = tmp;
+            }
+        } else if (opcode < BN_RX_CEIL_FSWAP_R) {
+            uint reg = dst & 7u;
+            if (reg < 4u) {
+                uint q = reg << 1;
+                f[q + 0u] = bn_rx_swap32_halves(f[q + 0u]);
+                f[q + 1u] = bn_rx_swap32_halves(f[q + 1u]);
+            } else {
+                uint q = (reg - 4u) << 1;
+                e[q + 0u] = bn_rx_swap32_halves(e[q + 0u]);
+                e[q + 1u] = bn_rx_swap32_halves(e[q + 1u]);
+            }
+        } else if (opcode < BN_RX_CEIL_FADD_R) {
+            uint fd = (dst & 3u) << 1;
+            uint fs = (src & 3u) << 1;
+            f[fd + 0u] = bn_rx_fp_add(f[fd + 0u], a[fs + 0u]);
+            f[fd + 1u] = bn_rx_fp_add(f[fd + 1u], a[fs + 1u]);
+        } else if (opcode < BN_RX_CEIL_FADD_M) {
+            ulong qword = bn_rx_scratch_load(scratch, r[src], imm32, mod & 3u, 0u);
+            uint fd = (dst & 3u) << 1;
+            f[fd + 0u] = bn_rx_fp_add(f[fd + 0u], bn_rx_fp_from_i32((uint)qword));
+            f[fd + 1u] = bn_rx_fp_add(f[fd + 1u], bn_rx_fp_from_i32((uint)(qword >> 32)));
+        } else if (opcode < BN_RX_CEIL_FSUB_R) {
+            uint fd = (dst & 3u) << 1;
+            uint fs = (src & 3u) << 1;
+            f[fd + 0u] = bn_rx_fp_sub(f[fd + 0u], a[fs + 0u]);
+            f[fd + 1u] = bn_rx_fp_sub(f[fd + 1u], a[fs + 1u]);
+        } else if (opcode < BN_RX_CEIL_FSUB_M) {
+            ulong qword = bn_rx_scratch_load(scratch, r[src], imm32, mod & 3u, 0u);
+            uint fd = (dst & 3u) << 1;
+            f[fd + 0u] = bn_rx_fp_sub(f[fd + 0u], bn_rx_fp_from_i32((uint)qword));
+            f[fd + 1u] = bn_rx_fp_sub(f[fd + 1u], bn_rx_fp_from_i32((uint)(qword >> 32)));
+        } else if (opcode < BN_RX_CEIL_FSCAL_R) {
+            uint fd = (dst & 3u) << 1;
+            f[fd + 0u] ^= BN_U64_C(0x80f0000000000000);
+            f[fd + 1u] ^= BN_U64_C(0x80f0000000000000);
+        } else if (opcode < BN_RX_CEIL_FMUL_R) {
+            uint ed = (dst & 3u) << 1;
+            uint as = (src & 3u) << 1;
+            e[ed + 0u] = bn_rx_fp_mul(e[ed + 0u], a[as + 0u]);
+            e[ed + 1u] = bn_rx_fp_mul(e[ed + 1u], a[as + 1u]);
+        } else if (opcode < BN_RX_CEIL_FDIV_M) {
+            ulong qword = bn_rx_scratch_load(scratch, r[src], imm32, mod & 3u, 0u);
+            uint ed = (dst & 3u) << 1;
+            e[ed + 0u] = bn_rx_fp_div(e[ed + 0u], bn_rx_fp_e_from_i32((uint)qword, e_mask[0]));
+            e[ed + 1u] = bn_rx_fp_div(e[ed + 1u], bn_rx_fp_e_from_i32((uint)(qword >> 32), e_mask[1]));
+        } else if (opcode < BN_RX_CEIL_FSQRT_R) {
+            uint ed = (dst & 3u) << 1;
+            e[ed + 0u] = bn_rx_fp_sqrt(e[ed + 0u]);
+            e[ed + 1u] = bn_rx_fp_sqrt(e[ed + 1u]);
+        } else if (opcode < BN_RX_CEIL_CBRANCH) {
+            uint shift = (mod >> 4) + 8u;
+            ulong condition_mask = BN_U64_C(0xff) << shift;
+            ulong cimm = (ulong)(long)(int)imm32;
+            cimm |= 1UL << shift;
+            if (shift > 0u) {
+                cimm &= ~(1UL << (shift - 1u));
+            }
+            r[dst] += cimm;
+            if ((r[dst] & condition_mask) == 0UL) {
+                ushort target = branch_target[pc];
+                next_pc = (target == (ushort)0xffffu) ? 0u : (uint)target + 1u;
+            }
+        } else if (opcode < BN_RX_CEIL_CFROUND) {
+            *fprc = (uint)(bn_rotr64(r[src], imm32 & 63u) & 3UL);
+        } else {
+            uint force_l3 = ((mod >> 4) >= 14u) ? 1u : 0u;
+            bn_rx_scratch_store(scratch, r[dst], imm32, mod & 3u, force_l3, r[src]);
+        }
+
+        pc = next_pc;
+        ++steps;
+    }
+}
+
+inline void bn_rx_register_file(
+    __private const ulong r[8],
+    __private const ulong f[8],
+    __private const ulong e[8],
+    __private const ulong a_or_hash[8],
+    __private ulong words[32]
+) {
+    for (uint i = 0u; i < 8u; ++i) {
+        words[i +  0u] = r[i];
+        words[i +  8u] = f[i];
+        words[i + 16u] = e[i];
+        words[i + 24u] = a_or_hash[i];
+    }
+}
+
+/*
+ * ABI-compatible RandomX-structured predictor.
+ *
+ * This executes the same high-level stages and opcode distribution as RandomX,
+ * but with the bounded profile declared above. The full Dataset is consumed as
+ * aligned 64-byte items. The seed pointer is intentionally not hashed into H:
+ * in consensus RandomX the seed key influences the prebuilt Dataset, while
+ * Hash512(H) is calculated from the nonce-bearing blob alone.
+ */
 inline void bn_gpu_dataset_prefilter_hash_fast(
+    __global const uchar* blob,
+    uint blob_len,
+    uint nonce_offset,
+    uint nonce_u32,
+    __global const uchar* seed,
+    uint seed_len,
+    __global const ulong* dataset64,
+    uint dataset_words,
+    __private ulong outv[4]
+) {
+    if (
+        blob_len == 0u ||
+        blob_len > BN_MAX_BLOB_BYTES ||
+        nonce_offset > blob_len ||
+        (blob_len - nonce_offset) < 4u ||
+        dataset_words < 8u
+    ) {
+        outv[0] = 0UL;
+        outv[1] = 0UL;
+        outv[2] = 0UL;
+        outv[3] = ~0UL;
+        return;
+    }
+
+    (void)seed;
+    (void)seed_len;
+
+    ulong initial_seed[8];
+    uchar aes_state[64];
+    ulong aes_words[8];
+    ulong scratch[BN_RX_PREDICT_SCRATCH_WORDS];
+    ulong config[16];
+    ulong program[BN_RX_PREDICT_PROGRAM_SIZE];
+    ushort branch_target[BN_RX_PREDICT_PROGRAM_SIZE];
+    ulong r[8];
+    ulong f[8];
+    ulong e[8];
+    ulong a[8];
+    ulong e_mask[2];
+    ulong reg_file[32];
+    ulong chain_hash[8];
+    ulong scratch_hash[8];
+    uint fprc = 0u;
+    uint dataset_items = dataset_words >> 3;
+
+    bn_blake2b_overlay(
+        blob,
+        blob_len,
+        nonce_offset,
+        nonce_u32,
+        8u,
+        initial_seed
+    );
+    bn_rx_words_to_aes_state(initial_seed, aes_state);
+
+    /*
+     * AesGenerator1R scratchpad fill. The state after the final generated
+     * 64-byte line is reused as AesGenerator4R state, matching RandomX.
+     */
+    for (uint base = 0u; base < BN_RX_PREDICT_SCRATCH_WORDS; base += 8u) {
+        bn_rx_aes1_step(aes_state);
+        bn_rx_aes_state_to_words(aes_state, aes_words);
+        for (uint i = 0u; i < 8u; ++i) {
+            scratch[base + i] = aes_words[i];
+        }
+    }
+
+    for (uint i = 0u; i < 8u; ++i) {
+        r[i] = 0UL;
+        f[i] = 0UL;
+        e[i] = 0UL;
+        a[i] = 0UL;
+    }
+
+    for (uint program_index = 0u; program_index < BN_RX_PREDICT_PROGRAMS; ++program_index) {
+        bn_rx_generate_program(aes_state, config, program);
+        bn_rx_build_branch_targets(program, branch_target);
+
+        for (uint i = 0u; i < 8u; ++i) {
+            a[i] = bn_rx_small_positive_float_bits(config[i]);
+        }
+        e_mask[0] = bn_rx_float_mask(config[14]);
+        e_mask[1] = bn_rx_float_mask(config[15]);
+
+        uint ma = ((uint)config[8]) & ~63u;
+        uint mx = (uint)config[10];
+        ulong address_registers = config[12];
+        uint read_reg0 = 0u + (uint)(address_registers & 1UL);
+        address_registers >>= 1;
+        uint read_reg1 = 2u + (uint)(address_registers & 1UL);
+        address_registers >>= 1;
+        uint read_reg2 = 4u + (uint)(address_registers & 1UL);
+        address_registers >>= 1;
+        uint read_reg3 = 6u + (uint)(address_registers & 1UL);
+        uint dataset_offset_item = (uint)(config[13] % (ulong)dataset_items);
+
+        for (uint iteration = 0u; iteration < BN_RX_PREDICT_ITERATIONS; ++iteration) {
+            ulong sp_mix = r[read_reg0] ^ r[read_reg1];
+            uint sp_addr0 = (uint)((sp_mix >> 3) & (ulong)(BN_RX_PREDICT_SCRATCH_WORDS - 8u));
+            uint sp_addr1 = (uint)(((sp_mix >> 32) >> 3) & (ulong)(BN_RX_PREDICT_SCRATCH_WORDS - 8u));
+
+            for (uint i = 0u; i < 8u; ++i) {
+                r[i] ^= scratch[sp_addr0 + i];
+            }
+
+            for (uint i = 0u; i < 4u; ++i) {
+                ulong fq = scratch[sp_addr1 + i];
+                ulong eq = scratch[sp_addr1 + 4u + i];
+                uint p = i << 1;
+                f[p + 0u] = bn_rx_fp_from_i32((uint)fq);
+                f[p + 1u] = bn_rx_fp_from_i32((uint)(fq >> 32));
+                e[p + 0u] = bn_rx_fp_e_from_i32((uint)eq, e_mask[0]);
+                e[p + 1u] = bn_rx_fp_e_from_i32((uint)(eq >> 32), e_mask[1]);
+            }
+
+            bn_rx_execute_program(
+                program,
+                branch_target,
+                r,
+                f,
+                e,
+                a,
+                e_mask,
+                scratch,
+                &fprc
+            );
+
+            mx ^= (uint)r[read_reg2] ^ (uint)r[read_reg3];
+            mx &= ~63u;
+
+            ulong item_number =
+                (((ulong)ma >> 6) + (ulong)dataset_offset_item) %
+                (ulong)dataset_items;
+            uint dataset_base = (uint)(item_number << 3);
+
+            for (uint i = 0u; i < 8u; ++i) {
+                ulong next_r = r[i] ^ dataset64[dataset_base + i];
+                r[i] = next_r;
+                scratch[sp_addr1 + i] = next_r;
+                scratch[sp_addr0 + i] = f[i] ^ e[i];
+            }
+
+            uint tmp = ma;
+            ma = mx;
+            mx = tmp;
+        }
+
+        if (program_index + 1u < BN_RX_PREDICT_PROGRAMS) {
+            bn_rx_register_file(r, f, e, a, reg_file);
+            bn_blake2b_private_words(reg_file, 32u, 8u, chain_hash);
+            bn_rx_words_to_aes_state(chain_hash, aes_state);
+        }
+    }
+
+    bn_rx_aes_hash_scratch(scratch, scratch_hash);
+    bn_rx_register_file(r, f, e, scratch_hash, reg_file);
+    bn_blake2b_private_words(reg_file, 32u, 4u, chain_hash);
+
+    outv[0] = chain_hash[0];
+    outv[1] = chain_hash[1];
+    outv[2] = chain_hash[2];
+    outv[3] = chain_hash[3];
+}
+
+inline void bn_gpu_dataset_prefilter_hash_legacy(
     __global const uchar* blob,
     uint blob_len,
     uint nonce_offset,
