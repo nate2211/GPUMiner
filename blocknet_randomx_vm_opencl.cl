@@ -1,6 +1,6 @@
 /*
  * blocknet_randomx_fused_all_kernels.cl
- * RandomX-structured predictive OpenCL core with ABI-compatible wrappers.
+ * Throughput-first RandomX candidate OpenCL core with ABI-compatible wrappers.
  *
  * Included entry kernels:
  *   - blocknet_randomx_basic_hash          (simple per-work-item hash dump)
@@ -20,14 +20,15 @@
  * Notes:
  *   - This is OpenCL C. Do not include <CL/cl.h> inside this file.
  *   - Every public kernel name and argument list from the uploaded source is preserved.
- *   - The predictor now follows the RandomX data flow: BLAKE2b input seed, RandomX AES
- *     scratchpad/program generation, RandomX opcode frequencies, integer VM operations,
- *     aligned 64-byte Dataset reads, chained programs, scratchpad fingerprinting, and
- *     BLAKE2b finalization.
- *   - It deliberately uses bounded predictor constants so the existing ABI remains
- *     launchable without a separate 2 MiB mutable scratchpad allocation per hash.
- *     Therefore its 32-byte result is a predictor/ranking digest, NOT a consensus
- *     RandomX hash. CPU/native full-RandomX verification remains mandatory.
+ *   - The default path is deliberately register-light: BLAKE2b seed derivation, a
+ *     compact AES-generated scratch window, full aligned 64-byte Dataset reads,
+ *     RandomX-style integer/multiply-high/rotate mixing, and BLAKE2b finalization.
+ *   - Define BN_RX_USE_STRUCTURED_VM=1 at build time to select the slower bounded
+ *     VM interpreter retained below for experiments and predictor training.
+ *   - No kernel using the preserved ABI can hold RandomX's mandatory writable
+ *     2 MiB scratchpad per hash. The 32-byte output is therefore a candidate
+ *     ranking digest, NOT a consensus RandomX hash. Every returned nonce must be
+ *     checked with native/full RandomX before a share is submitted.
  */
 
 #pragma OPENCL EXTENSION cl_khr_byte_addressable_store : enable
@@ -62,6 +63,22 @@
 
 #ifndef BN_LOCAL_TOPK
 #define BN_LOCAL_TOPK 64u
+#endif
+
+#if BN_LOCAL_TOPK > BN_LOCAL_STAGE_SIZE
+#error "BN_LOCAL_TOPK must not exceed BN_LOCAL_STAGE_SIZE"
+#endif
+
+#ifndef BN_RX_USE_STRUCTURED_VM
+#define BN_RX_USE_STRUCTURED_VM 0
+#endif
+
+#ifndef BN_RX_FAST_DATASET_ROUNDS
+#define BN_RX_FAST_DATASET_ROUNDS 8u
+#endif
+
+#if BN_RX_FAST_DATASET_ROUNDS < 2u
+#error "BN_RX_FAST_DATASET_ROUNDS must be at least 2"
 #endif
 
 #ifndef BN_PREFILTER_ROUNDS_FAST
@@ -259,15 +276,22 @@ inline uint bn_tail_bin_from_tail(ulong tail64, uint tail_bins) {
     if (tail_bins <= 1u) {
         return 0u;
     }
-    uint bits = bn_log2_pow2(tail_bins);
-    uint shift = 64u - bits;
-    return (uint)(tail64 >> shift);
+
+    /*
+     * Division-free range reduction. Unlike the previous shift, this remains
+     * correct when the host supplies a non-power-of-two number of tail bins.
+     */
+    return (uint)mul_hi(tail64, (ulong)tail_bins);
 }
 
 inline uint bn_tune_bucket(ulong h0, ulong h1, uint nonce_u32) {
 #if BN_TUNE_WORDS > 0
     ulong key = bn_mix64(h0 ^ bn_rotl64(h1, 13u) ^ (ulong)nonce_u32);
+#if (BN_TUNE_WORDS & (BN_TUNE_WORDS - 1u)) == 0u
+    return (uint)key & (BN_TUNE_WORDS - 1u);
+#else
     return (uint)(key % (ulong)BN_TUNE_WORDS);
+#endif
 #else
     (void)h0;
     (void)h1;
@@ -505,6 +529,22 @@ inline ulong bn_blob_load_u64_overlay(
     uint nonce_u32,
     uint off
 ) {
+#if defined(__ENDIAN_LITTLE__)
+    uint nonce_end = nonce_offset + 4u;
+    if (
+        off <= blob_len &&
+        (blob_len - off) >= 8u &&
+        (off + 8u <= nonce_offset || off >= nonce_end)
+    ) {
+        /*
+         * Most BLAKE2b words do not intersect the nonce. A vector load avoids
+         * eight byte-wise bounds/overlay branches while remaining safe for
+         * unaligned blobs.
+         */
+        return as_ulong(vload8(0u, blob + off));
+    }
+#endif
+
     ulong v = 0UL;
     for (uint i = 0u; i < 8u; ++i) {
         uint ix = off + i;
@@ -532,26 +572,37 @@ inline ulong bn_dataset_read_mix_fast(
     uint dataset_words,
     ulong addr
 ) {
-    if (dataset_words == 0u) {
+    uint dataset_items = dataset_words >> 3;
+    if (dataset_items == 0u) {
         return 0UL;
     }
 
-    ulong a0 = addr ^ bn_rotl64(addr, 17u) ^ BN_U64_C(0x9E3779B97F4A7C15);
-    uint base0 = (uint)(a0 % (ulong)dataset_words);
-    uint base1 = (base0 + 8u + (uint)((addr >> 29) & 15UL)) % dataset_words;
+    /*
+     * RandomX consumes one naturally aligned 64-byte Dataset item per VM
+     * iteration. mul_hi maps a 64-bit selector into the item range without a
+     * costly integer divide, and the two vector loads give the device a single
+     * contiguous cache-line request.
+     */
+    ulong selector = bn_mix64(
+        addr ^ bn_rotl64(addr, 17u) ^ BN_U64_C(0x9E3779B97F4A7C15)
+    );
+    uint item = (uint)mul_hi(selector, (ulong)dataset_items);
+    uint base = item << 3;
+    __global const ulong* line = dataset64 + base;
+    ulong4 q0 = vload4(0u, line);
+    ulong4 q1 = vload4(0u, line + 4u);
 
-    ulong v0 = dataset64[(base0 + 0u) % dataset_words];
-    ulong v1 = dataset64[(base0 + 1u) % dataset_words];
-    ulong v2 = dataset64[(base0 + 2u) % dataset_words];
-    ulong v3 = dataset64[(base0 + 3u) % dataset_words];
-    ulong u0 = dataset64[(base1 + 0u) % dataset_words];
-    ulong u1 = dataset64[(base1 + 1u) % dataset_words];
+    ulong m0 = bn_mix64(q0.s0 ^ bn_rotl64(q0.s2, 11u) ^ addr);
+    ulong m1 = bn_mix64(q0.s1 ^ bn_rotr64(q0.s3, 13u) ^ bn_rotr64(addr, 7u));
+    ulong m2 = bn_mix64(q1.s0 ^ bn_rotl64(q1.s2, 19u) ^ bn_rotl64(addr, 23u));
+    ulong m3 = bn_mix64(q1.s1 ^ bn_rotr64(q1.s3, 17u) ^ selector);
 
-    ulong m0 = bn_mix64(v0 ^ bn_rotl64(v2, 11u) ^ addr);
-    ulong m1 = bn_mix64(v1 ^ bn_rotr64(v3, 13u) ^ bn_rotr64(addr, 7u));
-    ulong m2 = bn_mix64(u0 ^ bn_rotl64(u1, 19u) ^ bn_rotl64(addr, 23u));
-
-    return bn_avalanche64(m0 ^ bn_rotl64(m1, (uint)(addr & 31u)) ^ bn_rotr64(m2, (uint)((addr >> 37) & 31UL)));
+    return bn_avalanche64(
+        m0 ^
+        bn_rotl64(m1, (uint)(addr & 31u)) ^
+        bn_rotr64(m2, (uint)((addr >> 37) & 31UL)) ^
+        bn_rotl64(m3, 29u)
+    );
 }
 
 inline ulong bn_hash_balance_penalty(__private const ulong hv[4]) {
@@ -1609,7 +1660,7 @@ inline void bn_rx_register_file(
 }
 
 /*
- * ABI-compatible RandomX-structured predictor.
+ * ABI-compatible bounded RandomX VM predictor.
  *
  * This executes the same high-level stages and opcode distribution as RandomX,
  * but with the bounded profile declared above. The full Dataset is consumed as
@@ -1617,7 +1668,7 @@ inline void bn_rx_register_file(
  * in consensus RandomX the seed key influences the prebuilt Dataset, while
  * Hash512(H) is calculated from the nonce-bearing blob alone.
  */
-inline void bn_gpu_dataset_prefilter_hash_fast(
+inline void bn_gpu_dataset_prefilter_hash_structured(
     __global const uchar* blob,
     uint blob_len,
     uint nonce_offset,
@@ -1782,6 +1833,218 @@ inline void bn_gpu_dataset_prefilter_hash_fast(
     outv[3] = chain_hash[3];
 }
 
+/*
+ * Throughput predictor used by the public kernels by default.
+ *
+ * The former default interpreted a private random program for every lane. On
+ * GPUs that produces heavy control-flow divergence and typically spills the
+ * program, branch table, scratchpad, and register file to global memory. This
+ * path keeps the consensus-relevant outer shape while using a fixed,
+ * branch-light integer schedule. It consumes one complete 64-byte Dataset item
+ * per round and keeps only a 128-byte AES-generated scratch window per lane.
+ *
+ * As with the structured path, this is a ranking digest only. RandomX is
+ * intentionally unpredictable, so native verification—not predictor score—is
+ * the source of valid shares.
+ */
+inline void bn_rx_fast_dataset_round(
+    __global const ulong* dataset64,
+    uint dataset_items,
+    uint round,
+    __private ulong r[8],
+    __private ulong scratch[16]
+) {
+    uint sbase = (round & 1u) << 3;
+    uint read_reg = (round + 1u) & 7u;
+    ulong selector =
+        r[0] ^
+        bn_rotl64(r[read_reg], (round * 7u + 13u) & 63u) ^
+        scratch[sbase + ((round + 3u) & 7u)] ^
+        ((ulong)round * BN_U64_C(0x9E3779B97F4A7C15));
+
+    selector = bn_mix64(selector);
+    uint item = (uint)mul_hi(selector, (ulong)dataset_items);
+    __global const ulong* line = dataset64 + (item << 3);
+    ulong4 q0 = vload4(0u, line);
+    ulong4 q1 = vload4(0u, line + 4u);
+
+    ulong d0 = q0.s0;
+    ulong d1 = q0.s1;
+    ulong d2 = q0.s2;
+    ulong d3 = q0.s3;
+    ulong d4 = q1.s0;
+    ulong d5 = q1.s1;
+    ulong d6 = q1.s2;
+    ulong d7 = q1.s3;
+
+    ulong o0 = r[0];
+    ulong o1 = r[1];
+    ulong o2 = r[2];
+    ulong o3 = r[3];
+    ulong o4 = r[4];
+    ulong o5 = r[5];
+    ulong o6 = r[6];
+    ulong o7 = r[7];
+
+    ulong x0 = d0 ^ scratch[sbase + 0u];
+    ulong x1 = d1 ^ scratch[sbase + 1u];
+    ulong x2 = d2 ^ scratch[sbase + 2u];
+    ulong x3 = d3 ^ scratch[sbase + 3u];
+    ulong x4 = d4 ^ scratch[sbase + 4u];
+    ulong x5 = d5 ^ scratch[sbase + 5u];
+    ulong x6 = d6 ^ scratch[sbase + 6u];
+    ulong x7 = d7 ^ scratch[sbase + 7u];
+
+    ulong hi0 = bn_mulh64((o0 ^ x4) | 1UL, (o4 ^ x0) | 1UL);
+    ulong hi1 = bn_smulh64((o1 ^ x5) | 1UL, (o5 ^ x1) | 1UL);
+
+    r[0] = o0 + x0 + bn_rotl64(o5, 17u) + hi1;
+    r[1] = o1 ^ x1 ^ bn_rotr64(o6 + hi0, 11u);
+    r[2] = (o2 + x2) * ((x6 << 1) | 1UL);
+    r[3] = bn_rotl64(o3 ^ x3 ^ hi0, (uint)((x7 >> 58) + 1UL));
+    r[4] = o4 + x4 + bn_rotr64(o1, 23u) + hi0;
+    r[5] = o5 ^ x5 ^ bn_rotl64(o2 + hi1, 29u);
+    r[6] = bn_mulh64((o6 + x6) | 1UL, (o3 ^ x2) | 1UL) ^ o0;
+    r[7] = bn_rotr64(o7 + x7 + hi1, (uint)((x0 >> 57) + 1UL));
+
+    /*
+     * Read-modify-write both compact scratch lines. This mirrors the data
+     * dependency shape of RandomX's two implicit scratchpad cache-line stores
+     * without pretending the window is the consensus 2 MiB scratchpad.
+     */
+    scratch[sbase + 0u] = x0 ^ r[4];
+    scratch[sbase + 1u] = x1 + r[5];
+    scratch[sbase + 2u] = x2 ^ r[6];
+    scratch[sbase + 3u] = x3 + r[7];
+    scratch[sbase + 4u] = x4 ^ r[0];
+    scratch[sbase + 5u] = x5 + r[1];
+    scratch[sbase + 6u] = x6 ^ r[2];
+    scratch[sbase + 7u] = x7 + r[3];
+}
+
+inline void bn_gpu_dataset_prefilter_hash_throughput(
+    __global const uchar* blob,
+    uint blob_len,
+    uint nonce_offset,
+    uint nonce_u32,
+    __global const uchar* seed,
+    uint seed_len,
+    __global const ulong* dataset64,
+    uint dataset_words,
+    __private ulong outv[4]
+) {
+    uint dataset_items = dataset_words >> 3;
+    if (
+        blob_len == 0u ||
+        blob_len > BN_MAX_BLOB_BYTES ||
+        nonce_offset > blob_len ||
+        (blob_len - nonce_offset) < 4u ||
+        dataset_items == 0u
+    ) {
+        outv[0] = 0UL;
+        outv[1] = 0UL;
+        outv[2] = 0UL;
+        outv[3] = ~0UL;
+        return;
+    }
+
+    /*
+     * In RandomX the seed key has already been committed into Dataset
+     * construction. Re-reading it per nonce is redundant and wastes bandwidth.
+     */
+    (void)seed;
+    (void)seed_len;
+
+    ulong h[8];
+    uchar aes_state[64];
+    ulong scratch[16];
+    ulong r[8];
+
+    bn_blake2b_overlay(
+        blob,
+        blob_len,
+        nonce_offset,
+        nonce_u32,
+        8u,
+        h
+    );
+    bn_rx_words_to_aes_state(h, aes_state);
+
+    bn_rx_aes1_step(aes_state);
+    bn_rx_aes_state_to_words(aes_state, scratch + 0u);
+    bn_rx_aes1_step(aes_state);
+    bn_rx_aes_state_to_words(aes_state, scratch + 8u);
+
+    for (uint i = 0u; i < 8u; ++i) {
+        r[i] =
+            h[i] ^
+            scratch[i] ^
+            bn_rotl64(scratch[8u + i], (i * 7u + 5u) & 63u);
+    }
+
+    for (uint round = 0u; round < BN_RX_FAST_DATASET_ROUNDS; ++round) {
+        bn_rx_fast_dataset_round(
+            dataset64,
+            dataset_items,
+            round,
+            r,
+            scratch
+        );
+    }
+
+    for (uint i = 0u; i < 8u; ++i) {
+        ulong lo = scratch[i] ^ r[i];
+        ulong hi = scratch[8u + i] ^ r[(i + 3u) & 7u];
+        scratch[i] = bn_mix64(lo + bn_rotl64(hi, i + 1u));
+        scratch[8u + i] = bn_mix64(hi ^ bn_rotr64(lo, i + 9u));
+    }
+
+    /* h is dead after register initialization, so reuse it for finalization. */
+    bn_blake2b_private_words(scratch, 16u, 4u, h);
+    outv[0] = h[0];
+    outv[1] = h[1];
+    outv[2] = h[2];
+    outv[3] = h[3];
+}
+
+inline void bn_gpu_dataset_prefilter_hash_fast(
+    __global const uchar* blob,
+    uint blob_len,
+    uint nonce_offset,
+    uint nonce_u32,
+    __global const uchar* seed,
+    uint seed_len,
+    __global const ulong* dataset64,
+    uint dataset_words,
+    __private ulong outv[4]
+) {
+#if BN_RX_USE_STRUCTURED_VM
+    bn_gpu_dataset_prefilter_hash_structured(
+        blob,
+        blob_len,
+        nonce_offset,
+        nonce_u32,
+        seed,
+        seed_len,
+        dataset64,
+        dataset_words,
+        outv
+    );
+#else
+    bn_gpu_dataset_prefilter_hash_throughput(
+        blob,
+        blob_len,
+        nonce_offset,
+        nonce_u32,
+        seed,
+        seed_len,
+        dataset64,
+        dataset_words,
+        outv
+    );
+#endif
+}
+
 inline void bn_gpu_dataset_prefilter_hash_legacy(
     __global const uchar* blob,
     uint blob_len,
@@ -1921,31 +2184,25 @@ inline void bn_stage_candidate_local(
     __local uchar* l_class
 ) {
     if (lid < BN_LOCAL_STAGE_SIZE) {
-        if (stage_class != BN_STAGE_REJECT) {
-            l_score[lid] = rank_score;
-            l_nonce[lid] = nonce_u32;
-            l_h0[lid] = hv[0];
-            l_h1[lid] = hv[1];
-            l_h2[lid] = hv[2];
-            l_h3[lid] = hv[3];
-            l_bucket[lid] = tune_bucket;
-            l_rankq[lid] = (uchar)(rank_quality & 0xFFu);
-            l_threshq[lid] = (uchar)(threshold_quality & 0xFFu);
-            l_tailbin[lid] = (uchar)(tune_tail_bin & 0xFFu);
-            l_class[lid] = (uchar)(stage_class & 0xFFu);
-        } else {
-            l_score[lid] = ~0UL;
-            l_nonce[lid] = 0u;
-            l_h0[lid] = 0UL;
-            l_h1[lid] = 0UL;
-            l_h2[lid] = 0UL;
-            l_h3[lid] = ~0UL;
-            l_bucket[lid] = 0u;
-            l_rankq[lid] = (uchar)BN_TUNE_NEUTRAL;
-            l_threshq[lid] = (uchar)BN_TUNE_NEUTRAL;
-            l_tailbin[lid] = (uchar)0u;
-            l_class[lid] = (uchar)BN_STAGE_REJECT;
-        }
+        /*
+         * Keep every valid nonce available as verifier fallback. A bounded
+         * predictor cannot know a cryptographic RandomX result, so discarding
+         * every predictor miss can starve the only component that can produce
+         * real shares: the native verifier. Class priority still sends PASS and
+         * NEAR candidates first; low-pressure spare capacity is filled with
+         * ordinary candidates.
+         */
+        l_score[lid] = rank_score;
+        l_nonce[lid] = nonce_u32;
+        l_h0[lid] = hv[0];
+        l_h1[lid] = hv[1];
+        l_h2[lid] = hv[2];
+        l_h3[lid] = hv[3];
+        l_bucket[lid] = tune_bucket;
+        l_rankq[lid] = (uchar)(rank_quality & 0xFFu);
+        l_threshq[lid] = (uchar)(threshold_quality & 0xFFu);
+        l_tailbin[lid] = (uchar)(tune_tail_bin & 0xFFu);
+        l_class[lid] = (uchar)(stage_class & 0xFFu);
     }
 }
 
@@ -2099,6 +2356,42 @@ inline void bn_rank_and_stage(
     );
 }
 
+inline uint bn_reserve_output_slots(
+    volatile __global uint* out_count,
+    uint requested,
+    uint max_results,
+    __private uint* granted
+) {
+    *granted = 0u;
+    if (requested == 0u || max_results == 0u) {
+        return max_results;
+    }
+
+    uint observed = atomic_add(out_count, 0u);
+    while (observed < max_results) {
+        uint take = bn_min_u32(requested, max_results - observed);
+        uint desired = observed + take;
+        uint previous = atomic_cmpxchg(out_count, observed, desired);
+        if (previous == observed) {
+            *granted = take;
+            return observed;
+        }
+        observed = previous;
+    }
+
+    return max_results;
+}
+
+inline uint bn_stage_priority(uint stage_class) {
+    if (stage_class == BN_STAGE_PASS) {
+        return 0u;
+    }
+    if (stage_class == BN_STAGE_NEAR) {
+        return 1u;
+    }
+    return 2u;
+}
+
 inline void bn_flush_local_topk(
     uint lid,
     uint local_size,
@@ -2129,10 +2422,6 @@ inline void bn_flush_local_topk(
 ) {
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    if (lid != 0u) {
-        return;
-    }
-
     uint active = bn_min_u32(local_size, (uint)BN_LOCAL_STAGE_SIZE);
     uint effective_topk = bn_effective_local_topk(
         job_age_ms,
@@ -2140,170 +2429,107 @@ inline void bn_flush_local_topk(
         submit_pressure_q8,
         stale_risk_q8
     );
+    effective_topk = bn_min_u32(effective_topk, active);
     effective_topk = bn_min_u32(effective_topk, max_results);
 
-    uint near_limit = bn_effective_local_near_limit(
-        effective_topk,
-        job_age_ms,
-        verify_pressure_q8,
-        submit_pressure_q8,
-        stale_risk_q8
-    );
+    /*
+     * Snapshot this lane before lane 0 reuses two local entries to broadcast
+     * the bounded global reservation. Every lane participates in both barriers,
+     * including excess lanes when a host launches more than
+     * BN_LOCAL_STAGE_SIZE work-items.
+     */
+    ulong my_score = ~0UL;
+    uint my_nonce = 0u;
+    ulong my_h0 = 0UL;
+    ulong my_h1 = 0UL;
+    ulong my_h2 = 0UL;
+    ulong my_h3 = ~0UL;
+    uint my_bucket = 0u;
+    uchar my_rankq = (uchar)BN_TUNE_NEUTRAL;
+    uchar my_threshq = (uchar)BN_TUNE_NEUTRAL;
+    uchar my_tailbin = (uchar)0u;
+    uint my_class = BN_STAGE_REJECT;
 
-    uchar used[BN_LOCAL_STAGE_SIZE];
-    uint selected_ix[BN_LOCAL_TOPK];
-    uint chosen_bucket[BN_LOCAL_TOPK];
-    uchar chosen_tailbin[BN_LOCAL_TOPK];
-
-    for (uint i = 0u; i < active; ++i) {
-        used[i] = (uchar)0u;
+    if (lid < active) {
+        my_score = l_score[lid];
+        my_nonce = l_nonce[lid];
+        my_h0 = l_h0[lid];
+        my_h1 = l_h1[lid];
+        my_h2 = l_h2[lid];
+        my_h3 = l_h3[lid];
+        my_bucket = l_bucket[lid];
+        my_rankq = l_rankq[lid];
+        my_threshq = l_threshq[lid];
+        my_tailbin = l_tailbin[lid];
+        my_class = (uint)l_class[lid];
     }
 
-    uint selected_count = 0u;
-    uint near_picked = 0u;
-
-    while (selected_count < effective_topk) {
-        ulong best_score = ~0UL;
-        uint best_i = BN_LOCAL_STAGE_SIZE;
-
+    /*
+     * Parallel rank selection replaces the former serial O(N*K) leader sort.
+     * Each lane performs O(N) local-memory comparisons, so the whole wave
+     * advances together. Stage class dominates; score and lane ID provide a
+     * deterministic total ordering.
+     */
+    uint rank = 0u;
+    if (lid < active) {
+        uint my_priority = bn_stage_priority(my_class);
         for (uint i = 0u; i < active; ++i) {
-            if (used[i] != (uchar)0u) continue;
-            if ((uint)l_class[i] != BN_STAGE_PASS) continue;
-            if (l_score[i] == ~0UL) continue;
+            uint other_class = (uint)l_class[i];
+            uint other_priority = bn_stage_priority(other_class);
+            ulong other_score = l_score[i];
 
-            uint dup_cell = 0u;
-            for (uint j = 0u; j < selected_count; ++j) {
-                if (chosen_bucket[j] == l_bucket[i] && (uint)chosen_tailbin[j] == (uint)l_tailbin[i]) {
-                    dup_cell = 1u;
-                    break;
-                }
-            }
-            if (dup_cell != 0u) continue;
-
-            if (l_score[i] < best_score) {
-                best_score = l_score[i];
-                best_i = i;
-            }
-        }
-
-        if (best_i >= active || best_score == ~0UL) {
-            break;
-        }
-
-        used[best_i] = (uchar)1u;
-        selected_ix[selected_count] = best_i;
-        chosen_bucket[selected_count] = l_bucket[best_i];
-        chosen_tailbin[selected_count] = l_tailbin[best_i];
-        ++selected_count;
-    }
-
-    while (selected_count < effective_topk && near_picked < near_limit) {
-        ulong best_score = ~0UL;
-        uint best_i = BN_LOCAL_STAGE_SIZE;
-
-        for (uint i = 0u; i < active; ++i) {
-            if (used[i] != (uchar)0u) continue;
-            if ((uint)l_class[i] != BN_STAGE_NEAR) continue;
-            if (l_score[i] == ~0UL) continue;
-
-            uint dup_cell = 0u;
-            for (uint j = 0u; j < selected_count; ++j) {
-                if (chosen_bucket[j] == l_bucket[i] && (uint)chosen_tailbin[j] == (uint)l_tailbin[i]) {
-                    dup_cell = 1u;
-                    break;
-                }
-            }
-            if (dup_cell != 0u) continue;
-
-            if (l_score[i] < best_score) {
-                best_score = l_score[i];
-                best_i = i;
-            }
-        }
-
-        if (best_i >= active || best_score == ~0UL) {
-            break;
-        }
-
-        used[best_i] = (uchar)1u;
-        selected_ix[selected_count] = best_i;
-        chosen_bucket[selected_count] = l_bucket[best_i];
-        chosen_tailbin[selected_count] = l_tailbin[best_i];
-        ++selected_count;
-        ++near_picked;
-    }
-
-    while (selected_count < effective_topk) {
-        ulong best_adj_score = ~0UL;
-        uint best_i = BN_LOCAL_STAGE_SIZE;
-
-        for (uint i = 0u; i < active; ++i) {
-            if (used[i] != (uchar)0u) continue;
-            if ((uint)l_class[i] == BN_STAGE_REJECT) continue;
-            if (l_score[i] == ~0UL) continue;
-            if ((uint)l_class[i] == BN_STAGE_NEAR && near_picked >= near_limit) continue;
-
-            ulong adj = bn_add_penalty_sat(
-                l_score[i],
-                bn_local_pick_penalty(
-                    (uint)l_class[i],
-                    l_bucket[i],
-                    (uint)l_tailbin[i],
-                    chosen_bucket,
-                    chosen_tailbin,
-                    selected_count
+            if (
+                other_priority < my_priority ||
+                (
+                    other_priority == my_priority &&
+                    (
+                        other_score < my_score ||
+                        (other_score == my_score && i < lid)
+                    )
                 )
-            );
-
-            if (adj < best_adj_score) {
-                best_adj_score = adj;
-                best_i = i;
+            ) {
+                ++rank;
             }
         }
-
-        if (best_i >= active || best_adj_score == ~0UL) {
-            break;
-        }
-
-        used[best_i] = (uchar)1u;
-        selected_ix[selected_count] = best_i;
-        chosen_bucket[selected_count] = l_bucket[best_i];
-        chosen_tailbin[selected_count] = l_tailbin[best_i];
-
-        if ((uint)l_class[best_i] == BN_STAGE_NEAR) {
-            ++near_picked;
-        }
-        ++selected_count;
     }
 
-    if (selected_count == 0u) {
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (lid == 0u) {
+        uint granted = 0u;
+        uint base_slot = bn_reserve_output_slots(
+            (volatile __global uint*)out_count,
+            effective_topk,
+            max_results,
+            &granted
+        );
+        l_nonce[0] = base_slot;
+        l_bucket[0] = granted;
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    uint base_slot = l_nonce[0];
+    uint granted = l_bucket[0];
+    if (lid >= active || rank >= granted) {
         return;
     }
 
-    uint base_slot = atomic_add((volatile __global uint*)out_count, selected_count);
+    uint slot = base_slot + rank;
+    out_nonces[slot] = my_nonce;
+    out_scores[slot] = my_score;
+    out_buckets[slot] = my_bucket;
+    out_rankq[slot] = my_rankq;
+    out_threshq[slot] = my_threshq;
+    out_tailbin[slot] = my_tailbin;
 
-    for (uint k = 0u; k < selected_count; ++k) {
-        uint slot = base_slot + k;
-        if (slot >= max_results) {
-            break;
-        }
-
-        uint ix = selected_ix[k];
-        out_nonces[slot] = l_nonce[ix];
-        out_scores[slot] = l_score[ix];
-        out_buckets[slot] = l_bucket[ix];
-        out_rankq[slot] = l_rankq[ix];
-        out_threshq[slot] = l_threshq[ix];
-        out_tailbin[slot] = l_tailbin[ix];
-
-        bn_write_hash32(
-            out_hashes + (slot * BN_HASH_BYTES),
-            l_h0[ix],
-            l_h1[ix],
-            l_h2[ix],
-            l_h3[ix]
-        );
-    }
+    bn_write_hash32(
+        out_hashes + (slot * BN_HASH_BYTES),
+        my_h0,
+        my_h1,
+        my_h2,
+        my_h3
+    );
 }
 
 inline void bn_run_core(
@@ -2351,47 +2577,66 @@ inline void bn_run_core(
     const uint local_size = get_local_size(0);
     const uint nonce_u32 = start_nonce + (uint)get_global_id(0);
 
+    if (
+        blob_len == 0u ||
+        blob_len > BN_MAX_BLOB_BYTES ||
+        nonce_offset > blob_len ||
+        (blob_len - nonce_offset) < 4u ||
+        dataset_words < 8u ||
+        max_results == 0u
+    ) {
+        return;
+    }
+
     __private ulong hv[4];
 
-    bn_gpu_dataset_prefilter_hash_fast(
-        blob,
-        blob_len,
-        nonce_offset,
-        nonce_u32,
-        seed,
-        seed_len,
-        dataset64,
-        dataset_words,
-        hv
-    );
+    /*
+     * The ABI fixes local staging storage. Hosts should launch at most
+     * BN_LOCAL_STAGE_SIZE lanes per work-group; excess lanes still join the
+     * barriers below but skip the expensive hash instead of doing work that
+     * cannot be returned.
+     */
+    if (lid < BN_LOCAL_STAGE_SIZE) {
+        bn_gpu_dataset_prefilter_hash_fast(
+            blob,
+            blob_len,
+            nonce_offset,
+            nonce_u32,
+            seed,
+            seed_len,
+            dataset64,
+            dataset_words,
+            hv
+        );
 
-    bn_rank_and_stage(
-        lid,
-        nonce_u32,
-        hv,
-        target64,
-        seed_tune,
-        seed_tune_buckets,
-        seed_tune_tail_bins,
-        job_tune,
-        job_tune_buckets,
-        job_tune_tail_bins,
-        job_age_ms,
-        verify_pressure_q8,
-        submit_pressure_q8,
-        stale_risk_q8,
-        l_score,
-        l_nonce,
-        l_h0,
-        l_h1,
-        l_h2,
-        l_h3,
-        l_bucket,
-        l_rankq,
-        l_threshq,
-        l_tailbin,
-        l_class
-    );
+        bn_rank_and_stage(
+            lid,
+            nonce_u32,
+            hv,
+            target64,
+            seed_tune,
+            seed_tune_buckets,
+            seed_tune_tail_bins,
+            job_tune,
+            job_tune_buckets,
+            job_tune_tail_bins,
+            job_age_ms,
+            verify_pressure_q8,
+            submit_pressure_q8,
+            stale_risk_q8,
+            l_score,
+            l_nonce,
+            l_h0,
+            l_h1,
+            l_h2,
+            l_h3,
+            l_bucket,
+            l_rankq,
+            l_threshq,
+            l_tailbin,
+            l_class
+        );
+    }
 
     bn_flush_local_topk(
         lid,
@@ -2860,8 +3105,14 @@ __kernel void blocknet_randomx_basic_scan(
     );
 
     if (hv[3] <= target64) {
-        uint slot = atomic_add((volatile __global uint*)out_count, 1u);
-        if (slot < max_results) {
+        uint granted = 0u;
+        uint slot = bn_reserve_output_slots(
+            (volatile __global uint*)out_count,
+            1u,
+            max_results,
+            &granted
+        );
+        if (granted != 0u) {
             out_nonces[slot] = nonce_u32;
             bn_write_hash32(out_hashes + (slot * BN_HASH_BYTES), hv[0], hv[1], hv[2], hv[3]);
         }

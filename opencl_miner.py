@@ -69,6 +69,14 @@ class OpenCLGpuScanner:
     _PLANE_CREDIT = 2
     _PLANE_CONFIDENCE = 3
     _PLANE_COUNT = 4
+    _FULL_SCRATCHPAD_BYTES = 2 * 1024 * 1024
+    _FULL_SCRATCHPAD_WORDS = _FULL_SCRATCHPAD_BYTES // np.dtype(np.uint64).itemsize
+    _FULL_SCRATCH_KERNELS = frozenset(
+        {
+            "blocknet_randomx_vm_scan_fullscratch_ext",
+            "blocknet_randomx_vm_hash_batch_fullscratch_ext",
+        }
+    )
 
     def __init__(self, config: MinerConfig, on_log: Callable[[str], None]) -> None:
         self.config = config
@@ -83,6 +91,14 @@ class OpenCLGpuScanner:
         self.dataset_buf: Optional[cl.Buffer] = None
         self.dataset_words: int = 0
         self.dataset_fingerprint: Optional[bytes] = None
+
+        # OpenCL cannot provide a 2 MiB private/local array per work-item.
+        # The host owns one global-memory slice for every hash in a launch.
+        self._scratchpad_buf: Optional[cl.Buffer] = None
+        self._scratchpad_capacity: int = 0
+        self._scratchpad_stride_words: int = self._FULL_SCRATCHPAD_WORDS
+        self._full_scratch_enabled: bool = False
+        self._active_kernel_entry: str = ""
 
         self._seed_tune_buf: Optional[cl.Buffer] = None
         self._job_tune_buf: Optional[cl.Buffer] = None
@@ -192,11 +208,26 @@ class OpenCLGpuScanner:
         self.queue = cl.CommandQueue(self.ctx, device=device)
         self.program = self._build_program(self.ctx, self.config.kernel_path, self.config.build_options)
 
+        entry = self._selected_kernel_entry()
         try:
-            entry = self._selected_kernel_entry()
             self.kernel = getattr(self.program, entry)
         except AttributeError as exc:
-            raise RuntimeError(f"Kernel entry not found: {self._selected_kernel_entry()}") from exc
+            if entry in self._FULL_SCRATCH_KERNELS:
+                fallback_entry = self._fallback_kernel_entry()
+                try:
+                    self.kernel = getattr(self.program, fallback_entry)
+                except AttributeError:
+                    raise RuntimeError(f"Kernel entry not found: {entry}") from exc
+                self.on_log(
+                    f"[opencl] full-scratch kernel {entry} is unavailable; "
+                    f"using compatible kernel {fallback_entry}"
+                )
+                entry = fallback_entry
+            else:
+                raise RuntimeError(f"Kernel entry not found: {entry}") from exc
+
+        self._active_kernel_entry = entry
+        self._full_scratch_enabled = entry in self._FULL_SCRATCH_KERNELS
 
         self._effective_local_work_size = self._choose_local_work_size()
         self._ensure_tune_buffers()
@@ -204,13 +235,14 @@ class OpenCLGpuScanner:
         self.on_log(f"[opencl] using {platform.name.strip()} / {device.name.strip()}")
         self.on_log(
             f"[opencl] mode={self._scan_mode()} "
-            f"kernel={self._selected_kernel_entry()} "
+            f"kernel={self._active_kernel_entry} "
             f"window={self.config.active_scan_window()} "
             f"lws={self._effective_local_work_size or 'auto'} "
             f"max_results={self.config.max_results} "
             f"buckets={self._bucket_count} "
             f"tail_bins={self._tail_bins} "
             f"local_stage_size={self._local_stage_size} "
+            f"scratchpad={'2 MiB/hash' if self._full_scratch_enabled else 'compat'} "
             f"planes=rank+threshold+credit+confidence"
         )
 
@@ -234,6 +266,13 @@ class OpenCLGpuScanner:
         ):
             self.on_log("[opencl] RandomX dataset already bound for current seed")
             return
+
+        # Release the old arena before allocating a second Dataset copy. It is
+        # recreated lazily with a capacity that fits the new Dataset footprint.
+        with self._cl_lock:
+            self._release_buffer(self._scratchpad_buf)
+            self._scratchpad_buf = None
+            self._scratchpad_capacity = 0
 
         mf = cl.mem_flags
         old_buf = self.dataset_buf
@@ -297,6 +336,10 @@ class OpenCLGpuScanner:
             self.dataset_words = 0
             self.dataset_fingerprint = None
 
+            self._release_buffer(self._scratchpad_buf)
+            self._scratchpad_buf = None
+            self._scratchpad_capacity = 0
+
             self._release_buffer(self._seed_tune_buf)
             self._seed_tune_buf = None
             self._release_buffer(self._job_tune_buf)
@@ -340,6 +383,8 @@ class OpenCLGpuScanner:
             self._out_count_np = None
 
             self._effective_local_work_size = None
+            self._full_scratch_enabled = False
+            self._active_kernel_entry = ""
             self._reset_tune_state(self._seed_tune)
             self._reset_tune_state(self._job_tune)
             self._current_job_key = None
@@ -397,13 +442,31 @@ class OpenCLGpuScanner:
     def _scan_mode(self) -> str:
         return self.config.normalized_scan_mode()
 
-    def _selected_kernel_entry(self) -> str:
-        configured = str(getattr(self.config, "kernel_entry", "") or "").strip()
-        if configured and self.config.normalized_hash_engine() != "virtualasic":
-            return configured
+    def _full_scratch_requested(self) -> bool:
+        return bool(getattr(self.config, "enable_full_scratchpad", True))
+
+    def _fallback_kernel_entry(self) -> str:
         if self._scan_mode() == "hash_batch":
             return "blocknet_randomx_vm_hash_batch_ext"
         return "blocknet_randomx_vm_scan_ext"
+
+    def _selected_kernel_entry(self) -> str:
+        configured = str(getattr(self.config, "kernel_entry", "") or "").strip()
+        if configured and self.config.normalized_hash_engine() != "virtualasic":
+            if self._full_scratch_requested():
+                legacy_upgrade = {
+                    "blocknet_randomx_vm_scan_ext":
+                        "blocknet_randomx_vm_scan_fullscratch_ext",
+                    "blocknet_randomx_vm_hash_batch_ext":
+                        "blocknet_randomx_vm_hash_batch_fullscratch_ext",
+                }
+                return legacy_upgrade.get(configured, configured)
+            return configured
+        if self._full_scratch_requested():
+            if self._scan_mode() == "hash_batch":
+                return "blocknet_randomx_vm_hash_batch_fullscratch_ext"
+            return "blocknet_randomx_vm_scan_fullscratch_ext"
+        return self._fallback_kernel_entry()
 
     def _is_full_target(self, target_hex: str) -> bool:
         raw = safe_bytes_from_hex(target_hex)
@@ -517,6 +580,116 @@ class OpenCLGpuScanner:
 
         requested = max(1, min(int(requested), int(self._local_stage_size)))
         return requested
+
+    def _switch_to_compat_kernel_unlocked(self, reason: str) -> None:
+        if not self._full_scratch_enabled:
+            return
+        if self.program is None:
+            raise RuntimeError("OpenCL program is not initialized")
+
+        fallback_entry = self._fallback_kernel_entry()
+        try:
+            fallback_kernel = getattr(self.program, fallback_entry)
+        except AttributeError as exc:
+            raise RuntimeError(f"Kernel entry not found: {fallback_entry}") from exc
+
+        self._release_buffer(self._scratchpad_buf)
+        self._scratchpad_buf = None
+        self._scratchpad_capacity = 0
+        self.kernel = fallback_kernel
+        self._active_kernel_entry = fallback_entry
+        self._full_scratch_enabled = False
+        self._effective_local_work_size = self._choose_local_work_size()
+        self.on_log(
+            f"[opencl] full 2 MiB/hash scratchpad disabled ({reason}); "
+            f"using {fallback_entry}"
+        )
+
+    def _full_scratch_capacity_limit(self, requested_work_items: int) -> int:
+        requested = max(1, int(requested_work_items))
+        configured = max(
+            0,
+            int(getattr(self.config, "full_scratchpad_hash_capacity", 0) or 0),
+        )
+        desired = configured or max(1, int(self._effective_local_work_size or 64))
+        capacity = min(requested, desired)
+
+        max_mib = max(
+            0,
+            int(getattr(self.config, "full_scratchpad_max_mib", 512) or 0),
+        )
+        if max_mib > 0:
+            capacity = min(
+                capacity,
+                (max_mib * 1024 * 1024) // self._FULL_SCRATCHPAD_BYTES,
+            )
+
+        if self.device is not None:
+            try:
+                max_alloc = int(getattr(self.device, "max_mem_alloc_size", 0) or 0)
+                if max_alloc > 0:
+                    capacity = min(capacity, max_alloc // self._FULL_SCRATCHPAD_BYTES)
+            except Exception:
+                pass
+
+            try:
+                global_mem = int(getattr(self.device, "global_mem_size", 0) or 0)
+                reserve_mib = max(
+                    0,
+                    int(getattr(self.config, "full_scratchpad_reserve_mib", 512) or 0),
+                )
+                reserved = reserve_mib * 1024 * 1024
+                dataset_bytes = max(0, int(self.dataset_words)) * np.dtype(np.uint64).itemsize
+                available = global_mem - dataset_bytes - reserved
+                if global_mem > 0:
+                    capacity = min(
+                        capacity,
+                        max(0, available // self._FULL_SCRATCHPAD_BYTES),
+                    )
+            except Exception:
+                pass
+
+        return max(0, int(capacity))
+
+    def _ensure_full_scratchpad_unlocked(self, requested_work_items: int) -> int:
+        requested = max(1, int(requested_work_items))
+        if not self._full_scratch_enabled:
+            return requested
+        if self.ctx is None:
+            raise RuntimeError("OpenCL scanner not initialized")
+
+        capacity = self._full_scratch_capacity_limit(requested)
+        if capacity <= 0:
+            self._switch_to_compat_kernel_unlocked("insufficient device memory")
+            return requested
+
+        if self._scratchpad_buf is not None and self._scratchpad_capacity >= capacity:
+            return self._scratchpad_capacity
+
+        allocation_bytes = capacity * self._FULL_SCRATCHPAD_BYTES
+        try:
+            new_buf = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, allocation_bytes)
+        except Exception:
+            if self._scratchpad_buf is not None and self._scratchpad_capacity > 0:
+                self.on_log(
+                    f"[opencl] retaining existing full scratchpad capacity="
+                    f"{self._scratchpad_capacity} hashes after growth failed"
+                )
+                return self._scratchpad_capacity
+            self._switch_to_compat_kernel_unlocked("VRAM allocation failed")
+            return requested
+
+        old_buf = self._scratchpad_buf
+        self._scratchpad_buf = new_buf
+        self._scratchpad_capacity = capacity
+        self._release_buffer(old_buf)
+
+        self.on_log(
+            f"[opencl] full RandomX scratchpad arena ready: "
+            f"capacity={capacity} hashes, stride={self._FULL_SCRATCHPAD_BYTES // (1024 * 1024)} MiB, "
+            f"total={allocation_bytes / (1024 * 1024):.0f} MiB"
+        )
+        return capacity
 
     def _ensure_tune_buffers(self) -> None:
         if self.ctx is None or self.queue is None:
@@ -942,10 +1115,7 @@ class OpenCLGpuScanner:
         self._upload_tuning_unlocked(force=False)
         self._reset_out_count()
 
-        evt = self.kernel(
-            self.queue,
-            (int(work_items),),
-            self._launch_local_size(int(work_items)),
+        kernel_args = [
             self._blob_buf,
             np.uint32(len(blob)),
             np.uint32(self.config.nonce_offset),
@@ -974,6 +1144,29 @@ class OpenCLGpuScanner:
             np.uint32(max(0, min(255, int(verify_pressure_q8)))),
             np.uint32(max(0, min(255, int(submit_pressure_q8)))),
             np.uint32(max(0, min(255, int(stale_risk_q8)))),
+        ]
+
+        if self._full_scratch_enabled:
+            if self._scratchpad_buf is None or self._scratchpad_capacity <= 0:
+                raise RuntimeError("Full RandomX scratchpad arena is not initialized")
+            if int(work_items) > self._scratchpad_capacity:
+                raise RuntimeError(
+                    f"OpenCL launch requires {work_items} scratchpad slices, "
+                    f"but capacity is {self._scratchpad_capacity}"
+                )
+            kernel_args.extend(
+                [
+                    self._scratchpad_buf,
+                    np.uint32(self._scratchpad_stride_words),
+                    np.uint32(self._scratchpad_capacity),
+                ]
+            )
+
+        evt = self.kernel(
+            self.queue,
+            (int(work_items),),
+            self._launch_local_size(int(work_items)),
+            *kernel_args,
         )
         evt.wait()
 
@@ -1108,6 +1301,11 @@ class OpenCLGpuScanner:
         with self._cl_lock:
             self._ensure_job_buffers(blob, seed)
             self._ensure_output_buffers(max_results)
+            scratch_capacity = self._ensure_full_scratchpad_unlocked(
+                min(total_work, chunk_size)
+            )
+            if self._full_scratch_enabled:
+                chunk_size = min(chunk_size, scratch_capacity)
 
             while scanned < total_work:
                 remaining = total_work - scanned
@@ -1217,33 +1415,46 @@ class OpenCLGpuScanner:
             int(work_items_override or getattr(self.config, "hash_batch_size", self.config.global_work_size)),
         )
 
+        candidates: list[CandidateShare] = []
+        scanned = 0
+        chunk_count = 0
+
         with self._cl_lock:
             self._ensure_job_buffers(blob, seed)
             self._ensure_output_buffers(max_results)
+            launch_capacity = self._ensure_full_scratchpad_unlocked(work_items)
 
-            candidates, _raw_count = self._run_one_launch_unlocked(
-                job=job,
-                start_nonce=int(start_nonce),
-                blob=blob,
-                seed=seed,
-                target64=target64,
-                work_items=work_items,
-                max_results=max_results,
-                job_age_ms=job_age_ms,
-                verify_pressure_q8=verify_pressure_q8,
-                submit_pressure_q8=submit_pressure_q8,
-                stale_risk_q8=stale_risk_q8,
-            )
+            while scanned < work_items:
+                remaining = work_items - scanned
+                this_launch = min(remaining, launch_capacity)
+                launch_candidates, _raw_count = self._run_one_launch_unlocked(
+                    job=job,
+                    start_nonce=(int(start_nonce) + scanned) & 0xFFFFFFFF,
+                    blob=blob,
+                    seed=seed,
+                    target64=target64,
+                    work_items=int(this_launch),
+                    max_results=max_results,
+                    job_age_ms=job_age_ms,
+                    verify_pressure_q8=verify_pressure_q8,
+                    submit_pressure_q8=submit_pressure_q8,
+                    stale_risk_q8=stale_risk_q8,
+                )
+                candidates.extend(launch_candidates)
+                self._trim_candidates_unlocked(candidates, candidate_target)
+                scanned += int(this_launch)
+                chunk_count += 1
 
             self._trim_candidates_unlocked(candidates, candidate_target)
             self._upload_tuning_unlocked(force=False)
             self.queue.finish()
 
-        self.last_scan_work_items = int(work_items)
-        self.last_scan_chunk_count = 1
+        self.last_scan_work_items = int(scanned)
+        self.last_scan_chunk_count = int(chunk_count)
 
         self.on_log(
-            f"[opencl] hash_batch job={job.job_id} work_items={work_items} kept={len(candidates)} "
+            f"[opencl] hash_batch job={job.job_id} work_items={scanned} "
+            f"launches={chunk_count} kept={len(candidates)} "
             f"full_target={1 if full_target else 0} "
             f"job_age_ms={job_age_ms} verify_q8={verify_pressure_q8} "
             f"submit_q8={submit_pressure_q8} stale_q8={stale_risk_q8}"
