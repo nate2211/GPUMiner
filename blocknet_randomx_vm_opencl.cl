@@ -16,22 +16,45 @@
  *   - blocknet_randomx_vm_hash_batch_ext   (original ext wrapper, ulong target)
  *   - blocknet_randomx_vm_scan_vasic       (original vasic wrapper, target lo/hi)
  *   - blocknet_randomx_vm_hash_batch_vasic (original vasic wrapper, target lo/hi)
+ *   - blocknet_randomx_vm_scan_fullscratch_ext (2 MiB/hash consensus-oriented path)
+ *   - blocknet_randomx_vm_hash_batch_fullscratch_ext (2 MiB/hash batch path)
  *
  * Notes:
  *   - This is OpenCL C. Do not include <CL/cl.h> inside this file.
  *   - Every public kernel name and argument list from the uploaded source is preserved.
- *   - The default path is deliberately register-light: BLAKE2b seed derivation, a
- *     compact AES-generated scratch window, full aligned 64-byte Dataset reads,
- *     RandomX-style integer/multiply-high/rotate mixing, and BLAKE2b finalization.
- *   - Define BN_RX_USE_STRUCTURED_VM=1 at build time to select the slower bounded
- *     VM interpreter retained below for experiments and predictor training.
- *   - No kernel using the preserved ABI can hold RandomX's mandatory writable
- *     2 MiB scratchpad per hash. The 32-byte output is therefore a candidate
- *     ranking digest, NOT a consensus RandomX hash. Every returned nonce must be
- *     checked with native/full RandomX before a share is submitted.
+ *   - The default path now selects the bounded structured VM: BLAKE2b seed
+ *     derivation, AesGenerator1R scratch initialization, AesGenerator4R program
+ *     generation, RandomX v1 opcode frequencies, chained programs, aligned
+ *     64-byte Dataset reads, implicit scratch loads/stores, and final AES/Blake2b.
+ *   - Define BN_RX_USE_STRUCTURED_VM=0 only when the older branch-light ranking
+ *     predictor is explicitly preferred over VM fidelity.
+ *   - The original public ABIs remain predictor/compatibility paths. The two
+ *     fullscratch entry points append a host-owned 2 MiB/hash global arena and
+ *     run the fixed 256-instruction, 2048-iteration, 8-program profile.
+ *   - OpenCL floating-point behavior and device compiler differences can still
+ *     prevent bit-for-bit consensus. Native RandomX verification remains
+ *     mandatory before a share is submitted.
  */
 
 #pragma OPENCL EXTENSION cl_khr_byte_addressable_store : enable
+
+#define BN_CANDIDATE_FIX_V2 1
+#define BN_CANDIDATE_FAST_V3 1
+
+/*
+ * Candidate-fast v3 is deliberately a nomination kernel, not a consensus
+ * RandomX implementation. It performs a compact blob/seed/Dataset fingerprint,
+ * selects one low-score nonce per work-group, and relies on the native RandomX
+ * verifier for the authoritative hash and target test. Never submit these
+ * predictor rows without native verification.
+ */
+#ifndef BN_FAST_CANDIDATE_DATASET_ROUNDS
+#define BN_FAST_CANDIDATE_DATASET_ROUNDS 2u
+#endif
+
+#if BN_FAST_CANDIDATE_DATASET_ROUNDS < 1u || BN_FAST_CANDIDATE_DATASET_ROUNDS > 8u
+#error "BN_FAST_CANDIDATE_DATASET_ROUNDS must be in [1, 8]"
+#endif
 
 #ifndef BN_HASH_BYTES
 #define BN_HASH_BYTES 32u
@@ -70,7 +93,7 @@
 #endif
 
 #ifndef BN_RX_USE_STRUCTURED_VM
-#define BN_RX_USE_STRUCTURED_VM 0
+#define BN_RX_USE_STRUCTURED_VM 1
 #endif
 
 #ifndef BN_RX_FAST_DATASET_ROUNDS
@@ -106,19 +129,19 @@
  * smaller than the mandatory RandomX L3 scratchpad.
  */
 #ifndef BN_RX_PREDICT_SCRATCH_WORDS
-#define BN_RX_PREDICT_SCRATCH_WORDS 64u
+#define BN_RX_PREDICT_SCRATCH_WORDS 256u
 #endif
 
 #ifndef BN_RX_PREDICT_PROGRAM_SIZE
-#define BN_RX_PREDICT_PROGRAM_SIZE 32u
+#define BN_RX_PREDICT_PROGRAM_SIZE 256u
 #endif
 
 #ifndef BN_RX_PREDICT_ITERATIONS
-#define BN_RX_PREDICT_ITERATIONS 8u
+#define BN_RX_PREDICT_ITERATIONS 128u
 #endif
 
 #ifndef BN_RX_PREDICT_PROGRAMS
-#define BN_RX_PREDICT_PROGRAMS 2u
+#define BN_RX_PREDICT_PROGRAMS 4u
 #endif
 
 #ifndef BN_RX_PREDICT_MAX_BRANCH_STEPS
@@ -147,6 +170,60 @@
 
 #if BN_RX_PREDICT_PROGRAMS < 1u || BN_RX_PREDICT_PROGRAMS > 8u
 #error "BN_RX_PREDICT_PROGRAMS must be in [1, 8]"
+#endif
+
+
+/*
+ * Consensus RandomX address geometry. The preserved ABI has no writable
+ * per-hash scratchpad pointer, so the structured kernel keeps a bounded private
+ * backing store while preserving the real 16 KiB / 256 KiB / 2 MiB virtual
+ * address masks. High virtual address bits are folded into the private window
+ * instead of being discarded.
+ */
+#define BN_RX_VIRTUAL_L1_BYTES 16384u
+#define BN_RX_VIRTUAL_L2_BYTES 262144u
+#define BN_RX_VIRTUAL_L3_BYTES 2097152u
+#define BN_RX_VIRTUAL_L1_MASK  (BN_RX_VIRTUAL_L1_BYTES - 8u)
+#define BN_RX_VIRTUAL_L2_MASK  (BN_RX_VIRTUAL_L2_BYTES - 8u)
+#define BN_RX_VIRTUAL_L3_MASK  (BN_RX_VIRTUAL_L3_BYTES - 8u)
+#define BN_RX_VIRTUAL_L3_LINE_MASK (BN_RX_VIRTUAL_L3_BYTES - 64u)
+#define BN_RX_DATASET_BASE_ITEMS 33554432u
+#define BN_RX_DATASET_EXTRA_ITEMS 524287u
+#define BN_RX_DATASET_TOTAL_ITEMS (BN_RX_DATASET_BASE_ITEMS + BN_RX_DATASET_EXTRA_ITEMS)
+#define BN_RX_DATASET_TOTAL_WORDS (BN_RX_DATASET_TOTAL_ITEMS * 8u)
+
+/*
+ * Full-scratch, consensus-oriented profile. These constants are intentionally
+ * not build-time tunables: changing them changes RandomX semantics.
+ */
+#define BN_RX_FULL_SCRATCH_BYTES 2097152u
+#define BN_RX_FULL_SCRATCH_WORDS 262144u
+#define BN_RX_FULL_PROGRAM_SIZE 256u
+#define BN_RX_FULL_PROGRAM_ITERATIONS 2048u
+#define BN_RX_FULL_PROGRAM_COUNT 8u
+#define BN_RX_FULL_MAX_BRANCH_STEPS (BN_RX_FULL_PROGRAM_SIZE * 4u)
+
+#ifndef BN_RX_ENABLE_FULLSCRATCH
+#define BN_RX_ENABLE_FULLSCRATCH 1
+#endif
+
+#ifndef BN_RX_EMULATE_CFROUND
+#define BN_RX_EMULATE_CFROUND 1
+#endif
+
+/*
+ * Full-scratch verifier-probe cadence. An exact GPU prefilter hit is always
+ * emitted. In addition, one deterministic nonce out of 2^N is emitted so the
+ * native verifier cannot be starved by target-format mistakes or small GPU/CPU
+ * implementation differences. N=10 yields about 88 probes in a 90,619 nonce
+ * window. Set N=0 to emit every nonce or N=32 to disable probe rows.
+ */
+#ifndef BN_RX_FULL_CANDIDATE_PROBE_SHIFT
+#define BN_RX_FULL_CANDIDATE_PROBE_SHIFT 10u
+#endif
+
+#if BN_RX_FULL_CANDIDATE_PROBE_SHIFT > 32u
+#error "BN_RX_FULL_CANDIDATE_PROBE_SHIFT must be in [0, 32]"
 #endif
 
 #if defined(cl_khr_fp64)
@@ -1352,66 +1429,105 @@ inline ulong bn_rx_fp_e_from_i32(uint x, ulong e_mask) {
 #endif
 }
 
-inline ulong bn_rx_fp_add(ulong a, ulong b) {
-#if BN_RX_HAVE_FP64
-    return as_ulong(as_double(a) + as_double(b));
+inline ulong bn_rx_fp_round_adjust(ulong bits, uint fprc) {
+#if BN_RX_HAVE_FP64 && BN_RX_EMULATE_CFROUND
+    double x = as_double(bits);
+    if (fprc == 0u || x == 0.0 || isnan(x) || isinf(x)) {
+        return bits;
+    }
+    if (fprc == 1u) {
+        return as_ulong(nextafter(x, as_double(BN_U64_C(0xfff0000000000000))));
+    }
+    if (fprc == 2u) {
+        return as_ulong(nextafter(x, as_double(BN_U64_C(0x7ff0000000000000))));
+    }
+    return as_ulong(nextafter(x, 0.0));
 #else
+    (void)fprc;
+    return bits;
+#endif
+}
+
+inline ulong bn_rx_fp_add(ulong a, ulong b, uint fprc) {
+#if BN_RX_HAVE_FP64
+    return bn_rx_fp_round_adjust(as_ulong(as_double(a) + as_double(b)), fprc);
+#else
+    (void)fprc;
     return bn_mix64(a + bn_rotl64(b, 17u));
 #endif
 }
 
-inline ulong bn_rx_fp_sub(ulong a, ulong b) {
+inline ulong bn_rx_fp_sub(ulong a, ulong b, uint fprc) {
 #if BN_RX_HAVE_FP64
-    return as_ulong(as_double(a) - as_double(b));
+    return bn_rx_fp_round_adjust(as_ulong(as_double(a) - as_double(b)), fprc);
 #else
+    (void)fprc;
     return bn_mix64(a - bn_rotl64(b, 11u));
 #endif
 }
 
-inline ulong bn_rx_fp_mul(ulong a, ulong b) {
+inline ulong bn_rx_fp_mul(ulong a, ulong b, uint fprc) {
 #if BN_RX_HAVE_FP64
-    return as_ulong(as_double(a) * as_double(b));
+    return bn_rx_fp_round_adjust(as_ulong(as_double(a) * as_double(b)), fprc);
 #else
+    (void)fprc;
     return bn_mix64(a ^ bn_mulh64(a | 1UL, b | 1UL) ^ b);
 #endif
 }
 
-inline ulong bn_rx_fp_div(ulong a, ulong b) {
+inline ulong bn_rx_fp_div(ulong a, ulong b, uint fprc) {
 #if BN_RX_HAVE_FP64
     double d = as_double(b);
     if (d == 0.0) {
         d = 1.0;
     }
-    return as_ulong(as_double(a) / d);
+    return bn_rx_fp_round_adjust(as_ulong(as_double(a) / d), fprc);
 #else
+    (void)fprc;
     return bn_mix64(a ^ bn_rotr64(b | 1UL, 23u));
 #endif
 }
 
-inline ulong bn_rx_fp_sqrt(ulong a) {
+inline ulong bn_rx_fp_sqrt(ulong a, uint fprc) {
 #if BN_RX_HAVE_FP64
     double d = as_double(a);
     if (d < 0.0) {
         d = -d;
     }
-    return as_ulong(sqrt(d));
+    return bn_rx_fp_round_adjust(as_ulong(sqrt(d)), fprc);
 #else
+    (void)fprc;
     return bn_mix64(a ^ (a >> 1));
 #endif
 }
 
-inline uint bn_rx_scratch_index(ulong byte_address, uint mod_mem, uint force_l3) {
-    uint words;
-
-    if (force_l3 != 0u) {
-        words = BN_RX_PREDICT_SCRATCH_WORDS;
-    } else if (mod_mem != 0u) {
-        words = BN_RX_PREDICT_SCRATCH_WORDS >> 3;
-    } else {
-        words = BN_RX_PREDICT_SCRATCH_WORDS >> 1;
+inline uint bn_rx_fold_virtual_word(uint virtual_word) {
+    const uint physical_mask = BN_RX_PREDICT_SCRATCH_WORDS - 1u;
+    const uint physical_bits = bn_log2_pow2(BN_RX_PREDICT_SCRATCH_WORDS);
+    uint x = virtual_word;
+    x ^= x >> physical_bits;
+    if ((physical_bits << 1) < 32u) {
+        x ^= x >> (physical_bits << 1);
     }
+    return x & physical_mask;
+}
 
-    return (uint)((byte_address >> 3) & (ulong)(words - 1u));
+inline uint bn_rx_virtual_mem_mask(uint mod_mem, uint force_l3) {
+    if (force_l3 != 0u) {
+        return BN_RX_VIRTUAL_L3_MASK;
+    }
+    return (mod_mem != 0u) ? BN_RX_VIRTUAL_L1_MASK : BN_RX_VIRTUAL_L2_MASK;
+}
+
+inline uint bn_rx_scratch_index(ulong byte_address, uint mod_mem, uint force_l3) {
+    uint virtual_byte = (uint)byte_address & bn_rx_virtual_mem_mask(mod_mem, force_l3);
+    return bn_rx_fold_virtual_word(virtual_byte >> 3);
+}
+
+inline uint bn_rx_scratch_line_base(uint virtual_byte_address) {
+    uint virtual_word = (virtual_byte_address & BN_RX_VIRTUAL_L3_LINE_MASK) >> 3;
+    uint base = bn_rx_fold_virtual_word(virtual_word);
+    return base & (BN_RX_PREDICT_SCRATCH_WORDS - 8u);
 }
 
 inline ulong bn_rx_scratch_load(
@@ -1481,7 +1597,7 @@ inline void bn_rx_build_branch_targets(
         branch_target[pc] = (ushort)0xffffu;
 
         if (opcode < BN_RX_CEIL_IROL_R) {
-            if (opcode >= BN_RX_CEIL_IMUL_RCP - 8u && opcode < BN_RX_CEIL_IMUL_RCP) {
+            if (opcode >= (BN_RX_CEIL_IMUL_RCP - 8u) && opcode < BN_RX_CEIL_IMUL_RCP) {
                 if (bn_is_zero_or_power_of_two_u32(imm32) == 0u) {
                     last_write[dst] = (ushort)pc;
                 }
@@ -1489,6 +1605,10 @@ inline void bn_rx_build_branch_targets(
                 last_write[dst] = (ushort)pc;
             }
         } else if (opcode < BN_RX_CEIL_ISWAP_R) {
+            /* IROL_R writes only dst. */
+            last_write[dst] = (ushort)pc;
+        } else if (opcode < BN_RX_CEIL_FSWAP_R) {
+            /* ISWAP_R writes both integer registers unless it compiles to NOP. */
             if (src != dst) {
                 last_write[dst] = (ushort)pc;
                 last_write[src] = (ushort)pc;
@@ -1584,23 +1704,23 @@ inline void bn_rx_execute_program(
         } else if (opcode < BN_RX_CEIL_FADD_R) {
             uint fd = (dst & 3u) << 1;
             uint fs = (src & 3u) << 1;
-            f[fd + 0u] = bn_rx_fp_add(f[fd + 0u], a[fs + 0u]);
-            f[fd + 1u] = bn_rx_fp_add(f[fd + 1u], a[fs + 1u]);
+            f[fd + 0u] = bn_rx_fp_add(f[fd + 0u], a[fs + 0u], *fprc);
+            f[fd + 1u] = bn_rx_fp_add(f[fd + 1u], a[fs + 1u], *fprc);
         } else if (opcode < BN_RX_CEIL_FADD_M) {
             ulong qword = bn_rx_scratch_load(scratch, r[src], imm32, mod & 3u, 0u);
             uint fd = (dst & 3u) << 1;
-            f[fd + 0u] = bn_rx_fp_add(f[fd + 0u], bn_rx_fp_from_i32((uint)qword));
-            f[fd + 1u] = bn_rx_fp_add(f[fd + 1u], bn_rx_fp_from_i32((uint)(qword >> 32)));
+            f[fd + 0u] = bn_rx_fp_add(f[fd + 0u], bn_rx_fp_from_i32((uint)qword), *fprc);
+            f[fd + 1u] = bn_rx_fp_add(f[fd + 1u], bn_rx_fp_from_i32((uint)(qword >> 32)), *fprc);
         } else if (opcode < BN_RX_CEIL_FSUB_R) {
             uint fd = (dst & 3u) << 1;
             uint fs = (src & 3u) << 1;
-            f[fd + 0u] = bn_rx_fp_sub(f[fd + 0u], a[fs + 0u]);
-            f[fd + 1u] = bn_rx_fp_sub(f[fd + 1u], a[fs + 1u]);
+            f[fd + 0u] = bn_rx_fp_sub(f[fd + 0u], a[fs + 0u], *fprc);
+            f[fd + 1u] = bn_rx_fp_sub(f[fd + 1u], a[fs + 1u], *fprc);
         } else if (opcode < BN_RX_CEIL_FSUB_M) {
             ulong qword = bn_rx_scratch_load(scratch, r[src], imm32, mod & 3u, 0u);
             uint fd = (dst & 3u) << 1;
-            f[fd + 0u] = bn_rx_fp_sub(f[fd + 0u], bn_rx_fp_from_i32((uint)qword));
-            f[fd + 1u] = bn_rx_fp_sub(f[fd + 1u], bn_rx_fp_from_i32((uint)(qword >> 32)));
+            f[fd + 0u] = bn_rx_fp_sub(f[fd + 0u], bn_rx_fp_from_i32((uint)qword), *fprc);
+            f[fd + 1u] = bn_rx_fp_sub(f[fd + 1u], bn_rx_fp_from_i32((uint)(qword >> 32)), *fprc);
         } else if (opcode < BN_RX_CEIL_FSCAL_R) {
             uint fd = (dst & 3u) << 1;
             f[fd + 0u] ^= BN_U64_C(0x80f0000000000000);
@@ -1608,17 +1728,17 @@ inline void bn_rx_execute_program(
         } else if (opcode < BN_RX_CEIL_FMUL_R) {
             uint ed = (dst & 3u) << 1;
             uint as = (src & 3u) << 1;
-            e[ed + 0u] = bn_rx_fp_mul(e[ed + 0u], a[as + 0u]);
-            e[ed + 1u] = bn_rx_fp_mul(e[ed + 1u], a[as + 1u]);
+            e[ed + 0u] = bn_rx_fp_mul(e[ed + 0u], a[as + 0u], *fprc);
+            e[ed + 1u] = bn_rx_fp_mul(e[ed + 1u], a[as + 1u], *fprc);
         } else if (opcode < BN_RX_CEIL_FDIV_M) {
             ulong qword = bn_rx_scratch_load(scratch, r[src], imm32, mod & 3u, 0u);
             uint ed = (dst & 3u) << 1;
-            e[ed + 0u] = bn_rx_fp_div(e[ed + 0u], bn_rx_fp_e_from_i32((uint)qword, e_mask[0]));
-            e[ed + 1u] = bn_rx_fp_div(e[ed + 1u], bn_rx_fp_e_from_i32((uint)(qword >> 32), e_mask[1]));
+            e[ed + 0u] = bn_rx_fp_div(e[ed + 0u], bn_rx_fp_e_from_i32((uint)qword, e_mask[0]), *fprc);
+            e[ed + 1u] = bn_rx_fp_div(e[ed + 1u], bn_rx_fp_e_from_i32((uint)(qword >> 32), e_mask[1]), *fprc);
         } else if (opcode < BN_RX_CEIL_FSQRT_R) {
             uint ed = (dst & 3u) << 1;
-            e[ed + 0u] = bn_rx_fp_sqrt(e[ed + 0u]);
-            e[ed + 1u] = bn_rx_fp_sqrt(e[ed + 1u]);
+            e[ed + 0u] = bn_rx_fp_sqrt(e[ed + 0u], *fprc);
+            e[ed + 1u] = bn_rx_fp_sqrt(e[ed + 1u], *fprc);
         } else if (opcode < BN_RX_CEIL_CBRANCH) {
             uint shift = (mod >> 4) + 8u;
             ulong condition_mask = BN_U64_C(0xff) << shift;
@@ -1668,6 +1788,10 @@ inline void bn_rx_register_file(
  * in consensus RandomX the seed key influences the prebuilt Dataset, while
  * Hash512(H) is calculated from the nonce-bearing blob alone.
  */
+inline uint bn_rx_floor_pow2_u32(uint x) {
+    return (x == 0u) ? 0u : (1u << (31u - clz(x)));
+}
+
 inline void bn_gpu_dataset_prefilter_hash_structured(
     __global const uchar* blob,
     uint blob_len,
@@ -1693,6 +1817,7 @@ inline void bn_gpu_dataset_prefilter_hash_structured(
         return;
     }
 
+    /* The key is already committed into a correctly built RandomX Dataset. */
     (void)seed;
     (void)seed_len;
 
@@ -1713,6 +1838,9 @@ inline void bn_gpu_dataset_prefilter_hash_structured(
     ulong scratch_hash[8];
     uint fprc = 0u;
     uint dataset_items = dataset_words >> 3;
+    uint dataset_base_items = bn_min_u32(BN_RX_DATASET_BASE_ITEMS, bn_rx_floor_pow2_u32(dataset_items));
+    uint dataset_extra_items = dataset_items - dataset_base_items;
+    uint dataset_base_line_mask = (dataset_base_items << 6) - 64u;
 
     bn_blake2b_overlay(
         blob,
@@ -1724,10 +1852,6 @@ inline void bn_gpu_dataset_prefilter_hash_structured(
     );
     bn_rx_words_to_aes_state(initial_seed, aes_state);
 
-    /*
-     * AesGenerator1R scratchpad fill. The state after the final generated
-     * 64-byte line is reused as AesGenerator4R state, matching RandomX.
-     */
     for (uint base = 0u; base < BN_RX_PREDICT_SCRATCH_WORDS; base += 8u) {
         bn_rx_aes1_step(aes_state);
         bn_rx_aes_state_to_words(aes_state, aes_words);
@@ -1753,7 +1877,7 @@ inline void bn_gpu_dataset_prefilter_hash_structured(
         e_mask[0] = bn_rx_float_mask(config[14]);
         e_mask[1] = bn_rx_float_mask(config[15]);
 
-        uint ma = ((uint)config[8]) & ~63u;
+        uint ma = ((uint)config[8]) & dataset_base_line_mask;
         uint mx = (uint)config[10];
         ulong address_registers = config[12];
         uint read_reg0 = 0u + (uint)(address_registers & 1UL);
@@ -1763,12 +1887,19 @@ inline void bn_gpu_dataset_prefilter_hash_structured(
         uint read_reg2 = 4u + (uint)(address_registers & 1UL);
         address_registers >>= 1;
         uint read_reg3 = 6u + (uint)(address_registers & 1UL);
-        uint dataset_offset_item = (uint)(config[13] % (ulong)dataset_items);
+        uint dataset_offset_item = (uint)(config[13] % ((ulong)dataset_extra_items + 1UL));
+        uint sp_addr0_virtual = mx & BN_RX_VIRTUAL_L3_LINE_MASK;
+        uint sp_addr1_virtual = ma & BN_RX_VIRTUAL_L3_LINE_MASK;
 
         for (uint iteration = 0u; iteration < BN_RX_PREDICT_ITERATIONS; ++iteration) {
             ulong sp_mix = r[read_reg0] ^ r[read_reg1];
-            uint sp_addr0 = (uint)((sp_mix >> 3) & (ulong)(BN_RX_PREDICT_SCRATCH_WORDS - 8u));
-            uint sp_addr1 = (uint)(((sp_mix >> 32) >> 3) & (ulong)(BN_RX_PREDICT_SCRATCH_WORDS - 8u));
+            sp_addr0_virtual ^= (uint)sp_mix;
+            sp_addr0_virtual &= BN_RX_VIRTUAL_L3_LINE_MASK;
+            sp_addr1_virtual ^= (uint)(sp_mix >> 32);
+            sp_addr1_virtual &= BN_RX_VIRTUAL_L3_LINE_MASK;
+
+            uint sp_addr0 = bn_rx_scratch_line_base(sp_addr0_virtual);
+            uint sp_addr1 = bn_rx_scratch_line_base(sp_addr1_virtual);
 
             for (uint i = 0u; i < 8u; ++i) {
                 r[i] ^= scratch[sp_addr0 + i];
@@ -1796,24 +1927,25 @@ inline void bn_gpu_dataset_prefilter_hash_structured(
                 &fprc
             );
 
+            uint dataset_item = ((ma & dataset_base_line_mask) >> 6) + dataset_offset_item;
             mx ^= (uint)r[read_reg2] ^ (uint)r[read_reg3];
-            mx &= ~63u;
 
-            ulong item_number =
-                (((ulong)ma >> 6) + (ulong)dataset_offset_item) %
-                (ulong)dataset_items;
-            uint dataset_base = (uint)(item_number << 3);
+            uint dataset_base = dataset_item << 3;
+            for (uint i = 0u; i < 8u; ++i) {
+                r[i] ^= dataset64[dataset_base + i];
+                scratch[sp_addr1 + i] = r[i];
+            }
 
             for (uint i = 0u; i < 8u; ++i) {
-                ulong next_r = r[i] ^ dataset64[dataset_base + i];
-                r[i] = next_r;
-                scratch[sp_addr1 + i] = next_r;
-                scratch[sp_addr0 + i] = f[i] ^ e[i];
+                f[i] ^= e[i];
+                scratch[sp_addr0 + i] = f[i];
             }
 
             uint tmp = ma;
             ma = mx;
             mx = tmp;
+            sp_addr0_virtual = 0u;
+            sp_addr1_virtual = 0u;
         }
 
         if (program_index + 1u < BN_RX_PREDICT_PROGRAMS) {
@@ -1834,7 +1966,7 @@ inline void bn_gpu_dataset_prefilter_hash_structured(
 }
 
 /*
- * Throughput predictor used by the public kernels by default.
+ * Optional throughput predictor selected only when BN_RX_USE_STRUCTURED_VM=0.
  *
  * The former default interpreted a private random program for every lane. On
  * GPUs that produces heavy control-flow divergence and typically spills the
@@ -2159,6 +2291,499 @@ inline void bn_gpu_dataset_prefilter_hash_legacy(
     outv[1] = bn_avalanche64(f1 ^ s2 ^ bn_rotr64(f3, 7u));
     outv[2] = bn_avalanche64(f2 ^ s3 ^ bn_rotl64(f0, 13u));
     outv[3] = bn_avalanche64(f3 ^ s0 ^ bn_rotr64(f1, 17u));
+}
+
+
+// ============================================================
+// FULL 2 MiB/HASH RANDOMX-ORIENTED VM
+// ============================================================
+
+inline uint bn_rx_full_mem_mask(uint mod_mem, uint force_l3) {
+    if (force_l3 != 0u) {
+        return BN_RX_VIRTUAL_L3_MASK;
+    }
+    return (mod_mem != 0u) ? BN_RX_VIRTUAL_L1_MASK : BN_RX_VIRTUAL_L2_MASK;
+}
+
+inline uint bn_rx_full_scratch_index(ulong byte_address, uint mod_mem, uint force_l3) {
+    return (((uint)byte_address) & bn_rx_full_mem_mask(mod_mem, force_l3)) >> 3;
+}
+
+inline uint bn_rx_full_scratch_line_index(uint byte_address) {
+    return (byte_address & BN_RX_VIRTUAL_L3_LINE_MASK) >> 3;
+}
+
+inline ulong bn_rx_full_scratch_load(
+    __global const ulong* scratch,
+    ulong address_reg,
+    uint imm32,
+    uint mod_mem,
+    uint force_l3
+) {
+    ulong address = address_reg + (ulong)(long)(int)imm32;
+    return scratch[bn_rx_full_scratch_index(address, mod_mem, force_l3)];
+}
+
+inline void bn_rx_full_scratch_store(
+    __global ulong* scratch,
+    ulong address_reg,
+    uint imm32,
+    uint mod_mem,
+    uint force_l3,
+    ulong value
+) {
+    ulong address = address_reg + (ulong)(long)(int)imm32;
+    scratch[bn_rx_full_scratch_index(address, mod_mem, force_l3)] = value;
+}
+
+inline void bn_rx_fill_scratch_global(
+    __private uchar aes_state[64],
+    __global ulong* scratch
+) {
+    ulong words[8];
+    for (uint base = 0u; base < BN_RX_FULL_SCRATCH_WORDS; base += 8u) {
+        bn_rx_aes1_step(aes_state);
+        bn_rx_aes_state_to_words(aes_state, words);
+        for (uint i = 0u; i < 8u; ++i) {
+            scratch[base + i] = words[i];
+        }
+    }
+}
+
+inline void bn_rx_aes_hash_scratch_global(
+    __global const ulong* scratch,
+    __private ulong outv[8]
+) {
+    uchar state[64];
+
+    for (uint lane = 0u; lane < 4u; ++lane) {
+        uint k = lane << 2;
+        for (uint w = 0u; w < 4u; ++w) {
+            uint kw = BN_RX_AES_HASH_STATE[k + w];
+            uint p = (lane << 4) + (w << 2);
+            state[p + 0u] = (uchar)(kw & 0xffu);
+            state[p + 1u] = (uchar)((kw >> 8) & 0xffu);
+            state[p + 2u] = (uchar)((kw >> 16) & 0xffu);
+            state[p + 3u] = (uchar)((kw >> 24) & 0xffu);
+        }
+    }
+
+    for (uint base = 0u; base < BN_RX_FULL_SCRATCH_WORDS; base += 8u) {
+        for (uint lane = 0u; lane < 4u; ++lane) {
+            ulong lo = scratch[base + (lane << 1) + 0u];
+            ulong hi = scratch[base + (lane << 1) + 1u];
+            uint k0 = (uint)lo;
+            uint k1 = (uint)(lo >> 32);
+            uint k2 = (uint)hi;
+            uint k3 = (uint)(hi >> 32);
+            if ((lane & 1u) == 0u) {
+                bn_aes_enc_round(state + (lane << 4), k0, k1, k2, k3);
+            } else {
+                bn_aes_dec_round(state + (lane << 4), k0, k1, k2, k3);
+            }
+        }
+    }
+
+    for (uint xr = 0u; xr < 2u; ++xr) {
+        uint k = xr << 2;
+        for (uint lane = 0u; lane < 4u; ++lane) {
+            if ((lane & 1u) == 0u) {
+                bn_aes_enc_round(
+                    state + (lane << 4),
+                    BN_RX_AES_HASH_XKEYS[k + 0u],
+                    BN_RX_AES_HASH_XKEYS[k + 1u],
+                    BN_RX_AES_HASH_XKEYS[k + 2u],
+                    BN_RX_AES_HASH_XKEYS[k + 3u]
+                );
+            } else {
+                bn_aes_dec_round(
+                    state + (lane << 4),
+                    BN_RX_AES_HASH_XKEYS[k + 0u],
+                    BN_RX_AES_HASH_XKEYS[k + 1u],
+                    BN_RX_AES_HASH_XKEYS[k + 2u],
+                    BN_RX_AES_HASH_XKEYS[k + 3u]
+                );
+            }
+        }
+    }
+
+    bn_rx_aes_state_to_words(state, outv);
+}
+
+inline void bn_rx_generate_program_full(
+    __private uchar aes_state[64],
+    __private ulong config[16],
+    __private ulong program[BN_RX_FULL_PROGRAM_SIZE]
+) {
+    ulong block[8];
+
+    for (uint base = 0u; base < 16u; base += 8u) {
+        bn_rx_aes4_step(aes_state);
+        bn_rx_aes_state_to_words(aes_state, block);
+        for (uint i = 0u; i < 8u; ++i) {
+            config[base + i] = block[i];
+        }
+    }
+
+    for (uint base = 0u; base < BN_RX_FULL_PROGRAM_SIZE; base += 8u) {
+        bn_rx_aes4_step(aes_state);
+        bn_rx_aes_state_to_words(aes_state, block);
+        for (uint i = 0u; i < 8u && base + i < BN_RX_FULL_PROGRAM_SIZE; ++i) {
+            program[base + i] = block[i];
+        }
+    }
+}
+
+
+inline void bn_rx_build_branch_targets_full(
+    __private const ulong program[BN_RX_FULL_PROGRAM_SIZE],
+    __private ushort branch_target[BN_RX_FULL_PROGRAM_SIZE]
+) {
+    ushort last_write[8];
+
+    for (uint r = 0u; r < 8u; ++r) {
+        last_write[r] = (ushort)0xffffu;
+    }
+
+    for (uint pc = 0u; pc < BN_RX_FULL_PROGRAM_SIZE; ++pc) {
+        ulong inst = program[pc];
+        uint opcode = (uint)(inst & 0xffUL);
+        uint dst = (uint)((inst >> 8) & 7UL);
+        uint src = (uint)((inst >> 16) & 7UL);
+        uint imm32 = (uint)(inst >> 32);
+
+        branch_target[pc] = (ushort)0xffffu;
+
+        if (opcode < BN_RX_CEIL_IROL_R) {
+            if (opcode >= (BN_RX_CEIL_IMUL_RCP - 8u) && opcode < BN_RX_CEIL_IMUL_RCP) {
+                if (bn_is_zero_or_power_of_two_u32(imm32) == 0u) {
+                    last_write[dst] = (ushort)pc;
+                }
+            } else {
+                last_write[dst] = (ushort)pc;
+            }
+        } else if (opcode < BN_RX_CEIL_ISWAP_R) {
+            /* IROL_R writes only dst. */
+            last_write[dst] = (ushort)pc;
+        } else if (opcode < BN_RX_CEIL_FSWAP_R) {
+            /* ISWAP_R writes both integer registers unless it compiles to NOP. */
+            if (src != dst) {
+                last_write[dst] = (ushort)pc;
+                last_write[src] = (ushort)pc;
+            }
+        } else if (opcode >= BN_RX_CEIL_FSQRT_R && opcode < BN_RX_CEIL_CBRANCH) {
+            branch_target[pc] = last_write[dst];
+            for (uint r = 0u; r < 8u; ++r) {
+                last_write[r] = (ushort)pc;
+            }
+        }
+    }
+}
+
+
+inline void bn_rx_execute_program_full(
+    __private const ulong program[BN_RX_FULL_PROGRAM_SIZE],
+    __private const ushort branch_target[BN_RX_FULL_PROGRAM_SIZE],
+    __private ulong r[8],
+    __private ulong f[8],
+    __private ulong e[8],
+    __private const ulong a[8],
+    __private const ulong e_mask[2],
+    __global ulong* scratch,
+    __private uint* fprc
+) {
+    uint pc = 0u;
+    uint steps = 0u;
+
+    while (pc < BN_RX_FULL_PROGRAM_SIZE && steps < BN_RX_FULL_MAX_BRANCH_STEPS) {
+        ulong inst = program[pc];
+        uint opcode = (uint)(inst & 0xffUL);
+        uint dst = (uint)((inst >> 8) & 7UL);
+        uint src = (uint)((inst >> 16) & 7UL);
+        uint mod = (uint)((inst >> 24) & 0xffUL);
+        uint imm32 = (uint)(inst >> 32);
+        uint next_pc = pc + 1u;
+
+        if (opcode < BN_RX_CEIL_IADD_RS) {
+            uint shift = (mod >> 2) & 3u;
+            ulong displacement = (dst == 5u) ? (ulong)(long)(int)imm32 : 0UL;
+            r[dst] += (r[src] << shift) + displacement;
+        } else if (opcode < BN_RX_CEIL_IADD_M) {
+            r[dst] += bn_rx_full_scratch_load(scratch, (src == dst) ? 0UL : r[src], imm32, mod & 3u, (src == dst) ? 1u : 0u);
+        } else if (opcode < BN_RX_CEIL_ISUB_R) {
+            r[dst] -= (src == dst) ? (ulong)(long)(int)imm32 : r[src];
+        } else if (opcode < BN_RX_CEIL_ISUB_M) {
+            r[dst] -= bn_rx_full_scratch_load(scratch, (src == dst) ? 0UL : r[src], imm32, mod & 3u, (src == dst) ? 1u : 0u);
+        } else if (opcode < BN_RX_CEIL_IMUL_R) {
+            r[dst] *= (src == dst) ? (ulong)(long)(int)imm32 : r[src];
+        } else if (opcode < BN_RX_CEIL_IMUL_M) {
+            r[dst] *= bn_rx_full_scratch_load(scratch, (src == dst) ? 0UL : r[src], imm32, mod & 3u, (src == dst) ? 1u : 0u);
+        } else if (opcode < BN_RX_CEIL_IMULH_R) {
+            r[dst] = bn_mulh64(r[dst], r[src]);
+        } else if (opcode < BN_RX_CEIL_IMULH_M) {
+            r[dst] = bn_mulh64(r[dst], bn_rx_full_scratch_load(scratch, (src == dst) ? 0UL : r[src], imm32, mod & 3u, (src == dst) ? 1u : 0u));
+        } else if (opcode < BN_RX_CEIL_ISMULH_R) {
+            r[dst] = bn_smulh64(r[dst], r[src]);
+        } else if (opcode < BN_RX_CEIL_ISMULH_M) {
+            r[dst] = bn_smulh64(r[dst], bn_rx_full_scratch_load(scratch, (src == dst) ? 0UL : r[src], imm32, mod & 3u, (src == dst) ? 1u : 0u));
+        } else if (opcode < BN_RX_CEIL_IMUL_RCP) {
+            ulong reciprocal = bn_rx_reciprocal(imm32);
+            if (reciprocal != 0UL) {
+                r[dst] *= reciprocal;
+            }
+        } else if (opcode < BN_RX_CEIL_INEG_R) {
+            r[dst] = ~r[dst] + 1UL;
+        } else if (opcode < BN_RX_CEIL_IXOR_R) {
+            r[dst] ^= (src == dst) ? (ulong)(long)(int)imm32 : r[src];
+        } else if (opcode < BN_RX_CEIL_IXOR_M) {
+            r[dst] ^= bn_rx_full_scratch_load(scratch, (src == dst) ? 0UL : r[src], imm32, mod & 3u, (src == dst) ? 1u : 0u);
+        } else if (opcode < BN_RX_CEIL_IROR_R) {
+            ulong count = (src == dst) ? (ulong)imm32 : r[src];
+            r[dst] = bn_rotr64(r[dst], (uint)(count & 63UL));
+        } else if (opcode < BN_RX_CEIL_IROL_R) {
+            ulong count = (src == dst) ? (ulong)imm32 : r[src];
+            r[dst] = bn_rotl64(r[dst], (uint)(count & 63UL));
+        } else if (opcode < BN_RX_CEIL_ISWAP_R) {
+            if (src != dst) {
+                ulong tmp = r[dst];
+                r[dst] = r[src];
+                r[src] = tmp;
+            }
+        } else if (opcode < BN_RX_CEIL_FSWAP_R) {
+            uint reg = dst & 7u;
+            if (reg < 4u) {
+                uint q = reg << 1;
+                f[q + 0u] = bn_rx_swap32_halves(f[q + 0u]);
+                f[q + 1u] = bn_rx_swap32_halves(f[q + 1u]);
+            } else {
+                uint q = (reg - 4u) << 1;
+                e[q + 0u] = bn_rx_swap32_halves(e[q + 0u]);
+                e[q + 1u] = bn_rx_swap32_halves(e[q + 1u]);
+            }
+        } else if (opcode < BN_RX_CEIL_FADD_R) {
+            uint fd = (dst & 3u) << 1;
+            uint fs = (src & 3u) << 1;
+            f[fd + 0u] = bn_rx_fp_add(f[fd + 0u], a[fs + 0u], *fprc);
+            f[fd + 1u] = bn_rx_fp_add(f[fd + 1u], a[fs + 1u], *fprc);
+        } else if (opcode < BN_RX_CEIL_FADD_M) {
+            ulong qword = bn_rx_full_scratch_load(scratch, r[src], imm32, mod & 3u, 0u);
+            uint fd = (dst & 3u) << 1;
+            f[fd + 0u] = bn_rx_fp_add(f[fd + 0u], bn_rx_fp_from_i32((uint)qword), *fprc);
+            f[fd + 1u] = bn_rx_fp_add(f[fd + 1u], bn_rx_fp_from_i32((uint)(qword >> 32)), *fprc);
+        } else if (opcode < BN_RX_CEIL_FSUB_R) {
+            uint fd = (dst & 3u) << 1;
+            uint fs = (src & 3u) << 1;
+            f[fd + 0u] = bn_rx_fp_sub(f[fd + 0u], a[fs + 0u], *fprc);
+            f[fd + 1u] = bn_rx_fp_sub(f[fd + 1u], a[fs + 1u], *fprc);
+        } else if (opcode < BN_RX_CEIL_FSUB_M) {
+            ulong qword = bn_rx_full_scratch_load(scratch, r[src], imm32, mod & 3u, 0u);
+            uint fd = (dst & 3u) << 1;
+            f[fd + 0u] = bn_rx_fp_sub(f[fd + 0u], bn_rx_fp_from_i32((uint)qword), *fprc);
+            f[fd + 1u] = bn_rx_fp_sub(f[fd + 1u], bn_rx_fp_from_i32((uint)(qword >> 32)), *fprc);
+        } else if (opcode < BN_RX_CEIL_FSCAL_R) {
+            uint fd = (dst & 3u) << 1;
+            f[fd + 0u] ^= BN_U64_C(0x80f0000000000000);
+            f[fd + 1u] ^= BN_U64_C(0x80f0000000000000);
+        } else if (opcode < BN_RX_CEIL_FMUL_R) {
+            uint ed = (dst & 3u) << 1;
+            uint as = (src & 3u) << 1;
+            e[ed + 0u] = bn_rx_fp_mul(e[ed + 0u], a[as + 0u], *fprc);
+            e[ed + 1u] = bn_rx_fp_mul(e[ed + 1u], a[as + 1u], *fprc);
+        } else if (opcode < BN_RX_CEIL_FDIV_M) {
+            ulong qword = bn_rx_full_scratch_load(scratch, r[src], imm32, mod & 3u, 0u);
+            uint ed = (dst & 3u) << 1;
+            e[ed + 0u] = bn_rx_fp_div(e[ed + 0u], bn_rx_fp_e_from_i32((uint)qword, e_mask[0]), *fprc);
+            e[ed + 1u] = bn_rx_fp_div(e[ed + 1u], bn_rx_fp_e_from_i32((uint)(qword >> 32), e_mask[1]), *fprc);
+        } else if (opcode < BN_RX_CEIL_FSQRT_R) {
+            uint ed = (dst & 3u) << 1;
+            e[ed + 0u] = bn_rx_fp_sqrt(e[ed + 0u], *fprc);
+            e[ed + 1u] = bn_rx_fp_sqrt(e[ed + 1u], *fprc);
+        } else if (opcode < BN_RX_CEIL_CBRANCH) {
+            uint shift = (mod >> 4) + 8u;
+            ulong condition_mask = BN_U64_C(0xff) << shift;
+            ulong cimm = (ulong)(long)(int)imm32;
+            cimm |= 1UL << shift;
+            if (shift > 0u) {
+                cimm &= ~(1UL << (shift - 1u));
+            }
+            r[dst] += cimm;
+            if ((r[dst] & condition_mask) == 0UL) {
+                ushort target = branch_target[pc];
+                next_pc = (target == (ushort)0xffffu) ? 0u : (uint)target + 1u;
+            }
+        } else if (opcode < BN_RX_CEIL_CFROUND) {
+            *fprc = (uint)(bn_rotr64(r[src], imm32 & 63u) & 3UL);
+        } else {
+            uint force_l3 = ((mod >> 4) >= 14u) ? 1u : 0u;
+            bn_rx_full_scratch_store(scratch, r[dst], imm32, mod & 3u, force_l3, r[src]);
+        }
+
+        pc = next_pc;
+        ++steps;
+    }
+}
+
+
+
+inline void bn_gpu_randomx_fullscratch_hash(
+    __global const uchar* blob,
+    uint blob_len,
+    uint nonce_offset,
+    uint nonce_u32,
+    __global const uchar* seed,
+    uint seed_len,
+    __global const ulong* dataset64,
+    uint dataset_words,
+    __global ulong* scratch,
+    __private ulong outv[4]
+) {
+    if (
+        blob_len == 0u ||
+        blob_len > BN_MAX_BLOB_BYTES ||
+        nonce_offset > blob_len ||
+        (blob_len - nonce_offset) < 4u ||
+        dataset_words < BN_RX_DATASET_TOTAL_WORDS
+    ) {
+        outv[0] = 0UL;
+        outv[1] = 0UL;
+        outv[2] = 0UL;
+        outv[3] = ~0UL;
+        return;
+    }
+
+    /* The seed key is represented by the host-built Dataset. */
+    (void)seed;
+    (void)seed_len;
+
+    ulong initial_seed[8];
+    uchar aes_state[64];
+    ulong config[16];
+    ulong program[BN_RX_FULL_PROGRAM_SIZE];
+    ushort branch_target[BN_RX_FULL_PROGRAM_SIZE];
+    ulong r[8];
+    ulong f[8];
+    ulong e[8];
+    ulong a[8];
+    ulong e_mask[2];
+    ulong reg_file[32];
+    ulong chain_hash[8];
+    ulong scratch_hash[8];
+    uint fprc = 0u;
+
+    bn_blake2b_overlay(
+        blob,
+        blob_len,
+        nonce_offset,
+        nonce_u32,
+        8u,
+        initial_seed
+    );
+    bn_rx_words_to_aes_state(initial_seed, aes_state);
+    bn_rx_fill_scratch_global(aes_state, scratch);
+
+    for (uint program_index = 0u; program_index < BN_RX_FULL_PROGRAM_COUNT; ++program_index) {
+        bn_rx_generate_program_full(aes_state, config, program);
+        bn_rx_build_branch_targets_full(program, branch_target);
+
+        for (uint i = 0u; i < 8u; ++i) {
+            r[i] = 0UL;
+            f[i] = 0UL;
+            e[i] = 0UL;
+            a[i] = bn_rx_small_positive_float_bits(config[i]);
+        }
+
+        e_mask[0] = bn_rx_float_mask(config[14]);
+        e_mask[1] = bn_rx_float_mask(config[15]);
+
+        uint ma = ((uint)config[8]) & ~63u;
+        uint mx = ((uint)config[10]) & ~63u;
+        ulong address_registers = config[12];
+        uint read_reg0 = 0u + (uint)(address_registers & 1UL);
+        address_registers >>= 1;
+        uint read_reg1 = 2u + (uint)(address_registers & 1UL);
+        address_registers >>= 1;
+        uint read_reg2 = 4u + (uint)(address_registers & 1UL);
+        address_registers >>= 1;
+        uint read_reg3 = 6u + (uint)(address_registers & 1UL);
+        uint dataset_offset_items = (uint)(config[13] % ((ulong)BN_RX_DATASET_EXTRA_ITEMS + 1UL));
+        uint sp_addr0 = mx;
+        uint sp_addr1 = ma;
+
+        for (uint iteration = 0u; iteration < BN_RX_FULL_PROGRAM_ITERATIONS; ++iteration) {
+            ulong sp_mix = r[read_reg0] ^ r[read_reg1];
+            sp_addr0 ^= (uint)sp_mix;
+            sp_addr1 ^= (uint)(sp_mix >> 32);
+
+            uint sp0 = bn_rx_full_scratch_line_index(sp_addr0);
+            uint sp1 = bn_rx_full_scratch_line_index(sp_addr1);
+
+            for (uint i = 0u; i < 8u; ++i) {
+                r[i] ^= scratch[sp0 + i];
+            }
+
+            for (uint i = 0u; i < 4u; ++i) {
+                ulong fq = scratch[sp1 + i];
+                ulong eq = scratch[sp1 + 4u + i];
+                uint p = i << 1;
+                f[p + 0u] = bn_rx_fp_from_i32((uint)fq);
+                f[p + 1u] = bn_rx_fp_from_i32((uint)(fq >> 32));
+                e[p + 0u] = bn_rx_fp_e_from_i32((uint)eq, e_mask[0]);
+                e[p + 1u] = bn_rx_fp_e_from_i32((uint)(eq >> 32), e_mask[1]);
+            }
+
+            bn_rx_execute_program_full(
+                program,
+                branch_target,
+                r,
+                f,
+                e,
+                a,
+                e_mask,
+                scratch,
+                &fprc
+            );
+
+            uint mt = ma;
+            mx ^= (uint)r[read_reg2] ^ (uint)r[read_reg3];
+
+            /* RandomX v1 loads datasetOffset + (mt % baseSize). */
+            uint dataset_item = dataset_offset_items + ((mt & 0x7fffffc0u) >> 6);
+            uint dataset_base = dataset_item << 3;
+            for (uint i = 0u; i < 8u; ++i) {
+                r[i] ^= dataset64[dataset_base + i];
+            }
+
+            uint swap_tmp = mx;
+            mx = ma;
+            ma = swap_tmp;
+
+            for (uint i = 0u; i < 8u; ++i) {
+                scratch[sp1 + i] = r[i];
+            }
+            for (uint i = 0u; i < 8u; ++i) {
+                f[i] ^= e[i];
+                scratch[sp0 + i] = f[i];
+            }
+
+            sp_addr0 = 0u;
+            sp_addr1 = 0u;
+        }
+
+        if (program_index + 1u < BN_RX_FULL_PROGRAM_COUNT) {
+            bn_rx_register_file(r, f, e, a, reg_file);
+            bn_blake2b_private_words(reg_file, 32u, 8u, chain_hash);
+            bn_rx_words_to_aes_state(chain_hash, aes_state);
+        }
+    }
+
+    bn_rx_aes_hash_scratch_global(scratch, scratch_hash);
+    bn_rx_register_file(r, f, e, scratch_hash, reg_file);
+    bn_blake2b_private_words(reg_file, 32u, 4u, chain_hash);
+
+    outv[0] = chain_hash[0];
+    outv[1] = chain_hash[1];
+    outv[2] = chain_hash[2];
+    outv[3] = chain_hash[3];
 }
 
 inline void bn_stage_candidate_local(
@@ -3033,6 +3658,399 @@ __kernel void blocknet_randomx_vm_hash_batch_ext(
         l_class
     );
 }
+
+
+
+/*
+ * Low-latency candidate nomination path.
+ *
+ * One candidate is emitted per work-group. That keeps global atomics and PCIe
+ * copies bounded while allowing a large nonce window to be ranked in one GPU
+ * launch. The 32-byte value is a predictor fingerprint only; the host's native
+ * RandomX verifier must recompute the real hash before any target comparison or
+ * pool submission.
+ */
+inline void bn_candidate_fast_fingerprint(
+    __global const uchar* blob,
+    uint blob_len,
+    uint nonce_offset,
+    uint nonce_u32,
+    __global const uchar* seed,
+    uint seed_len,
+    __global const ulong* dataset64,
+    uint dataset_words,
+    __private ulong hv[4]
+) {
+    ulong b0 = bn_blob_load_u64_overlay(blob, blob_len, nonce_offset, nonce_u32, 0u);
+    ulong b1 = bn_blob_load_u64_overlay(blob, blob_len, nonce_offset, nonce_u32, 8u);
+    ulong b2 = bn_blob_load_u64_overlay(blob, blob_len, nonce_offset, nonce_u32, 16u);
+    ulong b3 = bn_blob_load_u64_overlay(blob, blob_len, nonce_offset, nonce_u32, 24u);
+
+    ulong s0 = bn_global_load_u64_repeat(seed, seed_len, 0u);
+    ulong s1 = bn_global_load_u64_repeat(seed, seed_len, 8u);
+    ulong s2 = bn_global_load_u64_repeat(seed, seed_len, 16u);
+    ulong s3 = bn_global_load_u64_repeat(seed, seed_len, 24u);
+
+    ulong x0 = bn_mix64(b0 ^ s0 ^ (ulong)nonce_u32 ^ BN_U64_C(0x243F6A8885A308D3));
+    ulong x1 = bn_mix64(b1 ^ s1 ^ bn_rotl64(x0, 17u) ^ BN_U64_C(0x13198A2E03707344));
+    ulong x2 = bn_mix64(b2 ^ s2 ^ bn_rotr64(x1, 11u) ^ BN_U64_C(0xA4093822299F31D0));
+    ulong x3 = bn_mix64(b3 ^ s3 ^ bn_rotl64(x2, 29u) ^ BN_U64_C(0x082EFA98EC4E6C89));
+
+    /* Two aligned Dataset-item reads are the default. They are enough to make
+       neighbouring nonces diverge while keeping nomination much cheaper than a
+       full RandomX VM execution. */
+    for (uint r = 0u; r < BN_FAST_CANDIDATE_DATASET_ROUNDS; ++r) {
+        ulong addr = bn_mix64(
+            x0 ^ bn_rotl64(x1, 7u + r) ^ bn_rotr64(x2, 13u + r) ^
+            x3 ^ ((ulong)r * BN_U64_C(0x9E3779B97F4A7C15))
+        );
+        ulong dm = bn_dataset_read_mix_fast(dataset64, dataset_words, addr);
+        x0 = bn_mix64(x0 + dm + ((ulong)r << 32));
+        x1 = bn_mix64(x1 ^ bn_rotl64(dm, 19u));
+        x2 = bn_mix64(x2 + bn_rotr64(dm, 23u));
+        x3 = bn_mix64(x3 ^ dm ^ bn_rotl64(x0, 31u));
+    }
+
+    hv[0] = bn_avalanche64(x0 ^ bn_rotl64(x2, 9u));
+    hv[1] = bn_avalanche64(x1 ^ bn_rotr64(x3, 7u));
+    hv[2] = bn_avalanche64(x2 ^ bn_rotl64(x0, 21u));
+    hv[3] = bn_avalanche64(x3 ^ bn_rotr64(x1, 17u));
+}
+
+__kernel void blocknet_randomx_vm_hash_batch_candidate_fast(
+    __global const uchar* blob,
+    const uint blob_len,
+    const uint nonce_offset,
+    const uint start_nonce,
+    const ulong target64,
+    const uint max_results,
+    __global uchar* out_hashes,
+    __global uint* out_nonces,
+    __global ulong* out_scores,
+    __global uint* out_buckets,
+    __global uchar* out_rankq,
+    __global uchar* out_threshq,
+    __global uchar* out_tailbin,
+    __global uint* out_count,
+    __global const uchar* seed,
+    const uint seed_len,
+    __global const ulong* dataset64,
+    const uint dataset_words,
+    __global const uchar* seed_tune,
+    const uint seed_tune_buckets,
+    const uint seed_tune_tail_bins,
+    __global const uchar* job_tune,
+    const uint job_tune_buckets,
+    const uint job_tune_tail_bins,
+    const uint job_age_ms,
+    const uint verify_pressure_q8,
+    const uint submit_pressure_q8,
+    const uint stale_risk_q8
+) {
+    (void)target64;
+    (void)seed_tune;
+    (void)seed_tune_buckets;
+    (void)job_tune;
+    (void)job_tune_buckets;
+    (void)job_tune_tail_bins;
+    (void)job_age_ms;
+    (void)verify_pressure_q8;
+    (void)submit_pressure_q8;
+    (void)stale_risk_q8;
+
+    const uint lid = get_local_id(0);
+    const uint local_size = get_local_size(0);
+    const uint active = bn_min_u32(local_size, (uint)BN_LOCAL_STAGE_SIZE);
+    const uint nonce_u32 = start_nonce + (uint)get_global_id(0);
+
+    if (
+        blob_len == 0u || blob_len > BN_MAX_BLOB_BYTES ||
+        nonce_offset > blob_len || (blob_len - nonce_offset) < 4u ||
+        seed_len == 0u || dataset_words < 8u || max_results == 0u
+    ) {
+        return;
+    }
+
+    __local ulong l_score[BN_LOCAL_STAGE_SIZE];
+    __local ulong l_h0[BN_LOCAL_STAGE_SIZE];
+    __local ulong l_h1[BN_LOCAL_STAGE_SIZE];
+    __local ulong l_h2[BN_LOCAL_STAGE_SIZE];
+    __local ulong l_h3[BN_LOCAL_STAGE_SIZE];
+    __local uint  l_nonce[BN_LOCAL_STAGE_SIZE];
+
+    if (lid < active) {
+        ulong hv[4];
+        bn_candidate_fast_fingerprint(
+            blob, blob_len, nonce_offset, nonce_u32,
+            seed, seed_len, dataset64, dataset_words, hv
+        );
+
+        /* Lower is better. Blend all limbs so the selected lane is not based on
+           one predictor limb alone. */
+        ulong score = bn_mix64(
+            hv[3] ^ bn_rotl64(hv[0], 11u) ^
+            bn_rotr64(hv[1], 17u) ^ bn_rotl64(hv[2], 29u)
+        );
+        l_score[lid] = score;
+        l_h0[lid] = hv[0];
+        l_h1[lid] = hv[1];
+        l_h2[lid] = hv[2];
+        l_h3[lid] = hv[3];
+        l_nonce[lid] = nonce_u32;
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (lid == 0u) {
+        uint best = 0u;
+        ulong best_score = l_score[0];
+        for (uint i = 1u; i < active; ++i) {
+            ulong candidate_score = l_score[i];
+            if (candidate_score < best_score) {
+                best = i;
+                best_score = candidate_score;
+            }
+        }
+
+        uint granted = 0u;
+        uint slot = bn_reserve_output_slots(
+            (volatile __global uint*)out_count,
+            1u,
+            max_results,
+            &granted
+        );
+        if (granted != 0u) {
+            uint bucket = bn_tune_bucket(l_h0[best], l_h1[best], l_nonce[best]);
+            uint tail_bins = bn_max_u32(1u, seed_tune_tail_bins);
+            uint tail_bin = bn_tail_bin_from_tail(l_h3[best], tail_bins);
+
+            out_nonces[slot] = l_nonce[best];
+            out_scores[slot] = best_score;
+            out_buckets[slot] = bucket;
+            out_rankq[slot] = (uchar)BN_TUNE_NEUTRAL;
+            out_threshq[slot] = (uchar)BN_TUNE_NEUTRAL;
+            out_tailbin[slot] = (uchar)(tail_bin & 0xffu);
+            bn_write_hash32(
+                out_hashes + (slot * BN_HASH_BYTES),
+                l_h0[best], l_h1[best], l_h2[best], l_h3[best]
+            );
+        }
+    }
+}
+
+#if BN_RX_ENABLE_FULLSCRATCH
+inline void bn_run_fullscratch_core(
+    __global const uchar* blob,
+    const uint blob_len,
+    const uint nonce_offset,
+    const uint start_nonce,
+    const ulong target64,
+    const uint max_results,
+    __global uchar* out_hashes,
+    __global uint* out_nonces,
+    __global ulong* out_scores,
+    __global uint* out_buckets,
+    __global uchar* out_rankq,
+    __global uchar* out_threshq,
+    __global uchar* out_tailbin,
+    __global uint* out_count,
+    __global const uchar* seed,
+    const uint seed_len,
+    __global const ulong* dataset64,
+    const uint dataset_words,
+    __global const uchar* seed_tune,
+    const uint seed_tune_buckets,
+    const uint seed_tune_tail_bins,
+    __global const uchar* job_tune,
+    const uint job_tune_buckets,
+    const uint job_tune_tail_bins,
+    const uint job_age_ms,
+    const uint verify_pressure_q8,
+    const uint submit_pressure_q8,
+    const uint stale_risk_q8,
+    __global ulong* scratch_arena,
+    const uint scratch_stride_words,
+    const uint scratch_capacity
+) {
+    const uint gid = (uint)get_global_id(0);
+    const uint nonce_u32 = start_nonce + gid;
+
+    /* Tuning and operational pressure must never tighten a consensus prefilter. */
+    (void)seed_tune;
+    (void)seed_tune_buckets;
+    (void)seed_tune_tail_bins;
+    (void)job_tune;
+    (void)job_tune_buckets;
+    (void)job_tune_tail_bins;
+    (void)job_age_ms;
+    (void)verify_pressure_q8;
+    (void)submit_pressure_q8;
+    (void)stale_risk_q8;
+
+    if (
+        gid >= scratch_capacity ||
+        scratch_stride_words < BN_RX_FULL_SCRATCH_WORDS ||
+        dataset_words < BN_RX_DATASET_TOTAL_WORDS ||
+        max_results == 0u
+    ) {
+        return;
+    }
+
+    __global ulong* scratch = scratch_arena + ((ulong)gid * (ulong)scratch_stride_words);
+    ulong hv[4];
+    bn_gpu_randomx_fullscratch_hash(
+        blob,
+        blob_len,
+        nonce_offset,
+        nonce_u32,
+        seed,
+        seed_len,
+        dataset64,
+        dataset_words,
+        scratch,
+        hv
+    );
+
+    /*
+     * target64 is the most-significant 64-bit limb of the little-endian target.
+     * Every true 256-bit winner necessarily satisfies this prefilter. The host
+     * still performs the exact 256-bit comparison and native RandomX check.
+     *
+     * A sparse deterministic verifier probe is also emitted. This does not
+     * authorize submission: submit_unverified remains off and the native
+     * RandomX verifier decides whether the nonce is a real share. The probe
+     * guarantees a contiguous scan window larger than 2^N contains candidates
+     * even if a compact stratum target was previously decoded incorrectly.
+     */
+    const uint exact_prefilter_hit = (hv[3] <= target64) ? 1u : 0u;
+
+    /*
+     * Always return the first completed hash in each launch to the native
+     * verifier. This is a candidate only, never an authorized share. It makes
+     * output progress independent of nonce alignment and compact-target bugs,
+     * and lets the host return after one expensive full-scratch launch instead
+     * of waiting for an entire 90k-hash window.
+     */
+    const uint launch_progress_candidate = (gid == 0u) ? 1u : 0u;
+    uint verifier_probe = 0u;
+#if BN_RX_FULL_CANDIDATE_PROBE_SHIFT == 0u
+    verifier_probe = 1u;
+#elif BN_RX_FULL_CANDIDATE_PROBE_SHIFT < 32u
+    verifier_probe = ((nonce_u32 & ((1u << BN_RX_FULL_CANDIDATE_PROBE_SHIFT) - 1u)) == 0u) ? 1u : 0u;
+#else
+    verifier_probe = 0u;
+#endif
+
+    if (exact_prefilter_hit != 0u || launch_progress_candidate != 0u || verifier_probe != 0u) {
+        uint granted = 0u;
+        uint slot = bn_reserve_output_slots(
+            (volatile __global uint*)out_count,
+            1u,
+            max_results,
+            &granted
+        );
+        if (granted != 0u) {
+            uint bucket = bn_tune_bucket(hv[0], hv[1], nonce_u32);
+            uint tail_bin = bn_tail_bin_from_tail(hv[3], bn_max_u32(1u, seed_tune_tail_bins));
+            out_nonces[slot] = nonce_u32;
+            out_scores[slot] = hv[3];
+            out_buckets[slot] = bucket;
+            out_rankq[slot] = (uchar)(exact_prefilter_hit ? 255u : (launch_progress_candidate ? 112u : 96u));
+            out_threshq[slot] = (uchar)(exact_prefilter_hit ? 255u : 0u);
+            out_tailbin[slot] = (uchar)(tail_bin & 0xffu);
+            bn_write_hash32(out_hashes + (slot * BN_HASH_BYTES), hv[0], hv[1], hv[2], hv[3]);
+        }
+    }
+}
+
+__kernel void blocknet_randomx_vm_scan_fullscratch_ext(
+    __global const uchar* blob,
+    const uint blob_len,
+    const uint nonce_offset,
+    const uint start_nonce,
+    const ulong target64,
+    const uint max_results,
+    __global uchar* out_hashes,
+    __global uint* out_nonces,
+    __global ulong* out_scores,
+    __global uint* out_buckets,
+    __global uchar* out_rankq,
+    __global uchar* out_threshq,
+    __global uchar* out_tailbin,
+    __global uint* out_count,
+    __global const uchar* seed,
+    const uint seed_len,
+    __global const ulong* dataset64,
+    const uint dataset_words,
+    __global const uchar* seed_tune,
+    const uint seed_tune_buckets,
+    const uint seed_tune_tail_bins,
+    __global const uchar* job_tune,
+    const uint job_tune_buckets,
+    const uint job_tune_tail_bins,
+    const uint job_age_ms,
+    const uint verify_pressure_q8,
+    const uint submit_pressure_q8,
+    const uint stale_risk_q8,
+    __global ulong* scratch_arena,
+    const uint scratch_stride_words,
+    const uint scratch_capacity
+) {
+    bn_run_fullscratch_core(
+        blob, blob_len, nonce_offset, start_nonce, target64, max_results,
+        out_hashes, out_nonces, out_scores, out_buckets, out_rankq,
+        out_threshq, out_tailbin, out_count, seed, seed_len, dataset64,
+        dataset_words, seed_tune, seed_tune_buckets, seed_tune_tail_bins,
+        job_tune, job_tune_buckets, job_tune_tail_bins, job_age_ms,
+        verify_pressure_q8, submit_pressure_q8, stale_risk_q8,
+        scratch_arena, scratch_stride_words, scratch_capacity
+    );
+}
+
+__kernel void blocknet_randomx_vm_hash_batch_fullscratch_ext(
+    __global const uchar* blob,
+    const uint blob_len,
+    const uint nonce_offset,
+    const uint start_nonce,
+    const ulong target64,
+    const uint max_results,
+    __global uchar* out_hashes,
+    __global uint* out_nonces,
+    __global ulong* out_scores,
+    __global uint* out_buckets,
+    __global uchar* out_rankq,
+    __global uchar* out_threshq,
+    __global uchar* out_tailbin,
+    __global uint* out_count,
+    __global const uchar* seed,
+    const uint seed_len,
+    __global const ulong* dataset64,
+    const uint dataset_words,
+    __global const uchar* seed_tune,
+    const uint seed_tune_buckets,
+    const uint seed_tune_tail_bins,
+    __global const uchar* job_tune,
+    const uint job_tune_buckets,
+    const uint job_tune_tail_bins,
+    const uint job_age_ms,
+    const uint verify_pressure_q8,
+    const uint submit_pressure_q8,
+    const uint stale_risk_q8,
+    __global ulong* scratch_arena,
+    const uint scratch_stride_words,
+    const uint scratch_capacity
+) {
+    bn_run_fullscratch_core(
+        blob, blob_len, nonce_offset, start_nonce, target64, max_results,
+        out_hashes, out_nonces, out_scores, out_buckets, out_rankq,
+        out_threshq, out_tailbin, out_count, seed, seed_len, dataset64,
+        dataset_words, seed_tune, seed_tune_buckets, seed_tune_tail_bins,
+        job_tune, job_tune_buckets, job_tune_tail_bins, job_age_ms,
+        verify_pressure_q8, submit_pressure_q8, stale_risk_q8,
+        scratch_arena, scratch_stride_words, scratch_capacity
+    );
+}
+#endif
 
 // ============================================================
 // ADDITIONAL FUSED COMPATIBILITY KERNELS

@@ -71,6 +71,16 @@ class OpenCLGpuScanner:
     _PLANE_COUNT = 4
     _FULL_SCRATCHPAD_BYTES = 2 * 1024 * 1024
     _FULL_SCRATCHPAD_WORDS = _FULL_SCRATCHPAD_BYTES // np.dtype(np.uint64).itemsize
+    _RANDOMX_DATASET_BASE_BYTES = 2_147_483_648
+    _RANDOMX_DATASET_EXTRA_BYTES = 33_554_368
+    _RANDOMX_DATASET_BYTES = _RANDOMX_DATASET_BASE_BYTES + _RANDOMX_DATASET_EXTRA_BYTES
+    _RANDOMX_DATASET_WORDS = _RANDOMX_DATASET_BYTES // np.dtype(np.uint64).itemsize
+    _UNSAFE_MATH_OPTIONS = frozenset({
+        "-cl-fast-relaxed-math",
+        "-cl-unsafe-math-optimizations",
+        "-cl-finite-math-only",
+        "-cl-mad-enable",
+    })
     _FULL_SCRATCH_KERNELS = frozenset(
         {
             "blocknet_randomx_vm_scan_fullscratch_ext",
@@ -184,6 +194,70 @@ class OpenCLGpuScanner:
                 )
         return out
 
+    def _consensus_opencl_required(self) -> bool:
+        return bool(
+            getattr(
+                self.config,
+                "require_randomx_consensus_opencl",
+                self._full_scratch_requested(),
+            )
+        )
+
+    def _dataset_is_consensus_sized(self) -> bool:
+        return int(self.dataset_words) == int(self._RANDOMX_DATASET_WORDS)
+
+    def _device_supports_fp64(self) -> bool:
+        if self.device is None:
+            return False
+        extensions = str(getattr(self.device, "extensions", "") or "").lower().split()
+        if "cl_khr_fp64" in extensions or "cl_amd_fp64" in extensions:
+            return True
+        try:
+            return int(getattr(self.device, "preferred_vector_width_double", 0) or 0) > 0
+        except Exception:
+            return False
+
+    def _validate_consensus_device(self) -> None:
+        if not self._full_scratch_requested():
+            return
+        if not self._device_supports_fp64():
+            message = (
+                "Selected OpenCL device has no usable FP64 support; "
+                "RandomX floating-point instructions cannot be represented faithfully"
+            )
+            if self._consensus_opencl_required():
+                raise RuntimeError(message)
+            self.on_log(f"[opencl] warning: {message}")
+
+    def _consensus_build_options(self, build_options: str) -> list[str]:
+        opts = (build_options or "").split()
+        if not self._full_scratch_requested():
+            return opts
+
+        unsafe = [opt for opt in opts if opt in self._UNSAFE_MATH_OPTIONS]
+        if unsafe:
+            if self._consensus_opencl_required():
+                self.on_log(
+                    "[opencl] removing unsafe floating-point options for full RandomX: "
+                    + " ".join(unsafe)
+                )
+            opts = [opt for opt in opts if opt not in self._UNSAFE_MATH_OPTIONS]
+
+        required_defines = {
+            "BN_RX_ENABLE_FULLSCRATCH": "1",
+            "BN_RX_USE_STRUCTURED_VM": "1",
+            "BN_RX_EMULATE_CFROUND": "1",
+        }
+        present = {
+            opt.split("=", 1)[0][2:]
+            for opt in opts
+            if opt.startswith("-D")
+        }
+        for name, value in required_defines.items():
+            if name not in present:
+                opts.append(f"-D{name}={value}")
+        return opts
+
     def initialize(self) -> None:
         self._ensure_opencl_loader()
 
@@ -206,6 +280,7 @@ class OpenCLGpuScanner:
         self.device = device
         self.ctx = cl.Context(devices=[device])
         self.queue = cl.CommandQueue(self.ctx, device=device)
+        self._validate_consensus_device()
         self.program = self._build_program(self.ctx, self.config.kernel_path, self.config.build_options)
 
         entry = self._selected_kernel_entry()
@@ -213,6 +288,10 @@ class OpenCLGpuScanner:
             self.kernel = getattr(self.program, entry)
         except AttributeError as exc:
             if entry in self._FULL_SCRATCH_KERNELS:
+                if self._consensus_opencl_required():
+                    raise RuntimeError(
+                        f"Required full-scratch RandomX kernel entry not found: {entry}"
+                    ) from exc
                 fallback_entry = self._fallback_kernel_entry()
                 try:
                     self.kernel = getattr(self.program, fallback_entry)
@@ -220,7 +299,7 @@ class OpenCLGpuScanner:
                     raise RuntimeError(f"Kernel entry not found: {entry}") from exc
                 self.on_log(
                     f"[opencl] full-scratch kernel {entry} is unavailable; "
-                    f"using compatible kernel {fallback_entry}"
+                    f"using non-consensus compatibility kernel {fallback_entry}"
                 )
                 entry = fallback_entry
             else:
@@ -242,7 +321,8 @@ class OpenCLGpuScanner:
             f"buckets={self._bucket_count} "
             f"tail_bins={self._tail_bins} "
             f"local_stage_size={self._local_stage_size} "
-            f"scratchpad={'2 MiB/hash' if self._full_scratch_enabled else 'compat'} "
+            f"scratchpad={'2 MiB/hash, 256x2048x8' if self._full_scratch_enabled else 'none'} "
+            f"candidate_engine={'fast-top1' if self._fast_candidate_requested() else 'randomx-vm'} "
             f"planes=rank+threshold+credit+confidence"
         )
 
@@ -258,6 +338,15 @@ class OpenCLGpuScanner:
             raise RuntimeError("OpenCL scanner not initialized")
 
         ds = np.ascontiguousarray(dataset_u64, dtype=np.uint64)
+
+        if self._full_scratch_requested() and int(ds.size) != int(self._RANDOMX_DATASET_WORDS):
+            message = (
+                f"RandomX full mode requires exactly {self._RANDOMX_DATASET_BYTES} bytes "
+                f"({self._RANDOMX_DATASET_WORDS} uint64 words), got {int(ds.nbytes)} bytes"
+            )
+            if self._consensus_opencl_required():
+                raise RuntimeError(message)
+            self.on_log(f"[opencl] warning: {message}")
 
         if (
             self.dataset_buf is not None
@@ -442,18 +531,47 @@ class OpenCLGpuScanner:
     def _scan_mode(self) -> str:
         return self.config.normalized_scan_mode()
 
+    def _fast_candidate_requested(self) -> bool:
+        return bool(
+            self._scan_mode() == "hash_batch"
+            and getattr(self.config, "enable_fast_candidate_kernel", True)
+        )
+
     def _full_scratch_requested(self) -> bool:
-        return bool(getattr(self.config, "enable_full_scratchpad", True))
+        # Candidate nomination and consensus hashing are separate jobs. In fast
+        # candidate mode the GPU ranks nonces cheaply and the native RandomX
+        # verifier performs the authoritative hash, so allocating/running a
+        # 2 MiB full-scratch VM here only delays candidate delivery.
+        return bool(
+            getattr(self.config, "enable_full_scratchpad", True)
+            and not self._fast_candidate_requested()
+        )
 
     def _fallback_kernel_entry(self) -> str:
+        if self._fast_candidate_requested():
+            return "blocknet_randomx_vm_hash_batch_candidate_fast"
         if self._scan_mode() == "hash_batch":
             return "blocknet_randomx_vm_hash_batch_ext"
         return "blocknet_randomx_vm_scan_ext"
 
     def _selected_kernel_entry(self) -> str:
+        if self._fast_candidate_requested():
+            return "blocknet_randomx_vm_hash_batch_candidate_fast"
+
         configured = str(getattr(self.config, "kernel_entry", "") or "").strip()
         if configured and self.config.normalized_hash_engine() != "virtualasic":
             if self._full_scratch_requested():
+                # Keep the configured ABI family, but never run the scan wrapper
+                # while the host is in hash_batch mode. Both wrappers currently
+                # share the core, yet matching the mode prevents stale configs
+                # from selecting the wrong future implementation.
+                if self._scan_mode() == "hash_batch" and configured in {
+                    "blocknet_randomx_vm_scan_ext",
+                    "blocknet_randomx_vm_scan_fullscratch_ext",
+                    "blocknet_randomx_vm_hash_batch_ext",
+                    "blocknet_randomx_vm_hash_batch_fullscratch_ext",
+                }:
+                    return "blocknet_randomx_vm_hash_batch_fullscratch_ext"
                 legacy_upgrade = {
                     "blocknet_randomx_vm_scan_ext":
                         "blocknet_randomx_vm_scan_fullscratch_ext",
@@ -473,15 +591,50 @@ class OpenCLGpuScanner:
         return bool(raw) and len(raw) >= 32
 
     def _job_prefilter_target64(self, job: MiningJob) -> np.uint64:
-        # Full 256-bit targets should not be tightly tail-prefiltered or you can lose exact winners.
-        if self._is_full_target(job.target_hex):
-            return np.uint64(0xFFFFFFFFFFFFFFFF)
+        """Return the 64-bit RandomX target used by the GPU prefilter.
+
+        Monero stratum commonly sends a four-byte little-endian target. It is
+        *not* the final uint64 target and must be expanded with the same integer
+        conversion used by XMRig. Treating the compact uint32 as a uint64 makes
+        the GPU pass probability roughly 2**32 times too small and starves the
+        verifier of candidates.
+        """
+        raw = safe_bytes_from_hex(job.target_hex)
+        if not raw:
+            return np.uint64(0)
+
+        if len(raw) >= 32:
+            raw32 = raw[:32]
+            byteorder = str(
+                getattr(self.config, "randomx_target_byteorder", "little") or "little"
+            ).strip().lower()
+            if byteorder == "big":
+                target_value = int.from_bytes(raw32, "big", signed=False)
+            else:
+                target_value = int.from_bytes(raw32, "little", signed=False)
+            return np.uint64((target_value >> 192) & 0xFFFFFFFFFFFFFFFF)
+
+        if len(raw) == 8:
+            return np.uint64(int.from_bytes(raw, "little", signed=False))
+
+        if len(raw) == 4:
+            compact = int.from_bytes(raw, "little", signed=False)
+            if compact <= 0:
+                return np.uint64(0)
+
+            # XMRig Job::setTarget():
+            # UINT64_MAX / (UINT32_MAX / compact_target).
+            divisor = 0xFFFFFFFF // compact
+            if divisor <= 0:
+                return np.uint64(0xFFFFFFFFFFFFFFFF)
+            return np.uint64(0xFFFFFFFFFFFFFFFF // divisor)
 
         if getattr(job, "prefilter_target64", None) is not None:
             try:
                 return np.uint64(int(job.prefilter_target64) & 0xFFFFFFFFFFFFFFFF)
             except Exception:
                 pass
+
         return np.uint64(target_hex_to_prefilter_u64(job.target_hex))
 
     def _effective_max_results(self, candidate_target: int, *, full_target: bool) -> int:
@@ -510,9 +663,22 @@ class OpenCLGpuScanner:
         with open(resolved_kernel_path, "r", encoding="utf-8", errors="replace") as f:
             src = f.read()
 
+        if "BN_CANDIDATE_FAST_V3" in src:
+            self.on_log("[opencl] candidate-fast v3 detected in kernel source")
+        elif "BN_CANDIDATE_FIX_V2" in src:
+            self.on_log(
+                "[opencl] warning: candidate fix v2 detected, but the v3 fast "
+                "candidate kernel is missing"
+            )
+        else:
+            self.on_log(
+                "[opencl] warning: candidate kernel marker is missing; "
+                "the project may still be loading an older kernel file"
+            )
+
         prg = cl.Program(ctx, src)
         try:
-            opts = build_options.split() if (build_options or "").strip() else []
+            opts = self._consensus_build_options(build_options)
             prg.build(options=opts)
         except Exception as exc:
             build_log = ""
@@ -614,6 +780,16 @@ class OpenCLGpuScanner:
         desired = configured or max(1, int(self._effective_local_work_size or 64))
         capacity = min(requested, desired)
 
+        # Bound one synchronous full-RandomX launch so the host regains control
+        # and can feed the verifier before the pool replaces the job. Set the
+        # optional value to 0 to disable this latency cap explicitly.
+        latency_cap = max(
+            0,
+            int(getattr(self.config, "full_scratchpad_latency_cap", 32) or 0),
+        )
+        if latency_cap > 0:
+            capacity = min(capacity, latency_cap)
+
         max_mib = max(
             0,
             int(getattr(self.config, "full_scratchpad_max_mib", 512) or 0),
@@ -660,6 +836,8 @@ class OpenCLGpuScanner:
 
         capacity = self._full_scratch_capacity_limit(requested)
         if capacity <= 0:
+            if self._consensus_opencl_required():
+                raise RuntimeError("Insufficient device memory for one 2 MiB RandomX scratchpad slice")
             self._switch_to_compat_kernel_unlocked("insufficient device memory")
             return requested
 
@@ -676,6 +854,10 @@ class OpenCLGpuScanner:
                     f"{self._scratchpad_capacity} hashes after growth failed"
                 )
                 return self._scratchpad_capacity
+            if self._consensus_opencl_required():
+                raise RuntimeError(
+                    f"Failed to allocate {allocation_bytes} bytes for the RandomX scratchpad arena"
+                )
             self._switch_to_compat_kernel_unlocked("VRAM allocation failed")
             return requested
 
@@ -1084,10 +1266,14 @@ class OpenCLGpuScanner:
         candidates: list[CandidateShare],
         candidate_target: int,
     ) -> None:
+        # Full-scratch launches can now include bounded verifier-probe rows in
+        # addition to exact GPU prefilter hits. Keep the best candidate budget
+        # instead of allowing every chunk to grow the verification queue. Exact
+        # hits sort ahead of probes because their tail is <= the pool target.
         if len(candidates) <= candidate_target:
             return
 
-        if self.config.sort_candidates:
+        if self._full_scratch_enabled or self.config.sort_candidates:
             candidates.sort(key=self.candidate_sort_key)
             del candidates[candidate_target:]
         else:
@@ -1236,10 +1422,13 @@ class OpenCLGpuScanner:
                 )
 
         if raw_count >= max_results:
-            self.on_log(
-                f"[opencl] candidate buffer saturated for job={job.job_id}: "
+            message = (
+                f"OpenCL candidate buffer saturated for job={job.job_id}: "
                 f"raw_count={raw_count}, max_results={max_results}"
             )
+            if self._full_scratch_enabled and self._consensus_opencl_required():
+                raise RuntimeError(message + "; valid RandomX prefilter matches may have been dropped")
+            self.on_log(f"[opencl] {message}")
 
         return candidates, raw_count
 
@@ -1257,6 +1446,8 @@ class OpenCLGpuScanner:
     ) -> list[CandidateShare]:
         if self.dataset_buf is None or self.dataset_words <= 0:
             return []
+        if self._full_scratch_enabled and not self._dataset_is_consensus_sized():
+            raise RuntimeError("Bound Dataset is not the exact RandomX full Dataset size")
 
         blob = safe_bytes_from_hex(job.blob_hex)
         if not blob:
@@ -1293,6 +1484,7 @@ class OpenCLGpuScanner:
         max_scan_time_ms = max(0, int(getattr(self.config, "max_scan_time_ms", 15)))
 
         all_candidates: list[CandidateShare] = []
+        raw_candidates = 0
         scanned = 0
         chunk_count = 0
         started = time.perf_counter()
@@ -1328,6 +1520,7 @@ class OpenCLGpuScanner:
                     stale_risk_q8=stale_risk_q8,
                 )
 
+                raw_candidates += int(raw_count)
                 if chunk_candidates:
                     all_candidates.extend(chunk_candidates)
                     self._trim_candidates_unlocked(all_candidates, candidate_target)
@@ -1336,7 +1529,7 @@ class OpenCLGpuScanner:
                 chunk_count += 1
 
                 # For fresh jobs, keep scanning at least a bit longer even if the candidate target was reached.
-                if len(all_candidates) >= candidate_target:
+                if (not self._full_scratch_enabled) and len(all_candidates) >= candidate_target:
                     if job_age_ms >= 250 or raw_count >= max_results:
                         early_stop_reason = f"candidate_target={candidate_target}"
                         break
@@ -1356,7 +1549,7 @@ class OpenCLGpuScanner:
         if chunk_count > 1 or early_stop_reason:
             self.on_log(
                 f"[opencl] chunked scan job={job.job_id} chunks={chunk_count} "
-                f"scanned={scanned}/{total_work} kept={len(all_candidates)} "
+                f"scanned={scanned}/{total_work} raw={raw_candidates} kept={len(all_candidates)} "
                 + (f"stop={early_stop_reason} " if early_stop_reason else "")
                 + f"full_target={1 if full_target else 0} "
                   f"job_age_ms={job_age_ms} verify_q8={verify_pressure_q8} "
@@ -1379,6 +1572,8 @@ class OpenCLGpuScanner:
     ) -> list[CandidateShare]:
         if self.dataset_buf is None or self.dataset_words <= 0:
             return []
+        if self._full_scratch_enabled and not self._dataset_is_consensus_sized():
+            raise RuntimeError("Bound Dataset is not the exact RandomX full Dataset size")
 
         blob = safe_bytes_from_hex(job.blob_hex)
         if not blob:
@@ -1407,17 +1602,80 @@ class OpenCLGpuScanner:
             1,
             int(candidate_target_override or self.config.scan_candidate_target),
         )
-        max_results = self._effective_max_results(requested_candidate_target, full_target=full_target)
-        candidate_target = min(requested_candidate_target, max_results)
+        fast_candidate_mode = (
+            self._active_kernel_entry == "blocknet_randomx_vm_hash_batch_candidate_fast"
+        )
 
-        work_items = max(
+        if fast_candidate_mode:
+            verifier_batch = max(
+                1,
+                int(getattr(self.config, "verify_batch_size", 128) or 128),
+            )
+            fast_return_limit = max(
+                1,
+                int(getattr(self.config, "fast_candidate_return_limit", verifier_batch) or verifier_batch),
+            )
+            # Match nomination rate to native-verifier capacity. At high queue
+            # pressure the GPU returns fewer, better-spaced candidates instead
+            # of wasting transfers on rows that will be dropped as stale.
+            pressure_left = max(16, 255 - max(0, min(255, int(verify_pressure_q8))))
+            pressure_budget = max(1, (fast_return_limit * pressure_left) // 255)
+            candidate_target = min(
+                requested_candidate_target,
+                fast_return_limit,
+                pressure_budget,
+            )
+            max_results = max(candidate_target, min(2048, candidate_target * 2))
+        else:
+            max_results = self._effective_max_results(
+                requested_candidate_target,
+                full_target=full_target,
+            )
+            candidate_target = min(requested_candidate_target, max_results)
+
+        requested_work_items = max(
             1,
             int(work_items_override or getattr(self.config, "hash_batch_size", self.config.global_work_size)),
         )
+        if fast_candidate_mode:
+            launch_limit = max(
+                128,
+                int(getattr(self.config, "fast_candidate_launch_items", 32768) or 32768),
+            )
+            lws = max(1, int(self._effective_local_work_size or 128))
+            # The kernel emits one winner per work-group, so launch only enough
+            # groups to fill this verifier batch. This avoids ranking 90k nonces
+            # when 128 candidate rows are all the verifier can consume now.
+            desired_groups = max(1, candidate_target)
+            desired_items = desired_groups * lws
+            work_items = min(requested_work_items, launch_limit, desired_items)
+            # Keep a real work-group size instead of falling back to local size 1
+            # for odd windows such as 90,619. Scanning a few padded nonces is
+            # harmless and much faster than one-lane work-groups.
+            work_items = max(lws, ((work_items + lws - 1) // lws) * lws)
+        else:
+            work_items = requested_work_items
 
         candidates: list[CandidateShare] = []
+        raw_candidates = 0
         scanned = 0
         chunk_count = 0
+        started = time.perf_counter()
+        early_stop_reason = ""
+
+        # A full RandomX launch is expensive. Returning only after the entire
+        # configured window (90k+ hashes in the reported configuration) starves
+        # the verifier even when an early launch already produced candidates.
+        # Return a small verified-work batch promptly; the worker calls scan()
+        # again with the next nonce range.
+        return_candidate_min = max(
+            1,
+            int(getattr(self.config, "full_scratchpad_return_candidate_min", 1) or 1),
+        )
+        return_max_ms = max(
+            0,
+            int(getattr(self.config, "full_scratchpad_return_max_ms", 750) or 0),
+        )
 
         with self._cl_lock:
             self._ensure_job_buffers(blob, seed)
@@ -1427,7 +1685,7 @@ class OpenCLGpuScanner:
             while scanned < work_items:
                 remaining = work_items - scanned
                 this_launch = min(remaining, launch_capacity)
-                launch_candidates, _raw_count = self._run_one_launch_unlocked(
+                launch_candidates, launch_raw_count = self._run_one_launch_unlocked(
                     job=job,
                     start_nonce=(int(start_nonce) + scanned) & 0xFFFFFFFF,
                     blob=blob,
@@ -1440,10 +1698,22 @@ class OpenCLGpuScanner:
                     submit_pressure_q8=submit_pressure_q8,
                     stale_risk_q8=stale_risk_q8,
                 )
+                raw_candidates += int(launch_raw_count)
                 candidates.extend(launch_candidates)
                 self._trim_candidates_unlocked(candidates, candidate_target)
                 scanned += int(this_launch)
                 chunk_count += 1
+
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                if fast_candidate_mode:
+                    early_stop_reason = f"fast_candidate_batch={len(candidates)}"
+                    break
+                if self._full_scratch_enabled and len(candidates) >= return_candidate_min:
+                    early_stop_reason = f"candidate_return={len(candidates)}"
+                    break
+                if self._full_scratch_enabled and return_max_ms > 0 and elapsed_ms >= return_max_ms:
+                    early_stop_reason = f"return_budget_ms={return_max_ms}"
+                    break
 
             self._trim_candidates_unlocked(candidates, candidate_target)
             self._upload_tuning_unlocked(force=False)
@@ -1453,12 +1723,22 @@ class OpenCLGpuScanner:
         self.last_scan_chunk_count = int(chunk_count)
 
         self.on_log(
-            f"[opencl] hash_batch job={job.job_id} work_items={scanned} "
-            f"launches={chunk_count} kept={len(candidates)} "
-            f"full_target={1 if full_target else 0} "
-            f"job_age_ms={job_age_ms} verify_q8={verify_pressure_q8} "
-            f"submit_q8={submit_pressure_q8} stale_q8={stale_risk_q8}"
+            f"[opencl] hash_batch job={job.job_id} engine="
+            f"{'candidate-fast' if fast_candidate_mode else 'randomx-vm'} "
+            f"scanned={scanned}/{requested_work_items} launches={chunk_count} "
+            f"raw={raw_candidates} kept={len(candidates)} "
+            + (f"stop={early_stop_reason} " if early_stop_reason else "")
+            + f"target64=0x{int(target64):016x} full_target={1 if full_target else 0} "
+              f"job_age_ms={job_age_ms} verify_q8={verify_pressure_q8} "
+              f"submit_q8={submit_pressure_q8} stale_q8={stale_risk_q8}"
         )
+
+        if not candidates:
+            self.on_log(
+                f"[opencl] warning: no candidates produced for job={job.job_id}; "
+                f"target_hex={job.target_hex} target64=0x{int(target64):016x} "
+                f"work_items={scanned}"
+            )
 
         return candidates
 
